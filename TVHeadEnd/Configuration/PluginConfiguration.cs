@@ -21,6 +21,7 @@ namespace TVHeadEnd.Configuration
         public string ChannelType { get; set; }
         public bool HideRecordingsChannel { get; set; }
         public bool EnableSubsMaudios { get; set; }
+        public string StreamingMethod { get; set; }
         public bool ForceDeinterlace { get; set; }
 
         public PluginConfiguration()
@@ -38,6 +39,7 @@ namespace TVHeadEnd.Configuration
             ChannelType = "Ignore";
             HideRecordingsChannel = false;
             EnableSubsMaudios = false;
+            StreamingMethod = "";
             ForceDeinterlace = false;
         }
     }

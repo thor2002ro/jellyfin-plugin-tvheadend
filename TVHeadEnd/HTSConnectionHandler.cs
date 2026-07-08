@@ -13,6 +13,7 @@ using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.LiveTv;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
+using TVHeadEnd.Configuration;
 using TVHeadEnd.DataHelper;
 using TVHeadEnd.HTSP;
 
@@ -45,7 +46,7 @@ namespace TVHeadEnd
         private string _webRoot;
         private string _userName;
         private string _password;
-        private bool _enableSubsMaudios;
+        private string _streamingMethod;
         private bool _forceDeinterlace;
 
         // Data helpers
@@ -152,7 +153,7 @@ namespace TVHeadEnd
             _priority = config.Priority;
             _profile = config.Profile.Trim();
             _channelType = config.ChannelType.Trim();
-            _enableSubsMaudios = config.EnableSubsMaudios;
+            _streamingMethod = StreamingMethods.GetEffective(config.StreamingMethod, config.EnableSubsMaudios);
             _forceDeinterlace = config.ForceDeinterlace;
 
             if (_priority < 0 || _priority > 4)
@@ -172,7 +173,7 @@ namespace TVHeadEnd
             _userName = config.Username.Trim();
             _password = config.Password.Trim();
 
-            if (_enableSubsMaudios)
+            if (_streamingMethod == StreamingMethods.HttpBasic)
             {
                 // Use HTTP basic auth instead of TVH ticketing system for authentication to allow the users to switch subs or audio tracks at any time
                 _httpBaseUrl = "http://" + _userName + ":" + _password + "@" + _tvhServerName + ":" + _httpPort + _webRoot;
@@ -310,7 +311,13 @@ namespace TVHeadEnd
         public bool GetEnableSubsMaudios()
         {
             init();
-            return _enableSubsMaudios;
+            return _streamingMethod == StreamingMethods.HttpBasic;
+        }
+
+        public string GetStreamingMethod()
+        {
+            init();
+            return _streamingMethod;
         }
 
         public bool GetForceDeinterlace()

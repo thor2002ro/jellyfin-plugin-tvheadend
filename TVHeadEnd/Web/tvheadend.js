@@ -3,6 +3,13 @@
 };
 
 export default function (view, params) {
+    function getStreamingMethod(config) {
+        if (config.StreamingMethod) {
+            return config.StreamingMethod;
+        }
+        return config.EnableSubsMaudios ? 'HttpBasic' : 'HttpTicket';
+    }
+
     view.addEventListener('viewshow', function () {
         Dashboard.showLoadingMsg();
         const page = this;
@@ -19,7 +26,7 @@ export default function (view, params) {
             page.querySelector('#txtPostPadding').value = config.Post_Padding || '0';
             page.querySelector('#selChannelType').value = config.ChannelType || 'Ignore';
             page.querySelector('#chkHideRecordingsChannel').checked = config.HideRecordingsChannel || false;
-            page.querySelector('#chkEnableSubsMaudios').checked = config.EnableSubsMaudios || false;
+            page.querySelector('#selStreamingMethod').value = getStreamingMethod(config);
             page.querySelector('#chkForceDeinterlace').checked = config.ForceDeinterlace || false;
             Dashboard.hideLoadingMsg();
         });
@@ -41,7 +48,8 @@ export default function (view, params) {
             config.Post_Padding = form.querySelector('#txtPostPadding').value;
             config.ChannelType = form.querySelector('#selChannelType').value;
             config.HideRecordingsChannel = form.querySelector('#chkHideRecordingsChannel').checked;
-            config.EnableSubsMaudios = form.querySelector('#chkEnableSubsMaudios').checked;
+            config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
+            config.EnableSubsMaudios = config.StreamingMethod === 'HttpBasic';
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
             ApiClient.updatePluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId, config).then(Dashboard.processPluginConfigurationUpdateResult);
         });

@@ -48,12 +48,13 @@
                         <span>Hide TVHeadEnd Recordings channel</span>
                     </label>
                 </div>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkEnableSubsMaudios" />
-                        <span>Enable live TV subtitles and multiple audio tracks (Experimental)</span>
-                    </label>
-                    <div class="fieldDescription checkboxFieldDescription">Note: Enabling this feature has security implications and will require a server restart. (TVH username and password will appear in server logs and will be transmitted in cleartext over the network)</div>
+                <div class="selectContainer">
+                    <select is="emby-select" id="selStreamingMethod" label="Streaming Method">
+                        <option value="HttpTicket">HTTP ticket</option>
+                        <option value="HttpBasic">HTTP basic auth</option>
+                        <option value="Htsp">HTSP</option>
+                    </select>
+                    <div class="fieldDescription">HTTP basic auth enables live TV subtitles and multiple audio tracks. HTSP is experimental and only passes through raw MPEG-TS payloads.</div>
                 </div>
                 <div class="checkboxContainer checkboxContainer-withDescription">
                     <label>

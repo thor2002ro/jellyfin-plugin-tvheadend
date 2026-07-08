@@ -5,13 +5,15 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Controller;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Logging;
-using TVHeadEnd.DataHelper;
+using TVHeadEnd.Configuration;
 using TVHeadEnd.Helper;
 using TVHeadEnd.HTSP;
 using TVHeadEnd.HTSP.Responses;
@@ -20,7 +22,7 @@ using static TVHeadEnd.TicketType;
 
 namespace TVHeadEnd
 {
-    public class LiveTvService : ILiveTvService
+    public class LiveTvService : ILiveTvService, ISupportsDirectStreamProvider
     {
         /// <summary>
         /// DVR_AUTOREC_BTYPE_ALL - record any broadcast.
@@ -36,14 +38,18 @@ namespace TVHeadEnd
 
         private readonly TimeSpan _timeout = TimeSpan.FromMinutes(5);
 
+        private readonly ILoggerFactory _loggerFactory;
+        private readonly IServerApplicationHost _appHost;
         private readonly HTSConnectionHandler _htsConnectionHandler;
         private readonly AccessTicketHandler _channelTicketHandler;
 
         private readonly ILogger<LiveTvService> _logger;
 
-        public LiveTvService(ILoggerFactory loggerFactory, IMediaEncoder mediaEncoder, HTSConnectionHandler connectionHandler)
+        public LiveTvService(ILoggerFactory loggerFactory, IMediaEncoder mediaEncoder, HTSConnectionHandler connectionHandler, IServerApplicationHost appHost)
         {
-            // System.Diagnostics.StackTrace t = new System.Diagnostics.StackTrace();
+            //System.Diagnostics.StackTrace t = new System.Diagnostics.StackTrace();
+            _loggerFactory = loggerFactory;
+            _appHost = appHost;
             _logger = loggerFactory.CreateLogger<LiveTvService>();
             _logger.LogDebug("LiveTvService()");
 
@@ -414,9 +420,15 @@ namespace TVHeadEnd
 
         public async Task<MediaSourceInfo> GetChannelStream(string channelId, string streamId, CancellationToken cancellationToken)
         {
-            var ticket = await _channelTicketHandler.GetTicket(channelId, cancellationToken).ConfigureAwait(false);
+            var streamingMethod = _htsConnectionHandler.GetStreamingMethod();
+            if (streamingMethod == StreamingMethods.Htsp)
+            {
+                return CreateHtspMediaSource(channelId);
+            }
 
-            if (_htsConnectionHandler.GetEnableSubsMaudios())
+            var ticket = await _channelTicketHandler.GetTicket(channelId, cancellationToken);
+
+            if (streamingMethod == StreamingMethods.HttpBasic)
             {
                 _logger.LogInformation("LiveTvService.GetChannelStream: support for live TV subtitles and multiple audio tracks is enabled");
 
@@ -490,6 +502,51 @@ namespace TVHeadEnd
                     }
                 };
             }
+        }
+
+        public async Task<ILiveStream> GetChannelStreamWithDirectStreamProvider(string channelId, string streamId, List<ILiveStream> currentLiveStreams, CancellationToken cancellationToken)
+        {
+            if (_htsConnectionHandler.GetStreamingMethod() == StreamingMethods.Htsp)
+            {
+                var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost);
+                await stream.Open(cancellationToken).ConfigureAwait(false);
+                return stream;
+            }
+
+            var mediaSource = await GetChannelStream(channelId, streamId, cancellationToken).ConfigureAwait(false);
+            return new MediaSourceLiveStream(mediaSource, () => CloseLiveStream(mediaSource.Id, CancellationToken.None));
+        }
+
+        private MediaSourceInfo CreateHtspMediaSource(string channelId)
+        {
+            return new MediaSourceInfo
+            {
+                Id = channelId,
+                Path = _appHost.GetApiUrlForLocalAccess(),
+                Protocol = MediaProtocol.Http,
+                AnalyzeDurationMs = 2000,
+                SupportsDirectStream = true,
+                SupportsProbing = true,
+                Container = "mpegts",
+                RequiresOpening = true,
+                RequiresClosing = true,
+                IsInfiniteStream = true,
+                MediaStreams = new List<MediaStream>
+                {
+                    new MediaStream
+                    {
+                        Type = MediaStreamType.Video,
+                        Index = -1,
+                        IsInterlaced = true,
+                        RealFrameRate = 50.0F
+                    },
+                    new MediaStream
+                    {
+                        Type = MediaStreamType.Audio,
+                        Index = -1
+                    }
+                }
+            };
         }
 
         private async Task ProbeStream(MediaSourceInfo mediaSourceInfo, string probeUrl, string source, CancellationToken cancellationToken)

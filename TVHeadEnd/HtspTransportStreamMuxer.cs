@@ -51,7 +51,11 @@ namespace TVHeadEnd
                 .Where(i => i != null)
                 .OrderBy(i => i.Index))
             {
-                ConfigureStream(stream);
+                if (!TryConfigureStream(stream))
+                {
+                    continue;
+                }
+
                 stream.Pid = _nextPid++;
                 _streams[stream.Index] = stream;
             }
@@ -62,6 +66,16 @@ namespace TVHeadEnd
             {
                 _pcrPid = pcrStream.Pid;
             }
+        }
+
+        public bool IsStreamKnown(int streamIndex)
+        {
+            return _streams.ContainsKey(streamIndex);
+        }
+
+        internal static bool CanMuxCodec(string codec)
+        {
+            return TryGetTsType(NormalizeCodec(codec), out _, out _, out _);
         }
 
         public byte[] WritePacket(int streamIndex, byte[] payload, long? pts, long? dts)
@@ -88,29 +102,27 @@ namespace TVHeadEnd
             return output.ToArray();
         }
 
-        private void ConfigureStream(StreamInfo stream)
+        private bool TryConfigureStream(StreamInfo stream)
         {
             var normalizedCodec = NormalizeCodec(stream.Codec);
             if (!TryGetTsType(normalizedCodec, out var streamType, out var kind, out var privateStreamId))
             {
-                streamType = 0x06;
-                kind = ElementaryStreamKind.Private;
-                privateStreamId = 0xBD;
-                stream.IsFallbackPrivateData = true;
+                return false;
             }
 
+            stream.IsFallbackPrivateData = false;
             stream.Kind = kind;
             stream.StreamType = streamType;
             stream.Descriptors = BuildDescriptors(stream, normalizedCodec);
-            stream.StreamTypeDescription = stream.IsFallbackPrivateData
-                ? "PRIVATE(" + (string.IsNullOrWhiteSpace(stream.Codec) ? "UNKNOWN" : stream.Codec) + ")"
-                : stream.Codec;
+            stream.StreamTypeDescription = stream.Codec;
             stream.StreamId = kind switch
             {
                 ElementaryStreamKind.Video => 0xE0 + Math.Min(_nextVideoStreamId++, 0x0F),
                 ElementaryStreamKind.Audio when !privateStreamId.HasValue => 0xC0 + Math.Min(_nextAudioStreamId++, 0x1F),
                 _ => privateStreamId ?? 0xBD
             };
+
+            return true;
         }
 
         private void WriteTables(Stream output)
@@ -485,8 +497,8 @@ namespace TVHeadEnd
         private static void AddDvbSubtitleDescriptor(List<byte> descriptors, StreamInfo stream)
         {
             var lang = GetIsoLanguageBytes(stream.Language);
-            var compositionId = stream.CompositionId == 0 ? 1 : stream.CompositionId;
-            var ancillaryId = stream.AncillaryId == 0 ? compositionId : stream.AncillaryId;
+            var compositionId = stream.CompositionId & 0xFFFF;
+            var ancillaryId = stream.AncillaryId & 0xFFFF;
             AddDescriptor(
                 descriptors,
                 0x59,

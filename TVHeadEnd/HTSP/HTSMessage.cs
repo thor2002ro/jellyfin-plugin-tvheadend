@@ -12,21 +12,24 @@ namespace TVHeadEnd.HTSP
 {
     public class HTSMessage
     {
-        /// <summary>
-        /// The highest HTSP protocol version this client understands.
-        /// </summary>
-        /// <remarks>
-        /// TVHeadend negotiates <c>min(server version, requested version)</c>, so this value is
-        /// an upper bound: older servers simply agree on their own version and newer ones are
-        /// held at this one. It therefore has to be the newest version whose behaviour the
-        /// client actually handles, because the server withholds every field gated above it.
-        /// </remarks>
-        public const long HtspVersion = 44;
-        private const byte HmfMap = 1;
-        private const byte HmfS64 = 2;
-        private const byte HmfStr = 3;
-        private const byte HmfBin = 4;
-        private const byte HmfList = 5;
+        // Align the advertised client protocol with Kodi pvr.hts.
+        // Tvheadend master currently supports newer server-side protocol versions,
+        // but advertising the server maximum would enable features this client does
+        // not implement. Keep this at the client feature level.
+        public const long HTSP_CLIENT_VERSION = 34;
+        public const long HTSP_MIN_SERVER_VERSION = 19;
+
+        // Backwards-compatible alias used by existing call sites and UI strings.
+        public const long HTSP_VERSION = HTSP_CLIENT_VERSION;
+
+        private const byte HMF_MAP = 1;
+        private const byte HMF_S64 = 2;
+        private const byte HMF_STR = 3;
+        private const byte HMF_BIN = 4;
+        private const byte HMF_LIST = 5;
+        private const byte HMF_DBL = 6;
+        private const byte HMF_BOOL = 7;
+        private const byte HMF_UUID = 8;
 
         private readonly Dictionary<string, object> _dict;
         private ILogger<HTSMessage>? _logger;
@@ -76,7 +79,12 @@ namespace TVHeadEnd.HTSP
             return _dict.ContainsKey(name);
         }
 
-        public System.Numerics.BigInteger GetBigInteger(string name)
+        public object GetField(string name)
+        {
+            return _dict[name];
+        }
+
+        public System.Numerics.BigInteger getBigInteger(string name)
         {
             try
             {
@@ -122,7 +130,62 @@ namespace TVHeadEnd.HTSP
             return GetInt(name);
         }
 
-        public string? GetString(string name, string? std)
+        public bool getBool(string name)
+        {
+            object obj = _dict[name];
+            if (obj is bool boolValue)
+            {
+                return boolValue;
+            }
+
+            if (obj is System.Numerics.BigInteger intValue)
+            {
+                return intValue != 0;
+            }
+
+            return Convert.ToBoolean(obj);
+        }
+
+        public bool getBool(string name, bool std)
+        {
+            if (!containsField(name))
+            {
+                return std;
+            }
+            return getBool(name);
+        }
+
+        public double getDouble(string name)
+        {
+            object obj = _dict[name];
+            if (obj is double doubleValue)
+            {
+                return doubleValue;
+            }
+
+            if (obj is float floatValue)
+            {
+                return floatValue;
+            }
+
+            if (obj is System.Numerics.BigInteger intValue)
+            {
+                return (double)intValue;
+            }
+
+            return Convert.ToDouble(obj);
+        }
+
+        public double getDouble(string name, double std)
+        {
+            if (!containsField(name))
+            {
+                return std;
+            }
+            return getDouble(name);
+        }
+
+        public string getString(string name, string std)
         {
             if (!ContainsField(name))
             {
@@ -286,6 +349,21 @@ namespace TVHeadEnd.HTSP
                 type = HTSMessage.HmfS64;
                 bData = ToByteArray((long)value);
             }
+            else if (value is bool)
+            {
+                type = HTSMessage.HMF_BOOL;
+                bData = (bool)value ? new byte[] { 1 } : new byte[0];
+            }
+            else if (value is double)
+            {
+                type = HTSMessage.HMF_DBL;
+                bData = BitConverter.GetBytes((double)value);
+            }
+            else if (value is float)
+            {
+                type = HTSMessage.HMF_DBL;
+                bData = BitConverter.GetBytes((double)(float)value);
+            }
             else if (value is byte[])
             {
                 type = HTSMessage.HmfBin;
@@ -326,24 +404,38 @@ namespace TVHeadEnd.HTSP
 
         private byte[] ToByteArray(System.Numerics.BigInteger big)
         {
-            byte[] b = BitConverter.GetBytes((long)big);
-            byte[] b1 = Array.Empty<byte>();
-            bool tail = false;
-            for (int ii = 0; ii < b.Length; ii++)
+            if (big < long.MinValue || big > long.MaxValue)
             {
-                if (b[ii] != 0 || !tail)
-                {
-                    tail = true;
-                    b1 = b1.Concat(new byte[] { b[ii] }).ToArray();
-                }
+                throw new IOException("[TVHclient] HTSPMessage.toByteArray: S64 value is outside the signed 64-bit range: " + big);
             }
 
-            if (b1.Length == 0)
+            long value = (long)big;
+            byte[] bytes = BitConverter.GetBytes(value);
+
+            if (!BitConverter.IsLittleEndian)
             {
-                b1 = new byte[1];
+                Array.Reverse(bytes);
             }
 
-            return b1;
+            // HTSP S64 values are encoded little-endian with only redundant
+            // most-significant zero bytes removed. Keep zero bytes that occur
+            // inside the value; dropping them changes values such as 65536.
+            // Negative S64 values must be sent as the full 8-byte two's
+            // complement representation.
+            if (value < 0)
+            {
+                return bytes;
+            }
+
+            int length = bytes.Length;
+            while (length > 1 && bytes[length - 1] == 0)
+            {
+                length--;
+            }
+
+            byte[] result = new byte[length];
+            Array.Copy(bytes, result, length);
+            return result;
         }
 
         public static HTSMessage? Parse(byte[] data, ILogger<HTSMessage> logger)
@@ -438,6 +530,7 @@ namespace TVHeadEnd.HTSP
                 byte[] bData = new byte[datalen];
                 buf.Get(bData);
 
+                bool decoded = true;
                 switch (type)
                 {
                     case HTSMessage.HmfStr:
@@ -469,12 +562,44 @@ namespace TVHeadEnd.HTSP
                             obj = new List<object>(DeserializeBinary(bData)._dict.Values);
                             break;
                         }
-
+                    case HMF_DBL:
+                        {
+                            if (bData.Length == sizeof(double))
+                            {
+                                obj = BitConverter.ToDouble(bData, 0);
+                            }
+                            else
+                            {
+                                decoded = false;
+                            }
+                            break;
+                        }
+                    case HMF_BOOL:
+                        {
+                            obj = bData.Length == 1 && bData[0] != 0;
+                            break;
+                        }
+                    case HMF_UUID:
+                        {
+                            // Keep UUID payloads as raw bytes. Tvheadend treats UUID as a
+                            // distinct HTSMSG type, but this client only needs to avoid
+                            // failing when newer servers include it in replies.
+                            obj = bData;
+                            break;
+                        }
                     default:
-                        throw new IOException("[TVHclient] HTSMessage.deserializeBinary: unknown data type");
+                        {
+                            // Forward compatibility: ignore fields with newer HTSMSG types
+                            // instead of dropping the whole message.
+                            decoded = false;
+                            break;
+                        }
                 }
 
-                msg.PutField(name, obj);
+                if (decoded)
+                {
+                    msg.putField(name, obj);
+                }
             }
 
             return msg;

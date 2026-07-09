@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 
 namespace TVHeadEnd
 {
@@ -9,36 +10,55 @@ namespace TVHeadEnd
     {
         private const int PacketSize = 188;
         private const int PmtPid = 0x100;
+        private const int FirstElementaryPid = 0x101;
+        private const int RepeatTablesEveryPesPackets = 64;
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
         private bool _wroteTables;
-        private int _nextPid = 0x101;
+        private bool _timestampsAre90Khz;
+        private int _nextPid = FirstElementaryPid;
         private int _nextVideoStreamId;
         private int _nextAudioStreamId;
+        private int _packetsSinceTables;
+        private int _pcrPid = PmtPid;
 
         public bool HasStreams => _streams.Count > 0;
+
+        public int SupportedStreamCount => _streams.Count;
+
+        public void SetTimestampsAre90Khz(bool timestampsAre90Khz)
+        {
+            _timestampsAre90Khz = timestampsAre90Khz;
+        }
 
         public void SetStreams(IEnumerable<StreamInfo> streams)
         {
             _streams.Clear();
             _continuityCounters.Clear();
             _wroteTables = false;
-            _nextPid = 0x101;
+            _nextPid = FirstElementaryPid;
             _nextVideoStreamId = 0;
             _nextAudioStreamId = 0;
+            _packetsSinceTables = 0;
+            _pcrPid = PmtPid;
 
-            foreach (var stream in streams)
+            foreach (var stream in streams ?? Enumerable.Empty<StreamInfo>())
             {
-                if (!TryGetTsType(stream.Codec, out var streamType, out var isVideo))
+                if (!ConfigureStream(stream))
                 {
                     continue;
                 }
 
                 stream.Pid = _nextPid++;
-                stream.StreamType = streamType;
-                stream.StreamId = isVideo ? 0xE0 + _nextVideoStreamId++ : 0xC0 + _nextAudioStreamId++;
                 _streams[stream.Index] = stream;
+            }
+
+            var pcrStream = _streams.Values.FirstOrDefault(i => i.Kind == ElementaryStreamKind.Video)
+                ?? _streams.Values.FirstOrDefault();
+            if (pcrStream != null)
+            {
+                _pcrPid = pcrStream.Pid;
             }
         }
 
@@ -50,15 +70,40 @@ namespace TVHeadEnd
             }
 
             using var output = new MemoryStream();
-            if (!_wroteTables)
+            if (!_wroteTables || _packetsSinceTables >= RepeatTablesEveryPesPackets)
             {
                 WriteTables(output);
                 _wroteTables = true;
+                _packetsSinceTables = 0;
             }
 
-            var pes = BuildPes(stream.StreamId, payload, ToTsTimestamp(pts), ToTsTimestamp(dts));
-            WriteTsPackets(output, stream.Pid, true, pes);
+            var tsDts = ToTsTimestamp(dts);
+            var tsPts = ToTsTimestamp(pts);
+            var pes = BuildPes(stream.StreamId, payload, tsPts, tsDts);
+            var pcr = stream.Pid == _pcrPid ? tsDts ?? tsPts : null;
+            WriteTsPackets(output, stream.Pid, true, pes, pcr);
+            _packetsSinceTables++;
             return output.ToArray();
+        }
+
+        private bool ConfigureStream(StreamInfo stream)
+        {
+            if (stream == null || !TryGetTsType(stream.Codec, out var streamType, out var kind))
+            {
+                return false;
+            }
+
+            stream.Kind = kind;
+            stream.StreamType = streamType;
+            stream.Descriptors = BuildDescriptors(stream);
+            stream.StreamId = kind switch
+            {
+                ElementaryStreamKind.Video => 0xE0 + _nextVideoStreamId++,
+                ElementaryStreamKind.Audio => 0xC0 + _nextAudioStreamId++,
+                _ => 0xBD
+            };
+
+            return true;
         }
 
         private void WriteTables(Stream output)
@@ -91,8 +136,7 @@ namespace TVHeadEnd
         private byte[] BuildPmt()
         {
             var streams = _streams.Values.OrderBy(i => i.Pid).ToList();
-            var pcrPid = streams.FirstOrDefault(i => i.StreamId >= 0xE0)?.Pid ?? streams.First().Pid;
-            var sectionLength = 9 + streams.Count * 5 + 4;
+            var sectionLength = 9 + streams.Sum(i => 5 + (i.Descriptors?.Length ?? 0)) + 4;
             var section = new List<byte>
             {
                 0x02,
@@ -103,19 +147,21 @@ namespace TVHeadEnd
                 0xC1,
                 0x00,
                 0x00,
-                (byte)(0xE0 | ((pcrPid >> 8) & 0x1F)),
-                (byte)(pcrPid & 0xFF),
+                (byte)(0xE0 | ((_pcrPid >> 8) & 0x1F)),
+                (byte)(_pcrPid & 0xFF),
                 0xF0,
                 0x00
             };
 
             foreach (var stream in streams)
             {
+                var descriptors = stream.Descriptors ?? Array.Empty<byte>();
                 section.Add(stream.StreamType);
                 section.Add((byte)(0xE0 | ((stream.Pid >> 8) & 0x1F)));
                 section.Add((byte)(stream.Pid & 0xFF));
-                section.Add(0xF0);
-                section.Add(0x00);
+                section.Add((byte)(0xF0 | ((descriptors.Length >> 8) & 0x0F)));
+                section.Add((byte)(descriptors.Length & 0xFF));
+                section.AddRange(descriptors);
             }
 
             AppendCrc(section);
@@ -161,10 +207,10 @@ namespace TVHeadEnd
             var data = new byte[section.Length + 1];
             data[0] = 0x00;
             Array.Copy(section, 0, data, 1, section.Length);
-            WriteTsPackets(output, pid, true, data);
+            WriteTsPackets(output, pid, true, data, null);
         }
 
-        private void WriteTsPackets(Stream output, int pid, bool payloadUnitStart, byte[] data)
+        private void WriteTsPackets(Stream output, int pid, bool payloadUnitStart, byte[] data, long? pcr)
         {
             var offset = 0;
             var first = true;
@@ -176,20 +222,32 @@ namespace TVHeadEnd
                 packet[2] = (byte)(pid & 0xFF);
 
                 var remaining = data.Length - offset;
-                var payloadCapacity = 184;
-                var useAdaptation = remaining < payloadCapacity;
+                var writePcr = first && pcr.HasValue;
+                var minAdaptationLength = writePcr ? 7 : 0; // flags byte + 6-byte PCR
+                var maxPayloadWithAdaptation = 183 - minAdaptationLength;
+                var useAdaptation = writePcr || remaining < 184;
+                int payloadCapacity;
+
                 if (useAdaptation)
                 {
-                    payloadCapacity = remaining;
+                    payloadCapacity = Math.Min(remaining, maxPayloadWithAdaptation);
                     var adaptationLength = 183 - payloadCapacity;
                     packet[3] = (byte)(0x30 | NextCounter(pid));
                     packet[4] = (byte)adaptationLength;
+
                     if (adaptationLength > 0)
                     {
-                        packet[5] = 0x00;
-                        for (var i = 6; i < 5 + adaptationLength; i++)
+                        var adaptationOffset = 5;
+                        packet[adaptationOffset++] = writePcr ? (byte)0x10 : (byte)0x00;
+                        if (writePcr)
                         {
-                            packet[i] = 0xFF;
+                            WritePcr(packet, adaptationOffset, pcr.Value);
+                            adaptationOffset += 6;
+                        }
+
+                        while (adaptationOffset < 5 + adaptationLength)
+                        {
+                            packet[adaptationOffset++] = 0xFF;
                         }
                     }
 
@@ -197,6 +255,7 @@ namespace TVHeadEnd
                 }
                 else
                 {
+                    payloadCapacity = 184;
                     packet[3] = (byte)(0x10 | NextCounter(pid));
                     Array.Copy(data, offset, packet, 4, payloadCapacity);
                 }
@@ -214,9 +273,14 @@ namespace TVHeadEnd
             return current;
         }
 
-        private static long? ToTsTimestamp(long? htspTimestamp)
+        private long? ToTsTimestamp(long? htspTimestamp)
         {
-            return htspTimestamp.HasValue ? htspTimestamp.Value * 90 / 1000 : null;
+            if (!htspTimestamp.HasValue)
+            {
+                return null;
+            }
+
+            return _timestampsAre90Khz ? htspTimestamp.Value : htspTimestamp.Value * 90 / 1000;
         }
 
         private static void WriteTimestamp(Stream output, int marker, long timestamp)
@@ -229,41 +293,171 @@ namespace TVHeadEnd
             output.WriteByte((byte)(((value & 0x7F) << 1) | 1));
         }
 
-        private static bool TryGetTsType(string codec, out byte streamType, out bool isVideo)
+        private static void WritePcr(byte[] packet, int offset, long timestamp)
         {
-            isVideo = false;
-            switch ((codec ?? string.Empty).ToUpperInvariant())
+            var pcrBase = (ulong)timestamp & 0x1FFFFFFFFUL;
+            packet[offset] = (byte)((pcrBase >> 25) & 0xFF);
+            packet[offset + 1] = (byte)((pcrBase >> 17) & 0xFF);
+            packet[offset + 2] = (byte)((pcrBase >> 9) & 0xFF);
+            packet[offset + 3] = (byte)((pcrBase >> 1) & 0xFF);
+            packet[offset + 4] = (byte)(((pcrBase & 0x01) << 7) | 0x7E);
+            packet[offset + 5] = 0x00;
+        }
+
+        private static bool TryGetTsType(string codec, out byte streamType, out ElementaryStreamKind kind)
+        {
+            kind = ElementaryStreamKind.Private;
+            switch ((codec ?? string.Empty).Replace("-", string.Empty, StringComparison.Ordinal).Replace("_", string.Empty, StringComparison.Ordinal).ToUpperInvariant())
             {
+                case "MPEG1VIDEO":
+                    streamType = 0x01;
+                    kind = ElementaryStreamKind.Video;
+                    return true;
                 case "MPEGTS":
                 case "MPEG2VIDEO":
+                case "MPEGVIDEO":
                     streamType = 0x02;
-                    isVideo = true;
+                    kind = ElementaryStreamKind.Video;
                     return true;
                 case "H264":
+                case "AVC":
                     streamType = 0x1B;
-                    isVideo = true;
+                    kind = ElementaryStreamKind.Video;
                     return true;
                 case "HEVC":
                 case "H265":
                     streamType = 0x24;
-                    isVideo = true;
+                    kind = ElementaryStreamKind.Video;
                     return true;
                 case "AAC":
+                case "AACADTS":
+                case "MPEG4AUDIO":
                     streamType = 0x0F;
+                    kind = ElementaryStreamKind.Audio;
                     return true;
+                case "AACLATM":
+                case "LATM":
+                    streamType = 0x11;
+                    kind = ElementaryStreamKind.Audio;
+                    return true;
+                case "MPEG1AUDIO":
                 case "MPEG2AUDIO":
                 case "MP2":
+                case "MP3":
+                case "MPA":
                     streamType = 0x03;
+                    kind = ElementaryStreamKind.Audio;
                     return true;
                 case "AC3":
                     streamType = 0x81;
+                    kind = ElementaryStreamKind.Audio;
                     return true;
                 case "EAC3":
                     streamType = 0x87;
+                    kind = ElementaryStreamKind.Audio;
+                    return true;
+                case "DTS":
+                    streamType = 0x8A;
+                    kind = ElementaryStreamKind.Audio;
+                    return true;
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                case "TELETEXT":
+                case "VORBIS":
+                    streamType = 0x06;
+                    kind = ElementaryStreamKind.Private;
                     return true;
                 default:
                     streamType = 0;
                     return false;
+            }
+        }
+
+        private static byte[] BuildDescriptors(StreamInfo stream)
+        {
+            var descriptors = new List<byte>();
+            var normalizedCodec = (stream.Codec ?? string.Empty).Replace("-", string.Empty, StringComparison.Ordinal).Replace("_", string.Empty, StringComparison.Ordinal).ToUpperInvariant();
+
+            if (stream.Kind == ElementaryStreamKind.Audio && HasLanguage(stream.Language))
+            {
+                var lang = GetIsoLanguageBytes(stream.Language);
+                AddDescriptor(descriptors, 0x0A, lang[0], lang[1], lang[2], (byte)(stream.AudioType & 0xFF));
+            }
+
+            switch (normalizedCodec)
+            {
+                case "AC3":
+                    AddDescriptor(descriptors, 0x6A);
+                    break;
+                case "EAC3":
+                    AddDescriptor(descriptors, 0x7A);
+                    break;
+                case "DTS":
+                    AddDescriptor(descriptors, 0x7B);
+                    break;
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                    AddDvbSubtitleDescriptor(descriptors, stream);
+                    break;
+                case "TELETEXT":
+                    AddTeletextDescriptor(descriptors, stream);
+                    break;
+            }
+
+            return descriptors.ToArray();
+        }
+
+        private static void AddDvbSubtitleDescriptor(List<byte> descriptors, StreamInfo stream)
+        {
+            var lang = GetIsoLanguageBytes(stream.Language);
+            var compositionId = stream.CompositionId == 0 ? 1 : stream.CompositionId;
+            var ancillaryId = stream.AncillaryId == 0 ? compositionId : stream.AncillaryId;
+            AddDescriptor(
+                descriptors,
+                0x59,
+                lang[0],
+                lang[1],
+                lang[2],
+                0x10,
+                (byte)((compositionId >> 8) & 0xFF),
+                (byte)(compositionId & 0xFF),
+                (byte)((ancillaryId >> 8) & 0xFF),
+                (byte)(ancillaryId & 0xFF));
+        }
+
+        private static void AddTeletextDescriptor(List<byte> descriptors, StreamInfo stream)
+        {
+            var lang = GetIsoLanguageBytes(stream.Language);
+            AddDescriptor(descriptors, 0x56, lang[0], lang[1], lang[2], 0x20, 0x00);
+        }
+
+        private static bool HasLanguage(string language)
+        {
+            return !string.IsNullOrWhiteSpace(language);
+        }
+
+        private static byte[] GetIsoLanguageBytes(string language)
+        {
+            var normalized = new string((language ?? string.Empty)
+                .Where(char.IsLetter)
+                .Take(3)
+                .Select(char.ToLowerInvariant)
+                .ToArray());
+            if (normalized.Length != 3)
+            {
+                normalized = "und";
+            }
+
+            return Encoding.ASCII.GetBytes(normalized);
+        }
+
+        private static void AddDescriptor(List<byte> descriptors, byte tag, params byte[] data)
+        {
+            descriptors.Add(tag);
+            descriptors.Add((byte)(data?.Length ?? 0));
+            if (data != null && data.Length > 0)
+            {
+                descriptors.AddRange(data);
             }
         }
 
@@ -285,17 +479,46 @@ namespace TVHeadEnd
             data.Add((byte)(crc & 0xFF));
         }
 
+        internal enum ElementaryStreamKind
+        {
+            Video,
+            Audio,
+            Private
+        }
+
         internal sealed class StreamInfo
         {
             public int Index { get; set; }
 
             public string Codec { get; set; }
 
+            public string Language { get; set; }
+
+            public byte[] Meta { get; set; }
+
+            public int Width { get; set; }
+
+            public int Height { get; set; }
+
+            public int Channels { get; set; }
+
+            public int Rate { get; set; }
+
+            public int AudioType { get; set; }
+
+            public int CompositionId { get; set; }
+
+            public int AncillaryId { get; set; }
+
             public int Pid { get; set; }
 
             public byte StreamType { get; set; }
 
             public int StreamId { get; set; }
+
+            internal ElementaryStreamKind Kind { get; set; }
+
+            internal byte[] Descriptors { get; set; }
         }
     }
 }

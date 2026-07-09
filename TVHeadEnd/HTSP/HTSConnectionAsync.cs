@@ -22,6 +22,7 @@ namespace TVHeadEnd.HTSP
 
         private volatile Boolean _needsRestart = false;
         private volatile Boolean _connected;
+        private volatile Boolean _expectedClose;
         private int _seq = 0;
 
         private readonly object _lock;
@@ -82,6 +83,7 @@ namespace TVHeadEnd.HTSP
 
         public void Stop()
         {
+            _expectedClose = true;
             _connected = false;
 
             try
@@ -121,7 +123,12 @@ namespace TVHeadEnd.HTSP
             return _needsRestart;
         }
 
-        public void Open(string hostname, int port)
+        public void BeginExpectedClose()
+        {
+            _expectedClose = true;
+        }
+
+        public void open(String hostname, int port)
         {
             open(hostname, port, CancellationToken.None, 0);
         }
@@ -141,6 +148,7 @@ namespace TVHeadEnd.HTSP
                 }
 
                 _needsRestart = false;
+                _expectedClose = false;
                 ResetCancellationTokenSources();
 
                 var attempts = 0;
@@ -641,9 +649,21 @@ namespace TVHeadEnd.HTSP
 
         private void HandleConnectionError(Exception ex, string source)
         {
+            bool expectedClose = IsExpectedCloseInProgress() && IsExpectedCloseException(ex);
+
             _connected = false;
-            _needsRestart = true;
+            if (!expectedClose)
+            {
+                _needsRestart = true;
+            }
+
             CloseSocket();
+
+            if (expectedClose)
+            {
+                _logger.LogDebug(ex, "[TVHclient] HTSConnectionAsync.{source}: expected HTSP socket close during shutdown", source);
+                return;
+            }
 
             _logger.LogError(ex, "[TVHclient] HTSConnectionAsync.{source}: exception caught", source);
             if (_listener != null)
@@ -696,6 +716,23 @@ namespace TVHeadEnd.HTSP
             _messageBuilderThreadTokenSource = new CancellationTokenSource();
             _sendingHandlerThreadTokenSource = new CancellationTokenSource();
             _messageDistributorThreadTokenSource = new CancellationTokenSource();
+        }
+
+        private bool IsExpectedCloseInProgress()
+        {
+            return _expectedClose
+                   || !_connected
+                   || (_receiveHandlerThreadTokenSource?.IsCancellationRequested ?? false)
+                   || (_messageBuilderThreadTokenSource?.IsCancellationRequested ?? false)
+                   || (_sendingHandlerThreadTokenSource?.IsCancellationRequested ?? false)
+                   || (_messageDistributorThreadTokenSource?.IsCancellationRequested ?? false);
+        }
+
+        private static bool IsExpectedCloseException(Exception ex)
+        {
+            return ex is IOException
+                   || ex is ObjectDisposedException
+                   || ex is SocketException;
         }
 
         private static bool IsSocketTimeout(SocketException ex)

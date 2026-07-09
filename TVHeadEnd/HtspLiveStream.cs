@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -43,6 +44,9 @@ namespace TVHeadEnd
         private const int MaxOpenAttempts = 3;
         private const int MaxLiveReconnectAttempts = 5;
         private const int MuxPacketStatsIntervalSeconds = 30;
+        private const long StartupCacheMaxBytes = 8L * 1024L * 1024L;
+
+        private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
 
         private static readonly TimeSpan SubscribeResponseTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
@@ -68,11 +72,15 @@ namespace TVHeadEnd
         private readonly object _connectionStateLock = new object();
         private readonly object _clientAbortSync = new object();
         private readonly object _readerStateLock = new object();
+        private readonly object _broadcastLock = new object();
+        private readonly object _sharedReferenceLock = new object();
+        private readonly object _producerOpenLock = new object();
         private readonly SemaphoreSlim _connectionSemaphore = new SemaphoreSlim(1, 1);
         private readonly CancellationTokenSource _lifetimeCancellationTokenSource = new CancellationTokenSource();
 
         private CancellationTokenRegistration _clientAbortRegistration;
         private CancellationTokenSource _readerIdleDisconnectCancellationTokenSource;
+        private CancellationTokenSource _sharedHubIdleCloseCancellationTokenSource;
         private HTSConnectionAsync _connection;
         private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
         private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
@@ -80,11 +88,20 @@ namespace TVHeadEnd
         private int _reconnectScheduled;
         private int _liveReconnectAttempts;
         private int _closeStarted;
+        private int _playbackCloseStarted;
         private int _activeStreamReaders;
         private bool _closing;
         private bool _started;
         private bool _recovering;
+        private bool _registeredAsSharedHub;
+        private HtspLiveStream _sharedProducer;
+        private Task _producerOpenTask;
         private DateTime _lastMuxPacketStatsLogUtc = DateTime.MinValue;
+        private long _startupCacheBytes;
+        private readonly Queue<byte[]> _startupCache = new Queue<byte[]>();
+        private readonly Dictionary<string, List<BlockingByteStream>> _consumerQueuesByOwner = new Dictionary<string, List<BlockingByteStream>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CancellationTokenSource> _ownerIdleDisconnects = new Dictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _sharedPlaybackReferences = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private static TaskCompletionSource<bool> CreateFirstPacketSource()
         {
@@ -94,6 +111,20 @@ namespace TVHeadEnd
         private static TaskCompletionSource<Exception> CreateConnectionErrorSource()
         {
             return new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        internal string ChannelId => _channelId;
+
+        private bool IsSharedProxy => _sharedProducer != null && !ReferenceEquals(_sharedProducer, this);
+
+        private bool IsSharedHubUsable
+        {
+            get
+            {
+                return !_closing
+                    && !_lifetimeCancellationTokenSource.IsCancellationRequested
+                    && !_stream.IsCompleted;
+            }
         }
 
         public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
@@ -124,6 +155,11 @@ namespace TVHeadEnd
         public string UniqueId { get; }
 
         public async Task Open(CancellationToken openCancellationToken)
+        {
+            await OpenThroughSharedHubAsync(openCancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task OpenProducerAsync(CancellationToken openCancellationToken)
         {
             using var openLifetime = CancellationTokenSource.CreateLinkedTokenSource(openCancellationToken, _lifetimeCancellationTokenSource.Token);
             var openToken = openLifetime.Token;
@@ -187,18 +223,148 @@ namespace TVHeadEnd
             throw htspException;
         }
 
-        private void ConfigureOpenedMediaSource()
+        private async Task OpenThroughSharedHubAsync(CancellationToken openCancellationToken)
+        {
+            while (true)
+            {
+                if (SharedHubsByChannelId.TryGetValue(_channelId, out var existingHub))
+                {
+                    if (!existingHub.IsSharedHubUsable)
+                    {
+                        SharedHubsByChannelId.TryRemove(_channelId, out _);
+                        continue;
+                    }
+
+                    _sharedProducer = existingHub;
+                    existingHub.AddSharedPlaybackReference(UniqueId);
+
+                    try
+                    {
+                        await existingHub.EnsureProducerOpenAsync(openCancellationToken).ConfigureAwait(false);
+                        ConfigureOpenedMediaSourceFromHub(existingHub);
+
+                        _logger.LogInformation(
+                            "HTSP shared channel hub attached playback {PlaybackId} to channel {ChannelId}; active shared playback count is {PlaybackCount}",
+                            UniqueId,
+                            _channelId,
+                            existingHub.GetSharedPlaybackReferenceCount());
+                        return;
+                    }
+                    catch
+                    {
+                        existingHub.ReleaseSharedPlaybackReference(UniqueId, "failed to attach shared playback");
+                        _sharedProducer = null;
+                        throw;
+                    }
+                }
+
+                _registeredAsSharedHub = true;
+                _sharedProducer = this;
+                if (!SharedHubsByChannelId.TryAdd(_channelId, this))
+                {
+                    _registeredAsSharedHub = false;
+                    _sharedProducer = null;
+                    continue;
+                }
+
+                AddSharedPlaybackReference(UniqueId);
+
+                try
+                {
+                    await EnsureProducerOpenAsync(openCancellationToken).ConfigureAwait(false);
+                    ConfigureOpenedMediaSourceFromHub(this);
+                    _logger.LogInformation(
+                        "HTSP shared channel hub opened for channel {ChannelId}; upstream subscription {SubscriptionId}; playback {PlaybackId}",
+                        _channelId,
+                        _subscriptionId,
+                        UniqueId);
+                    return;
+                }
+                catch
+                {
+                    ReleaseSharedPlaybackReference(UniqueId, "failed to open shared channel hub");
+                    SharedHubsByChannelId.TryRemove(_channelId, out _);
+                    _registeredAsSharedHub = false;
+                    _sharedProducer = null;
+                    await CloseProducerNow("failed to open shared channel hub").ConfigureAwait(false);
+                    throw;
+                }
+            }
+        }
+
+        private Task EnsureProducerOpenAsync(CancellationToken openCancellationToken)
+        {
+            lock (_producerOpenLock)
+            {
+                if (_producerOpenTask == null || (_producerOpenTask.IsCompleted && !_started && !_closing))
+                {
+                    _producerOpenTask = OpenProducerAsync(openCancellationToken);
+                }
+
+                return _producerOpenTask;
+            }
+        }
+
+        private void ConfigureOpenedMediaSourceFromHub(HtspLiveStream hub)
         {
             var liveStreamPath = "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
+            MediaSource.Id = UniqueId;
             MediaSource.Path = GetClientApiBaseUrl() + liveStreamPath;
             MediaSource.EncoderPath = _appHost.GetApiUrlForLocalAccess() + liveStreamPath;
             MediaSource.EncoderProtocol = MediaProtocol.Http;
             MediaSource.Protocol = MediaProtocol.Http;
             MediaSource.Container = "ts";
-            // The HTSP path rebuilds MPEG-TS from demuxed muxpkt payloads.
-            // Keep the client-facing container as "ts", but ask Jellyfin/ffmpeg
-            // not to trust DTS too strictly when it has to remux/transcode.
-            MediaSource.IgnoreDts = true;
+            MediaSource.GenPtsInput = true;
+            MediaSource.UseMostCompatibleTranscodingProfile = true;
+            MediaSource.SupportsDirectPlay = true;
+            MediaSource.SupportsDirectStream = true;
+            MediaSource.SupportsTranscoding = true;
+            MediaSource.SupportsProbing = false;
+            MediaSource.RequiresOpening = true;
+            MediaSource.RequiresClosing = true;
+            MediaSource.IsInfiniteStream = true;
+            MediaSource.AnalyzeDurationMs = 2000;
+
+            if (hub?.MediaSource?.MediaStreams != null && hub.MediaSource.MediaStreams.Count > 0)
+            {
+                MediaSource.MediaStreams = hub.MediaSource.MediaStreams.Select(CloneMediaStream).ToList();
+                MediaSource.DefaultAudioStreamIndex = hub.MediaSource.DefaultAudioStreamIndex;
+                MediaSource.DefaultSubtitleStreamIndex = hub.MediaSource.DefaultSubtitleStreamIndex;
+                MediaSource.Bitrate = hub.MediaSource.Bitrate;
+            }
+        }
+
+        private static MediaStream CloneMediaStream(MediaStream source)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            var target = new MediaStream();
+            foreach (var property in typeof(MediaStream).GetProperties().Where(i => i.CanRead && i.CanWrite && i.GetIndexParameters().Length == 0))
+            {
+                try
+                {
+                    property.SetValue(target, property.GetValue(source));
+                }
+                catch
+                {
+                }
+            }
+
+            return target;
+        }
+
+        private void ConfigureOpenedMediaSource()
+        {
+            var liveStreamPath = "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
+            MediaSource.Id = UniqueId;
+            MediaSource.Path = GetClientApiBaseUrl() + liveStreamPath;
+            MediaSource.EncoderPath = _appHost.GetApiUrlForLocalAccess() + liveStreamPath;
+            MediaSource.EncoderProtocol = MediaProtocol.Http;
+            MediaSource.Protocol = MediaProtocol.Http;
+            MediaSource.Container = "ts";
             MediaSource.GenPtsInput = true;
             // Prefer the most-compatible live TV transcoding profile for HTSP so
             // clients that need server-side HLS get TS/H.264-family output rather
@@ -331,6 +497,36 @@ namespace TVHeadEnd
 
         public Task Close()
         {
+            if (Interlocked.Exchange(ref _playbackCloseStarted, 1) != 0)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (IsSharedProxy)
+            {
+                CloseOwnedConsumerQueues(UniqueId, "shared playback instance closed");
+                _sharedProducer.ReleaseSharedPlaybackReference(UniqueId, "shared playback instance closed");
+                return Task.CompletedTask;
+            }
+
+            CloseOwnedConsumerQueues(UniqueId, "shared playback instance closed");
+            var remainingReferences = ReleaseSharedPlaybackReference(UniqueId, "shared playback instance closed");
+            if (remainingReferences > 0)
+            {
+                _logger.LogInformation(
+                    "HTSP shared channel hub for channel {ChannelId} kept open after playback {PlaybackId} closed; {RemainingPlaybackCount} shared playback(s) remain",
+                    _channelId,
+                    UniqueId,
+                    remainingReferences);
+                return Task.CompletedTask;
+            }
+
+            ScheduleSharedHubIdleClose("last shared playback instance closed");
+            return Task.CompletedTask;
+        }
+
+        private Task CloseProducerNow(string reason)
+        {
             if (Interlocked.Exchange(ref _closeStarted, 1) != 0)
             {
                 return Task.CompletedTask;
@@ -340,41 +536,440 @@ namespace TVHeadEnd
             EnableStreamSharing = false;
             _lifetimeCancellationTokenSource.Cancel();
             CancelReaderIdleDisconnect();
+            CancelSharedHubIdleClose();
+            CancelAllOwnerIdleDisconnects();
             DisposeClientAbortRegistration();
+            CompleteAllConsumerQueues();
             _stream.Complete();
             CloseCurrentConnection(unsubscribe: true);
 
+            if (_registeredAsSharedHub)
+            {
+                SharedHubsByChannelId.TryRemove(_channelId, out _);
+                _registeredAsSharedHub = false;
+            }
+
             _logger.LogInformation(
-                "HTSP live stream closed for channel {ChannelId}; subscription {SubscriptionId} stopped",
+                "HTSP shared channel hub closed for channel {ChannelId}; subscription {SubscriptionId} stopped. Reason: {Reason}",
                 _channelId,
-                _subscriptionId);
+                _subscriptionId,
+                reason);
 
             return Task.CompletedTask;
         }
 
         public Stream GetStream()
         {
-            // Do not bind the HTSP subscription lifetime directly to the ambient
-            // HttpContext.RequestAborted token here.  For Jellyfin HLS/remux paths
-            // the ambient request can be /videos/.../live.m3u8 while ffmpeg is the
-            // actual reader of /LiveTv/LiveStreamFiles/.../stream.ts.  Treating
-            // that outer request as the direct stream consumer can close Tvheadend
-            // while ffmpeg is still starting, causing live.m3u8 failures.
-            //
-            // Also do not return the producer BlockingByteStream directly. Jellyfin
-            // can create and dispose short-lived wrappers while it is preparing HLS,
-            // before ffmpeg has opened EncoderPath. Returning a non-closing reader
-            // keeps /LiveTv/LiveStreamFiles/.../stream.ts registered long enough for
-            // ffmpeg and closes the subscription through CloseLiveStream, bounded
-            // buffering, or an idle reader timeout after actual bytes were consumed.
+            // Each Jellyfin playback instance gets a unique stream URL, but all
+            // instances for the same TVHeadend channel attach to the same upstream
+            // HTSP hub.  Do not return the producer queue directly: every reader
+            // needs its own bounded queue so one client cannot consume bytes that
+            // another client needs or block every other client.
+            var hub = IsSharedProxy ? _sharedProducer : this;
+            return hub.CreateFanoutReader(UniqueId);
+        }
+
+        private Stream CreateFanoutReader(string playbackId)
+        {
             var readerId = Guid.NewGuid().ToString("N");
+            BlockingByteStream queue = null;
+            queue = new BlockingByteStream(reason => OnBroadcastQueueClosed(playbackId, queue, reason));
+
+            lock (_broadcastLock)
+            {
+                if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
+                {
+                    queue.Complete();
+                }
+                else
+                {
+                    if (!_consumerQueuesByOwner.TryGetValue(playbackId, out var queues))
+                    {
+                        queues = new List<BlockingByteStream>();
+                        _consumerQueuesByOwner[playbackId] = queues;
+                    }
+
+                    queues.Add(queue);
+                    foreach (var cachedChunk in _startupCache)
+                    {
+                        queue.WriteChunk(cachedChunk);
+                    }
+                }
+            }
+
             OnStreamReaderOpened(readerId);
             return new ConsumerReadStream(
-                _stream,
-                hasRead => OnStreamReaderClosed(readerId, hasRead),
+                queue,
+                hasRead => OnBroadcastReaderClosed(playbackId, queue, readerId, hasRead),
                 _logger,
                 _channelId,
                 readerId);
+        }
+
+        private void OnBroadcastReaderClosed(string playbackId, BlockingByteStream queue, string readerId, bool consumedBytes)
+        {
+            var removed = RemoveConsumerQueue(playbackId, queue, complete: true);
+            if (!removed)
+            {
+                return;
+            }
+
+            int activeReaders;
+            lock (_readerStateLock)
+            {
+                if (_activeStreamReaders > 0)
+                {
+                    _activeStreamReaders--;
+                }
+
+                activeReaders = _activeStreamReaders;
+            }
+
+            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (!consumedBytes)
+            {
+                _logger.LogDebug(
+                    "HTSP shared reader {ReaderId} for channel {ChannelId}, playback {PlaybackId}, was disposed before consuming bytes; keeping shared hub open",
+                    readerId,
+                    _channelId,
+                    playbackId);
+                return;
+            }
+
+            _logger.LogDebug(
+                "HTSP shared reader {ReaderId} closed for channel {ChannelId}, playback {PlaybackId}; active shared reader count is {ActiveReaderCount}",
+                readerId,
+                _channelId,
+                playbackId,
+                activeReaders);
+
+            if (!OwnerHasConsumerQueues(playbackId))
+            {
+                ScheduleOwnerIdleDisconnect(playbackId, "Jellyfin disposed the direct stream reader after consuming data");
+            }
+        }
+
+        private void OnBroadcastQueueClosed(string playbackId, BlockingByteStream queue, string reason)
+        {
+            RemoveConsumerQueue(playbackId, queue, complete: true);
+            if (!OwnerHasConsumerQueues(playbackId))
+            {
+                _logger.LogInformation(
+                    "HTSP shared playback {PlaybackId} for channel {ChannelId} stopped because its reader queue closed. Reason: {Reason}",
+                    playbackId,
+                    _channelId,
+                    reason);
+                ReleaseSharedPlaybackReference(playbackId, reason);
+            }
+        }
+
+        private bool RemoveConsumerQueue(string playbackId, BlockingByteStream queue, bool complete)
+        {
+            if (queue == null)
+            {
+                return false;
+            }
+
+            var removed = false;
+            lock (_broadcastLock)
+            {
+                if (_consumerQueuesByOwner.TryGetValue(playbackId, out var queues))
+                {
+                    removed = queues.Remove(queue);
+                    if (queues.Count == 0)
+                    {
+                        _consumerQueuesByOwner.Remove(playbackId);
+                    }
+                }
+            }
+
+            if (removed && complete)
+            {
+                queue.Complete();
+            }
+
+            return removed;
+        }
+
+        private bool OwnerHasConsumerQueues(string playbackId)
+        {
+            lock (_broadcastLock)
+            {
+                return _consumerQueuesByOwner.TryGetValue(playbackId, out var queues) && queues.Count > 0;
+            }
+        }
+
+        private void CloseOwnedConsumerQueues(string playbackId, string reason)
+        {
+            List<BlockingByteStream> queues = null;
+            lock (_broadcastLock)
+            {
+                if (_consumerQueuesByOwner.TryGetValue(playbackId, out queues))
+                {
+                    _consumerQueuesByOwner.Remove(playbackId);
+                    queues = queues.ToList();
+                }
+            }
+
+            if (queues != null)
+            {
+                foreach (var queue in queues)
+                {
+                    queue.Complete();
+                }
+            }
+
+            CancelOwnerIdleDisconnect(playbackId);
+        }
+
+        private void CompleteAllConsumerQueues()
+        {
+            List<BlockingByteStream> queues;
+            lock (_broadcastLock)
+            {
+                queues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
+                _consumerQueuesByOwner.Clear();
+            }
+
+            foreach (var queue in queues)
+            {
+                queue.Complete();
+            }
+        }
+
+        private void BroadcastOutput(byte[] chunk)
+        {
+            List<BlockingByteStream> queues;
+            lock (_broadcastLock)
+            {
+                AddStartupCacheChunkLocked(chunk);
+                queues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
+            }
+
+            foreach (var queue in queues)
+            {
+                queue.WriteChunk(chunk);
+            }
+        }
+
+        private void AddStartupCacheChunkLocked(byte[] chunk)
+        {
+            if (chunk == null || chunk.Length == 0 || !LooksLikeTransportStream(chunk))
+            {
+                return;
+            }
+
+            _startupCache.Enqueue(chunk);
+            _startupCacheBytes += chunk.Length;
+            while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
+            {
+                var removed = _startupCache.Dequeue();
+                _startupCacheBytes -= removed.Length;
+            }
+        }
+
+        private void AddSharedPlaybackReference(string playbackId)
+        {
+            lock (_sharedReferenceLock)
+            {
+                _sharedPlaybackReferences.Add(playbackId);
+                CancelSharedHubIdleCloseLocked();
+            }
+        }
+
+        private int ReleaseSharedPlaybackReference(string playbackId, string reason)
+        {
+            var remaining = 0;
+            var shouldScheduleClose = false;
+            lock (_sharedReferenceLock)
+            {
+                _sharedPlaybackReferences.Remove(playbackId);
+                remaining = _sharedPlaybackReferences.Count;
+                shouldScheduleClose = remaining == 0;
+            }
+
+            CancelOwnerIdleDisconnect(playbackId);
+
+            if (shouldScheduleClose && !IsSharedProxy)
+            {
+                ScheduleSharedHubIdleClose(reason);
+            }
+
+            return remaining;
+        }
+
+        private int GetSharedPlaybackReferenceCount()
+        {
+            lock (_sharedReferenceLock)
+            {
+                return _sharedPlaybackReferences.Count;
+            }
+        }
+
+        private void ScheduleOwnerIdleDisconnect(string playbackId, string reason)
+        {
+            CancellationTokenSource idleCts;
+            lock (_broadcastLock)
+            {
+                if (OwnerHasConsumerQueues(playbackId) || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                CancelOwnerIdleDisconnectLocked(playbackId);
+                idleCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellationTokenSource.Token);
+                _ownerIdleDisconnects[playbackId] = idleCts;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(ReaderIdleCloseDelay, idleCts.Token).ConfigureAwait(false);
+                    if (!OwnerHasConsumerQueues(playbackId))
+                    {
+                        _logger.LogInformation(
+                            "HTSP shared playback {PlaybackId} for channel {ChannelId} became idle; releasing playback reference. Reason: {Reason}",
+                            playbackId,
+                            _channelId,
+                            reason);
+                        ReleaseSharedPlaybackReference(playbackId, reason);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                finally
+                {
+                    lock (_broadcastLock)
+                    {
+                        if (_ownerIdleDisconnects.TryGetValue(playbackId, out var current) && ReferenceEquals(current, idleCts))
+                        {
+                            _ownerIdleDisconnects.Remove(playbackId);
+                        }
+                    }
+
+                    idleCts.Dispose();
+                }
+            });
+        }
+
+        private void CancelOwnerIdleDisconnect(string playbackId)
+        {
+            lock (_broadcastLock)
+            {
+                CancelOwnerIdleDisconnectLocked(playbackId);
+            }
+        }
+
+        private void CancelOwnerIdleDisconnectLocked(string playbackId)
+        {
+            if (_ownerIdleDisconnects.TryGetValue(playbackId, out var cts))
+            {
+                try
+                {
+                    cts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                _ownerIdleDisconnects.Remove(playbackId);
+            }
+        }
+
+        private void CancelAllOwnerIdleDisconnects()
+        {
+            List<CancellationTokenSource> tokens;
+            lock (_broadcastLock)
+            {
+                tokens = _ownerIdleDisconnects.Values.ToList();
+                _ownerIdleDisconnects.Clear();
+            }
+
+            foreach (var token in tokens)
+            {
+                try
+                {
+                    token.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+        }
+
+        private void ScheduleSharedHubIdleClose(string reason)
+        {
+            CancellationTokenSource idleCts;
+            lock (_sharedReferenceLock)
+            {
+                if (_sharedPlaybackReferences.Count > 0 || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                CancelSharedHubIdleCloseLocked();
+                idleCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellationTokenSource.Token);
+                _sharedHubIdleCloseCancellationTokenSource = idleCts;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(ReaderIdleCloseDelay, idleCts.Token).ConfigureAwait(false);
+                    lock (_sharedReferenceLock)
+                    {
+                        if (!ReferenceEquals(_sharedHubIdleCloseCancellationTokenSource, idleCts) || _sharedPlaybackReferences.Count > 0)
+                        {
+                            return;
+                        }
+                    }
+
+                    await CloseProducerNow(reason).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                finally
+                {
+                    lock (_sharedReferenceLock)
+                    {
+                        if (ReferenceEquals(_sharedHubIdleCloseCancellationTokenSource, idleCts))
+                        {
+                            _sharedHubIdleCloseCancellationTokenSource = null;
+                        }
+                    }
+
+                    idleCts.Dispose();
+                }
+            });
+        }
+
+        private void CancelSharedHubIdleClose()
+        {
+            lock (_sharedReferenceLock)
+            {
+                CancelSharedHubIdleCloseLocked();
+            }
+        }
+
+        private void CancelSharedHubIdleCloseLocked()
+        {
+            try
+            {
+                _sharedHubIdleCloseCancellationTokenSource?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            _sharedHubIdleCloseCancellationTokenSource = null;
         }
 
         private void OnStreamReaderOpened(string readerId)
@@ -548,19 +1143,7 @@ namespace TVHeadEnd
                 return;
             }
 
-            // Mark the stream as closing before scheduling the asynchronous cleanup.
-            // This prevents a queued socket error from starting a reconnect after the
-            // Jellyfin HTTP client has already gone away.
-            _closing = true;
-            _lifetimeCancellationTokenSource.Cancel();
-
-            _logger.LogInformation(
-                "HTSP live stream consumer disconnected for channel {ChannelId}; closing TVHeadend subscription {SubscriptionId}. Reason: {Reason}",
-                _channelId,
-                _subscriptionId,
-                reason);
-
-            _ = Task.Run(() => Close());
+            ReleaseSharedPlaybackReference(UniqueId, reason);
         }
 
         private void DisposeClientAbortRegistration()
@@ -1585,7 +2168,7 @@ namespace TVHeadEnd
             }
 
             _started = true;
-            _stream.WriteChunk(chunk);
+            BroadcastOutput(chunk);
             _firstPacket.TrySetResult(true);
             GetConnectionFirstPacketTaskSource().TrySetResult(true);
         }
@@ -1599,8 +2182,14 @@ namespace TVHeadEnd
 
             _closing = true;
             _lifetimeCancellationTokenSource.Cancel();
+            CompleteAllConsumerQueues();
             _stream.Complete(ex);
             CloseCurrentConnection(unsubscribe: true);
+            if (_registeredAsSharedHub)
+            {
+                SharedHubsByChannelId.TryRemove(_channelId, out _);
+                _registeredAsSharedHub = false;
+            }
         }
 
         private void ResetConnectionAttemptSignals()
@@ -1660,6 +2249,8 @@ namespace TVHeadEnd
             {
                 return;
             }
+
+            connection.BeginExpectedClose();
 
             if (unsubscribe && _subscriptionId > 0)
             {
@@ -1765,7 +2356,20 @@ namespace TVHeadEnd
         public void Dispose()
         {
             Close().GetAwaiter().GetResult();
+
+            if (!IsSharedProxy && _registeredAsSharedHub && GetSharedPlaybackReferenceCount() > 0)
+            {
+                // Jellyfin may dispose the first playback object while other
+                // devices are still attached to the shared upstream channel hub.
+                // The static hub table still owns this object, so keep producer
+                // resources alive until the last playback reference leaves.
+                return;
+            }
+
             DisposeClientAbortRegistration();
+            CancelReaderIdleDisconnect();
+            CancelSharedHubIdleClose();
+            CancelAllOwnerIdleDisconnects();
             _stream.Dispose();
             _lifetimeCancellationTokenSource.Dispose();
             _connectionSemaphore.Dispose();

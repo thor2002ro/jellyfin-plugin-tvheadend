@@ -2,11 +2,13 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Helper;
@@ -120,6 +122,7 @@ namespace TVHeadEnd
                 await _firstPacket.Task.ConfigureAwait(false);
                 MediaSource.Path = _appHost.GetApiUrlForLocalAccess() + "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
                 MediaSource.Protocol = MediaProtocol.Http;
+                MediaSource.Container = "ts";
             }
             catch (Exception ex) when (!(ex is OperationCanceledException && openCancellationToken.IsCancellationRequested))
             {
@@ -362,7 +365,7 @@ namespace TVHeadEnd
             var streams = new List<HtspTransportStreamMuxer.StreamInfo>();
             foreach (var item in response.getList("streams"))
             {
-                if (item is not HTSMessage stream || !stream.containsField("index") || !stream.containsField("type"))
+                if (item is not HTSMessage stream || !stream.containsField("index"))
                 {
                     continue;
                 }
@@ -370,7 +373,7 @@ namespace TVHeadEnd
                 streams.Add(new HtspTransportStreamMuxer.StreamInfo
                 {
                     Index = stream.getInt("index"),
-                    Codec = stream.getString("type"),
+                    Codec = stream.getString("type", "UNKNOWN"),
                     Language = stream.getString("language", string.Empty),
                     Meta = stream.containsField("meta") ? stream.getByteArray("meta") : null,
                     Width = GetInt(stream, "width", 0),
@@ -383,17 +386,312 @@ namespace TVHeadEnd
                 });
             }
 
-            _muxer.SetStreams(streams);
+            var orderedStreams = streams.OrderBy(i => i.Index).ToList();
+            _muxer.SetStreams(orderedStreams);
+            UpdateMediaSourceStreamMetadata(orderedStreams);
             LogSourceInfo(response);
             _logger.LogInformation(
-                "HTSP stream metadata received: {TotalCount} stream(s), muxing {SupportedCount} supported stream(s)",
-                streams.Count,
-                _muxer.SupportedStreamCount);
+                "HTSP stream metadata received: {TotalCount} stream(s), muxing all {MuxedCount} stream(s): {StreamSummary}",
+                orderedStreams.Count,
+                _muxer.SupportedStreamCount,
+                _muxer.StreamSummary);
 
-            if (streams.Count > 0 && _muxer.SupportedStreamCount == 0)
+            if (orderedStreams.Count > 0 && _muxer.SupportedStreamCount != orderedStreams.Count)
             {
-                _logger.LogWarning("TVHeadend reported streams, but none of their codecs can be remuxed into MPEG-TS by the HTSP muxer.");
+                _logger.LogWarning(
+                    "HTSP stream metadata contained {TotalCount} stream(s), but only {MuxedCount} stream(s) could be routed. This should only happen for malformed duplicate/missing stream indexes.",
+                    orderedStreams.Count,
+                    _muxer.SupportedStreamCount);
             }
+        }
+
+        private void UpdateMediaSourceStreamMetadata(IReadOnlyList<HtspTransportStreamMuxer.StreamInfo> streams)
+        {
+            if (streams == null || streams.Count == 0)
+            {
+                return;
+            }
+
+            var mediaStreams = new List<MediaStream>();
+            MediaStream firstAudioStream = null;
+            var ffmpegStreamIndex = 0;
+
+            foreach (var stream in streams.OrderBy(i => i.Index))
+            {
+                var mediaStream = CreateMediaStream(stream, ffmpegStreamIndex);
+                if (mediaStream != null)
+                {
+                    if (mediaStream.Type == MediaStreamType.Audio && firstAudioStream == null)
+                    {
+                        mediaStream.IsDefault = true;
+                        firstAudioStream = mediaStream;
+                    }
+
+                    mediaStreams.Add(mediaStream);
+                }
+
+                ffmpegStreamIndex++;
+            }
+
+            if (mediaStreams.Count == 0)
+            {
+                _logger.LogWarning("HTSP subscription {SubscriptionId} did not expose any playable audio/video/subtitle stream metadata to Jellyfin", _subscriptionId);
+                return;
+            }
+
+            MediaSource.MediaStreams = mediaStreams;
+            MediaSource.DefaultAudioStreamIndex = firstAudioStream?.Index;
+            MediaSource.DefaultSubtitleStreamIndex = null;
+
+            // We already have the authoritative track list from HTSP subscriptionStart.
+            // Letting Jellyfin run its short live probe can replace this complete list
+            // with only the tracks that happened to emit packets during the probe window.
+            MediaSource.SupportsProbing = false;
+
+            _logger.LogInformation(
+                "HTSP exposed {Count} playable stream(s) to Jellyfin metadata: {Streams}; private/data streams remain preserved in the MPEG-TS output",
+                mediaStreams.Count,
+                string.Join(", ", mediaStreams.Select(i => $"#{i.Index}:{i.Type}:{i.Codec}{(string.IsNullOrWhiteSpace(i.Language) ? string.Empty : ":" + i.Language)}")));
+        }
+
+        private static MediaStream CreateMediaStream(HtspTransportStreamMuxer.StreamInfo stream, int ffmpegStreamIndex)
+        {
+            if (stream == null || !TryGetMediaStreamType(stream.Codec, out var mediaStreamType))
+            {
+                return null;
+            }
+
+            var mediaStream = new MediaStream
+            {
+                Index = ffmpegStreamIndex,
+                Type = mediaStreamType,
+                Codec = ToJellyfinCodec(stream.Codec),
+                Language = NormalizeLanguage(stream.Language),
+                TimeBase = "1/90000",
+                IsExternal = false
+            };
+
+            if (mediaStreamType == MediaStreamType.Video)
+            {
+                if (stream.Width > 0)
+                {
+                    mediaStream.Width = stream.Width;
+                }
+
+                if (stream.Height > 0)
+                {
+                    mediaStream.Height = stream.Height;
+                }
+
+                mediaStream.IsInterlaced = true;
+                mediaStream.RealFrameRate = 50.0F;
+            }
+            else if (mediaStreamType == MediaStreamType.Audio)
+            {
+                if (stream.Channels > 0)
+                {
+                    mediaStream.Channels = stream.Channels;
+                }
+
+                var sampleRate = GetAudioSampleRate(stream);
+                if (sampleRate.HasValue)
+                {
+                    mediaStream.SampleRate = sampleRate.Value;
+                }
+            }
+
+            return mediaStream;
+        }
+
+        private static int? GetAudioSampleRate(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null)
+            {
+                return null;
+            }
+
+            // Tvheadend does not always provide an audio sample rate in the HTSP
+            // subscriptionStart stream map.  Avoid exposing small control/enumeration
+            // values such as 3 as Jellyfin sample rates.
+            if (stream.Rate >= 8000 && stream.Rate <= 384000)
+            {
+                return stream.Rate;
+            }
+
+            switch (NormalizeCodec(stream.Codec))
+            {
+                case "AAC":
+                case "AACADTS":
+                case "AACLC":
+                case "HEAAC":
+                case "MPEG4AUDIO":
+                case "AACLATM":
+                case "LATM":
+                case "MPEG1AUDIO":
+                case "MPEG2AUDIO":
+                case "MP2":
+                case "MP3":
+                case "MPA":
+                case "AC3":
+                case "EAC3":
+                case "DTS":
+                case "DCA":
+                case "TRUEHD":
+                    return 48000;
+                default:
+                    return null;
+            }
+        }
+
+        private static bool TryGetMediaStreamType(string codec, out MediaStreamType mediaStreamType)
+        {
+            switch (NormalizeCodec(codec))
+            {
+                case "MPEG1VIDEO":
+                case "MPEGTS":
+                case "MPEG2VIDEO":
+                case "MPEGVIDEO":
+                case "H264":
+                case "AVC":
+                case "HEVC":
+                case "H265":
+                case "MPEG4VIDEO":
+                case "MPEG4PART2":
+                case "VC1":
+                    mediaStreamType = MediaStreamType.Video;
+                    return true;
+                case "AAC":
+                case "AACADTS":
+                case "AACLC":
+                case "HEAAC":
+                case "MPEG4AUDIO":
+                case "AACLATM":
+                case "LATM":
+                case "MPEG1AUDIO":
+                case "MPEG2AUDIO":
+                case "MP2":
+                case "MP3":
+                case "MPA":
+                case "AC3":
+                case "EAC3":
+                case "DTS":
+                case "DCA":
+                case "VORBIS":
+                case "OPUS":
+                case "TRUEHD":
+                    mediaStreamType = MediaStreamType.Audio;
+                    return true;
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
+                case "TELETEXT":
+                case "TEXTSUB":
+                case "TEXTSUBTITLE":
+                case "SRT":
+                case "SUBRIP":
+                case "SSA":
+                case "ASS":
+                    mediaStreamType = MediaStreamType.Subtitle;
+                    return true;
+                default:
+                    mediaStreamType = default;
+                    return false;
+            }
+        }
+
+        private static string ToJellyfinCodec(string codec)
+        {
+            switch (NormalizeCodec(codec))
+            {
+                case "MPEG1VIDEO":
+                    return "mpeg1video";
+                case "MPEGTS":
+                case "MPEG2VIDEO":
+                case "MPEGVIDEO":
+                    return "mpeg2video";
+                case "H264":
+                case "AVC":
+                    return "h264";
+                case "HEVC":
+                case "H265":
+                    return "hevc";
+                case "MPEG4VIDEO":
+                case "MPEG4PART2":
+                    return "mpeg4";
+                case "VC1":
+                    return "vc1";
+                case "AAC":
+                case "AACADTS":
+                case "AACLC":
+                case "HEAAC":
+                case "MPEG4AUDIO":
+                    return "aac";
+                case "AACLATM":
+                case "LATM":
+                    return "aac_latm";
+                case "MPEG1AUDIO":
+                case "MPEG2AUDIO":
+                case "MP2":
+                case "MPA":
+                    return "mp2";
+                case "MP3":
+                    return "mp3";
+                case "AC3":
+                    return "ac3";
+                case "EAC3":
+                    return "eac3";
+                case "DTS":
+                case "DCA":
+                    return "dts";
+                case "VORBIS":
+                    return "vorbis";
+                case "OPUS":
+                    return "opus";
+                case "TRUEHD":
+                    return "truehd";
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
+                    // Jellyfin classifies subtitle codecs using substring checks;
+                    // "dvb_subtitle" is mistakenly treated as text, while "dvbsub"
+                    // is correctly treated as non-text / non-extractable.
+                    return "dvbsub";
+                case "TELETEXT":
+                    // Keep this non-text too.  Embedded live-TV teletext is carried
+                    // inside the MPEG-TS stream, not as an external text attachment.
+                    return "dvbsub_teletext";
+                case "SRT":
+                case "SUBRIP":
+                    return "subrip";
+                case "SSA":
+                case "ASS":
+                    return "ass";
+                case "TEXTSUB":
+                case "TEXTSUBTITLE":
+                    return "text";
+                default:
+                    return string.IsNullOrWhiteSpace(codec) ? "unknown" : codec.Trim().ToLowerInvariant();
+            }
+        }
+
+        private static string NormalizeCodec(string codec)
+        {
+            return (codec ?? string.Empty)
+                .Replace("-", string.Empty, StringComparison.Ordinal)
+                .Replace("_", string.Empty, StringComparison.Ordinal)
+                .Replace(" ", string.Empty, StringComparison.Ordinal)
+                .ToUpperInvariant();
+        }
+
+        private static string NormalizeLanguage(string language)
+        {
+            if (string.IsNullOrWhiteSpace(language))
+            {
+                return null;
+            }
+
+            var normalized = new string(language.Trim().ToLowerInvariant().Where(char.IsLetter).Take(3).ToArray());
+            return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
         }
 
         private void LogQueueStatus(HTSMessage response)

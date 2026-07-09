@@ -130,7 +130,7 @@ namespace TVHeadEnd
                 MediaSource.EncoderPath = _appHost.GetApiUrlForLocalAccess() + liveStreamPath;
                 MediaSource.EncoderProtocol = MediaProtocol.Http;
                 MediaSource.Protocol = MediaProtocol.Http;
-                MediaSource.Container = "mpegts";
+                MediaSource.Container = "ts";
                 MediaSource.IgnoreDts = true;
                 MediaSource.SupportsDirectPlay = false;
                 MediaSource.SupportsDirectStream = true;
@@ -322,6 +322,18 @@ namespace TVHeadEnd
                 return;
             }
 
+            if (!response.containsField("stream"))
+            {
+                _logger.LogWarning("Ignoring HTSP mux packet without stream index");
+                return;
+            }
+
+            if (!_muxer.HasStreams)
+            {
+                CompleteWithError(new InvalidOperationException("HTSP muxpkt payload is not raw MPEG-TS and no subscriptionStart stream metadata was received for muxing."));
+                return;
+            }
+
             var streamIndex = response.getInt("stream");
             if (!_muxer.IsStreamKnown(streamIndex))
             {
@@ -332,12 +344,6 @@ namespace TVHeadEnd
                         streamIndex);
                 }
 
-                return;
-            }
-
-            if (!_muxer.HasStreams)
-            {
-                CompleteWithError(new InvalidOperationException("HTSP muxpkt payload is not raw MPEG-TS and no subscriptionStart stream metadata was received for muxing."));
                 return;
             }
 

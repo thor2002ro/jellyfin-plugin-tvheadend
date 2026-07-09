@@ -121,7 +121,6 @@ namespace TVHeadEnd
                 ElementaryStreamKind.Audio when !privateStreamId.HasValue => 0xC0 + Math.Min(_nextAudioStreamId++, 0x1F),
                 _ => privateStreamId ?? 0xBD
             };
-
             return true;
         }
 

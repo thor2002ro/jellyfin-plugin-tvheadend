@@ -431,14 +431,28 @@ namespace TVHeadEnd
             }
         }
 
+        private static string GetStableHtspMediaSourceId(string channelId)
+        {
+            var normalizedChannelId = string.IsNullOrWhiteSpace(channelId) ? string.Empty : channelId.Trim();
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes("tvheadend-htsp:" + normalizedChannelId));
+            var guidBytes = hash.Take(16).ToArray();
+
+            // Make the deterministic value GUID-shaped for Jellyfin code paths that
+            // parse MediaSourceInfo.Id as a Guid, while keeping it stable across
+            // repeated GetChannelStreamMediaSources/GetChannelStream calls.
+            guidBytes[7] = (byte)((guidBytes[7] & 0x0F) | 0x40);
+            guidBytes[8] = (byte)((guidBytes[8] & 0x3F) | 0x80);
+            return new Guid(guidBytes).ToString("N");
+        }
+
         private MediaSourceInfo CreateHtspMediaSource(string channelId)
         {
             return new MediaSourceInfo
             {
-            // This ID is used by Jellyfin's HLS/subtitle paths as a media source ID.
-            // Keep the TVHeadend channel ID separate and expose a GUID-shaped media
-            // source ID so subtitle filter/attachment code paths do not try to
-            // Guid.Parse() a numeric TVH channel ID.
+                // This ID is used by Jellyfin's HLS/subtitle paths as a media source ID.
+                // Keep the TVHeadend channel ID separate and expose a GUID-shaped media
+                // source ID so subtitle filter/attachment code paths do not try to
+                // Guid.Parse() a numeric TVH channel ID.
                 Id = GetStableHtspMediaSourceId(channelId),
                 Path = GetClientApiBaseUrl(),
                 EncoderPath = _appHost.GetApiUrlForLocalAccess(),
@@ -454,7 +468,7 @@ namespace TVHeadEnd
                 SupportsTranscoding = true,
                 SupportsProbing = true,
                 IgnoreDts = true,
-                Container = "mpegts",
+                Container = "ts",
                 RequiresOpening = true,
                 RequiresClosing = true,
                 IsInfiniteStream = true,
@@ -775,20 +789,6 @@ namespace TVHeadEnd
         private Task<int> WaitForInitialLoadTask(CancellationToken cancellationToken)
         {
             return Task.Factory.StartNew(() => _htsConnectionHandler.WaitForInitialLoad(cancellationToken), cancellationToken);
-        }
-
-        private static string GetStableHtspMediaSourceId(string channelId)
-        {
-            var normalizedChannelId = string.IsNullOrWhiteSpace(channelId) ? string.Empty : channelId.Trim();
-            var hash = SHA256.HashData(Encoding.UTF8.GetBytes("tvheadend-htsp:" + normalizedChannelId));
-            var guidBytes = hash.Take(16).ToArray();
-
-            // Make the deterministic value GUID-shaped for Jellyfin code paths that
-            // parse MediaSourceInfo.Id as a Guid, while keeping it stable across
-            // repeated GetChannelStreamMediaSources/GetChannelStream calls.
-            guidBytes[7] = (byte)((guidBytes[7] & 0x0F) | 0x40);
-            guidBytes[8] = (byte)((guidBytes[8] & 0x3F) | 0x80);
-            return new Guid(guidBytes).ToString("N");
         }
 
         private static string Dump(List<DayOfWeek> days)

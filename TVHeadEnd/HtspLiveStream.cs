@@ -47,6 +47,7 @@ namespace TVHeadEnd
         private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan InitialReconnectDelay = TimeSpan.FromMilliseconds(750);
         private static readonly TimeSpan MaxReconnectDelay = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan ReaderIdleCloseDelay = TimeSpan.FromSeconds(10);
 
         private static int _nextSubscriptionId;
 
@@ -65,10 +66,12 @@ namespace TVHeadEnd
         private readonly object _muxPacketStatsLock = new object();
         private readonly object _connectionStateLock = new object();
         private readonly object _clientAbortSync = new object();
+        private readonly object _readerStateLock = new object();
         private readonly SemaphoreSlim _connectionSemaphore = new SemaphoreSlim(1, 1);
         private readonly CancellationTokenSource _lifetimeCancellationTokenSource = new CancellationTokenSource();
 
         private CancellationTokenRegistration _clientAbortRegistration;
+        private CancellationTokenSource _readerIdleDisconnectCancellationTokenSource;
         private HTSConnectionAsync _connection;
         private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
         private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
@@ -76,6 +79,7 @@ namespace TVHeadEnd
         private int _reconnectScheduled;
         private int _liveReconnectAttempts;
         private int _closeStarted;
+        private int _activeStreamReaders;
         private bool _closing;
         private bool _started;
         private bool _recovering;
@@ -190,6 +194,15 @@ namespace TVHeadEnd
             MediaSource.EncoderProtocol = MediaProtocol.Http;
             MediaSource.Protocol = MediaProtocol.Http;
             MediaSource.Container = "ts";
+            // The HTSP path rebuilds MPEG-TS from demuxed muxpkt payloads.
+            // Keep the client-facing container as "ts", but ask Jellyfin/ffmpeg
+            // not to trust DTS too strictly when it has to remux/transcode.
+            MediaSource.IgnoreDts = true;
+            MediaSource.GenPtsInput = true;
+            // Prefer the most-compatible live TV transcoding profile for HTSP so
+            // clients that need server-side HLS get TS/H.264-family output rather
+            // than fMP4/AV1 when the server cannot open av1_vaapi.
+            MediaSource.UseMostCompatibleTranscodingProfile = true;
             MediaSource.SupportsDirectPlay = true;
             MediaSource.SupportsDirectStream = true;
             MediaSource.SupportsTranscoding = true;
@@ -325,6 +338,7 @@ namespace TVHeadEnd
             _closing = true;
             EnableStreamSharing = false;
             _lifetimeCancellationTokenSource.Cancel();
+            CancelReaderIdleDisconnect();
             DisposeClientAbortRegistration();
             _stream.Complete();
             CloseCurrentConnection(unsubscribe: true);
@@ -339,8 +353,159 @@ namespace TVHeadEnd
 
         public Stream GetStream()
         {
-            RegisterClientAbortCallback();
-            return _stream;
+            // Do not bind the HTSP subscription lifetime directly to the ambient
+            // HttpContext.RequestAborted token here.  For Jellyfin HLS/remux paths
+            // the ambient request can be /videos/.../live.m3u8 while ffmpeg is the
+            // actual reader of /LiveTv/LiveStreamFiles/.../stream.ts.  Treating
+            // that outer request as the direct stream consumer can close Tvheadend
+            // while ffmpeg is still starting, causing live.m3u8 failures.
+            //
+            // Also do not return the producer BlockingByteStream directly. Jellyfin
+            // can create and dispose short-lived wrappers while it is preparing HLS,
+            // before ffmpeg has opened EncoderPath. Returning a non-closing reader
+            // keeps /LiveTv/LiveStreamFiles/.../stream.ts registered long enough for
+            // ffmpeg and closes the subscription through CloseLiveStream, bounded
+            // buffering, or an idle reader timeout after actual bytes were consumed.
+            var readerId = Guid.NewGuid().ToString("N");
+            OnStreamReaderOpened(readerId);
+            return new ConsumerReadStream(
+                _stream,
+                hasRead => OnStreamReaderClosed(readerId, hasRead),
+                _logger,
+                _channelId,
+                readerId);
+        }
+
+        private void OnStreamReaderOpened(string readerId)
+        {
+            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
+            {
+                return;
+            }
+
+            int activeReaders;
+            lock (_readerStateLock)
+            {
+                _activeStreamReaders++;
+                activeReaders = _activeStreamReaders;
+                CancelReaderIdleDisconnectLocked();
+            }
+
+            _logger.LogDebug(
+                "HTSP direct stream reader {ReaderId} opened for channel {ChannelId}; active reader count is {ActiveReaderCount}",
+                readerId,
+                _channelId,
+                activeReaders);
+        }
+
+        private void OnStreamReaderClosed(string readerId, bool consumedBytes)
+        {
+            int activeReaders;
+            lock (_readerStateLock)
+            {
+                if (_activeStreamReaders > 0)
+                {
+                    _activeStreamReaders--;
+                }
+
+                activeReaders = _activeStreamReaders;
+            }
+
+            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (!consumedBytes)
+            {
+                _logger.LogDebug(
+                    "HTSP direct stream reader {ReaderId} for channel {ChannelId} was disposed before consuming bytes; keeping Tvheadend subscription {SubscriptionId} open for Jellyfin/ffmpeg",
+                    readerId,
+                    _channelId,
+                    _subscriptionId);
+                return;
+            }
+
+            _logger.LogDebug(
+                "HTSP direct stream reader {ReaderId} closed for channel {ChannelId}; active reader count is {ActiveReaderCount}",
+                readerId,
+                _channelId,
+                activeReaders);
+
+            if (activeReaders <= 0)
+            {
+                ScheduleReaderIdleDisconnect("Jellyfin disposed the direct stream reader after consuming data");
+            }
+        }
+
+        private void ScheduleReaderIdleDisconnect(string reason)
+        {
+            CancellationTokenSource idleCts;
+            lock (_readerStateLock)
+            {
+                if (_activeStreamReaders > 0 || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                CancelReaderIdleDisconnectLocked();
+                idleCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellationTokenSource.Token);
+                _readerIdleDisconnectCancellationTokenSource = idleCts;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(ReaderIdleCloseDelay, idleCts.Token).ConfigureAwait(false);
+
+                    lock (_readerStateLock)
+                    {
+                        if (!ReferenceEquals(_readerIdleDisconnectCancellationTokenSource, idleCts) || _activeStreamReaders > 0)
+                        {
+                            return;
+                        }
+                    }
+
+                    OnConsumerClosed(reason);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                finally
+                {
+                    lock (_readerStateLock)
+                    {
+                        if (ReferenceEquals(_readerIdleDisconnectCancellationTokenSource, idleCts))
+                        {
+                            _readerIdleDisconnectCancellationTokenSource = null;
+                        }
+                    }
+
+                    idleCts.Dispose();
+                }
+            });
+        }
+
+        private void CancelReaderIdleDisconnect()
+        {
+            lock (_readerStateLock)
+            {
+                CancelReaderIdleDisconnectLocked();
+            }
+        }
+
+        private void CancelReaderIdleDisconnectLocked()
+        {
+            try
+            {
+                _readerIdleDisconnectCancellationTokenSource?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            _readerIdleDisconnectCancellationTokenSource = null;
         }
 
         private void RegisterClientAbortCallback()
@@ -1622,6 +1787,88 @@ namespace TVHeadEnd
             }
         }
 
+        private sealed class ConsumerReadStream : Stream
+        {
+            private readonly BlockingByteStream _inner;
+            private readonly Action<bool> _onClosed;
+            private readonly ILogger _logger;
+            private readonly string _channelId;
+            private readonly string _readerId;
+            private int _closed;
+            private bool _consumedBytes;
+
+            public ConsumerReadStream(BlockingByteStream inner, Action<bool> onClosed, ILogger logger, string channelId, string readerId)
+            {
+                _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+                _onClosed = onClosed;
+                _logger = logger;
+                _channelId = channelId;
+                _readerId = readerId;
+            }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                var read = _inner.Read(buffer, offset, count);
+                if (read > 0)
+                {
+                    _consumedBytes = true;
+                }
+
+                return read;
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing && Interlocked.Exchange(ref _closed, 1) == 0)
+                {
+                    try
+                    {
+                        _onClosed?.Invoke(_consumedBytes);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(
+                            ex,
+                            "Error while closing HTSP direct stream reader {ReaderId} for channel {ChannelId}",
+                            _readerId,
+                            _channelId);
+                    }
+                }
+
+                base.Dispose(disposing);
+            }
+
+            public override void Flush()
+            {
+            }
+
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void SetLength(long value)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                throw new NotSupportedException();
+            }
+        }
+
         private sealed class BlockingByteStream : Stream
         {
             private const long MaxBufferedBytes = 128L * 1024L * 1024L;
@@ -1775,8 +2022,6 @@ namespace TVHeadEnd
                         _currentOffset = 0;
                         Monitor.PulseAll(_chunks);
                     }
-
-                    SignalConsumerClosed("Jellyfin disposed the direct stream");
                 }
 
                 base.Dispose(disposing);

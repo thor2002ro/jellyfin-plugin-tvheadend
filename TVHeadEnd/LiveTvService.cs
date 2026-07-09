@@ -463,7 +463,13 @@ namespace TVHeadEnd
                 SupportsDirectStream = true,
                 SupportsTranscoding = true,
                 SupportsProbing = true,
+                // Live HTSP is rebuilt MPEG-TS. Prefer Jellyfin's most-compatible
+                // live transcoding profile so web/remote clients do not choose
+                // fMP4/AV1 profiles that the server hardware encoder may not
+                // actually support.
+                UseMostCompatibleTranscodingProfile = true,
                 Container = "ts",
+                GenPtsInput = true,
                 RequiresOpening = true,
                 RequiresClosing = true,
                 IsInfiniteStream = true,

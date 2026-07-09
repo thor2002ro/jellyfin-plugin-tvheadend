@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -35,6 +36,7 @@ namespace TVHeadEnd
         private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly HTSConnectionHandler _htsConnectionHandler;
         private readonly AccessTicketHandler _channelTicketHandler;
+        private readonly ConcurrentDictionary<string, HtspLiveStream> _activeHtspStreams = new ConcurrentDictionary<string, HtspLiveStream>();
 
         private readonly ILogger<LiveTvService> _logger;
         public DateTime _lastRecordingChange = DateTime.MinValue;
@@ -156,6 +158,26 @@ namespace TVHeadEnd
 
         public async Task CloseLiveStream(string subscriptionId, CancellationToken cancellationToken)
         {
+            if (_htsConnectionHandler.GetStreamingMethod() == StreamingMethods.Htsp)
+            {
+                var closedCount = await CloseMatchingHtspStreams(subscriptionId, cancellationToken).ConfigureAwait(false);
+                if (closedCount > 0)
+                {
+                    _logger.LogInformation(
+                        "LiveTvService.CloseLiveStream: closed {ClosedCount} HTSP stream(s) for subscriptionId: {SubscriptionId}",
+                        closedCount,
+                        subscriptionId);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "LiveTvService.CloseLiveStream: no active HTSP stream matched subscriptionId: {SubscriptionId}",
+                        subscriptionId);
+                }
+
+                return;
+            }
+
             await Task.Factory.StartNew(() =>
             {
                 _logger.LogDebug("LiveTvService.CloseLiveStream: closed stream for subscriptionId: {id}", subscriptionId);
@@ -390,18 +412,30 @@ namespace TVHeadEnd
         {
             if (_htsConnectionHandler.GetStreamingMethod() == StreamingMethods.Htsp)
             {
+                HtspLiveStream stream = null;
                 try
                 {
-                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost, _httpContextAccessor);
+                    stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost, _httpContextAccessor);
+                    RegisterHtspLiveStream(stream);
                     await stream.Open(cancellationToken).ConfigureAwait(false);
                     return stream;
                 }
                 catch (HtspLiveStreamException)
                 {
+                    if (stream != null)
+                    {
+                        await stream.Close().ConfigureAwait(false);
+                    }
+
                     throw;
                 }
                 catch (Exception ex) when (!(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
                 {
+                    if (stream != null)
+                    {
+                        await stream.Close().ConfigureAwait(false);
+                    }
+
                     var htspException = HtspLiveStreamException.Create(channelId, ex);
                     _logger.LogError(htspException, "HTSP direct stream provider failed for channel {ChannelId}; TVHeadend HTTP fallback is disabled", channelId);
                     throw htspException;
@@ -410,6 +444,80 @@ namespace TVHeadEnd
 
             var mediaSource = await GetChannelStream(channelId, streamId, cancellationToken).ConfigureAwait(false);
             return new MediaSourceLiveStream(mediaSource, () => CloseLiveStream(mediaSource.Id, CancellationToken.None));
+        }
+
+        private void RegisterHtspLiveStream(HtspLiveStream stream)
+        {
+            if (stream == null)
+            {
+                return;
+            }
+
+            PruneClosedHtspStreams();
+            stream.Closed = OnHtspLiveStreamClosed;
+            _activeHtspStreams[stream.UniqueId] = stream;
+
+            _logger.LogDebug(
+                "Registered HTSP live stream {UniqueId} for channel {ChannelId}, mediaSourceId {MediaSourceId}",
+                stream.UniqueId,
+                stream.ChannelId,
+                stream.OriginalStreamId);
+        }
+
+        private void OnHtspLiveStreamClosed(HtspLiveStream stream)
+        {
+            if (stream == null)
+            {
+                return;
+            }
+
+            _activeHtspStreams.TryRemove(stream.UniqueId, out _);
+        }
+
+        private async Task<int> CloseMatchingHtspStreams(string subscriptionId, CancellationToken cancellationToken)
+        {
+            PruneClosedHtspStreams();
+
+            var matches = _activeHtspStreams.Values
+                .Where(stream => MatchesHtspStream(subscriptionId, stream))
+                .Distinct()
+                .ToList();
+
+            foreach (var stream in matches)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await stream.Close().ConfigureAwait(false);
+            }
+
+            return matches.Count;
+        }
+
+        private void PruneClosedHtspStreams()
+        {
+            foreach (var pair in _activeHtspStreams.ToArray())
+            {
+                if (pair.Value == null || pair.Value.IsClosed)
+                {
+                    _activeHtspStreams.TryRemove(pair.Key, out _);
+                }
+            }
+        }
+
+        private static bool MatchesHtspStream(string subscriptionId, HtspLiveStream stream)
+        {
+            if (stream == null || string.IsNullOrWhiteSpace(subscriptionId))
+            {
+                return false;
+            }
+
+            var id = subscriptionId.Trim();
+            var mediaSourceId = stream.OriginalStreamId ?? stream.MediaSource?.Id;
+
+            return string.Equals(id, stream.UniqueId, StringComparison.OrdinalIgnoreCase)
+                   || (!string.IsNullOrWhiteSpace(mediaSourceId)
+                       && (string.Equals(id, mediaSourceId, StringComparison.OrdinalIgnoreCase)
+                           || id.EndsWith("_" + mediaSourceId, StringComparison.OrdinalIgnoreCase)
+                           || id.EndsWith(mediaSourceId, StringComparison.OrdinalIgnoreCase)));
         }
 
         private string GetClientApiBaseUrl()
@@ -459,15 +567,10 @@ namespace TVHeadEnd
                 EncoderProtocol = MediaProtocol.Http,
                 Protocol = MediaProtocol.Http,
                 AnalyzeDurationMs = 2000,
-                // HTSP is demuxed by Tvheadend and rebuilt by this plugin into a
-                // Jellyfin-facing MPEG-TS.  Do not advertise it as client-direct
-                // playable like Tvheadend's native HTTP TS mux.  Let Jellyfin use
-                // its HLS/remux/transcode path for remote clients and track changes.
-                SupportsDirectPlay = false,
+                SupportsDirectPlay = true,
                 SupportsDirectStream = true,
                 SupportsTranscoding = true,
                 SupportsProbing = true,
-                IgnoreDts = true,
                 Container = "ts",
                 RequiresOpening = true,
                 RequiresClosing = true,

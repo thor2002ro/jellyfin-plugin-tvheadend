@@ -39,6 +39,14 @@ namespace TVHeadEnd
 
     public class HtspLiveStream : ILiveStream, IDirectStreamProvider, HTSConnectionListener
     {
+        private const int MaxOpenAttempts = 3;
+        private const int MaxLiveReconnectAttempts = 5;
+
+        private static readonly TimeSpan SubscribeResponseTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan InitialReconnectDelay = TimeSpan.FromMilliseconds(750);
+        private static readonly TimeSpan MaxReconnectDelay = TimeSpan.FromSeconds(5);
+
         private static int _nextSubscriptionId;
 
         private readonly string _channelId;
@@ -46,15 +54,34 @@ namespace TVHeadEnd
         private readonly IServerApplicationHost _appHost;
         private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly ILogger<HtspLiveStream> _logger;
-        private readonly BlockingByteStream _stream = new BlockingByteStream();
+        private readonly BlockingByteStream _stream;
         private readonly HtspTransportStreamMuxer _muxer = new HtspTransportStreamMuxer();
         private readonly TaskCompletionSource<bool> _firstPacket = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly HashSet<int> _ignoredMuxStreams = new HashSet<int>();
+        private readonly object _connectionStateLock = new object();
+        private readonly SemaphoreSlim _connectionSemaphore = new SemaphoreSlim(1, 1);
+        private readonly CancellationTokenSource _lifetimeCancellationTokenSource = new CancellationTokenSource();
 
         private HTSConnectionAsync _connection;
+        private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
+        private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
         private int _subscriptionId;
-        private bool _closing;
+        private int _reconnectScheduled;
+        private int _liveReconnectAttempts;
+        private int _closeRequested;
+        private volatile bool _closing;
         private bool _started;
+        private bool _recovering;
+
+        private static TaskCompletionSource<bool> CreateFirstPacketSource()
+        {
+            return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        private static TaskCompletionSource<Exception> CreateConnectionErrorSource()
+        {
+            return new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
 
         public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
         {
@@ -64,6 +91,7 @@ namespace TVHeadEnd
             _appHost = appHost;
             _httpContextAccessor = httpContextAccessor;
             _logger = loggerFactory.CreateLogger<HtspLiveStream>();
+            _stream = new BlockingByteStream(OnOutputStreamDisposed);
             UniqueId = Guid.NewGuid().ToString("N");
             OriginalStreamId = mediaSource?.Id;
             ConsumerCount = 1;
@@ -73,6 +101,12 @@ namespace TVHeadEnd
         public int ConsumerCount { get; set; }
 
         public string OriginalStreamId { get; set; }
+
+        public string ChannelId => _channelId;
+
+        public bool IsClosed => IsClosingRequested;
+
+        public Action<HtspLiveStream> Closed { get; set; }
 
         public string TunerHostId => null;
 
@@ -84,76 +118,177 @@ namespace TVHeadEnd
 
         public async Task Open(CancellationToken openCancellationToken)
         {
+            using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+                openCancellationToken,
+                _lifetimeCancellationTokenSource.Token);
+            var cancellationToken = linkedCancellationTokenSource.Token;
             var config = Plugin.Instance.Configuration;
-            _subscriptionId = Interlocked.Increment(ref _nextSubscriptionId);
-            _connection = new HTSConnectionAsync(this, "TVHclient4Jellyfin-HTSP", "" + HTSMessage.HTSP_VERSION, _loggerFactory);
+            var hostname = config.TVH_ServerName.Trim();
+            var username = config.Username.Trim();
+            var password = config.Password.Trim();
+            var profile = config.Profile?.Trim();
+            Exception lastException = null;
+
+            for (var attempt = 1; attempt <= MaxOpenAttempts; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    await ConnectAndSubscribeAsync(
+                        hostname,
+                        config.HTSP_Port,
+                        username,
+                        password,
+                        profile,
+                        cancellationToken,
+                        waitForMuxPacket: true).ConfigureAwait(false);
+
+                    ConfigureOpenedMediaSource();
+                    return;
+                }
+                catch (OperationCanceledException) when (openCancellationToken.IsCancellationRequested || IsClosingRequested)
+                {
+                    await Close().ConfigureAwait(false);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    CloseCurrentConnection(unsubscribe: false);
+
+                    if (attempt >= MaxOpenAttempts)
+                    {
+                        break;
+                    }
+
+                    var delay = GetRetryDelay(attempt);
+                    _logger.LogWarning(
+                        ex,
+                        "HTSP live stream open attempt {Attempt}/{MaxAttempts} failed for channel {ChannelId}; retrying in {DelayMs}ms",
+                        attempt,
+                        MaxOpenAttempts,
+                        _channelId,
+                        (int)delay.TotalMilliseconds);
+
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            await Close().ConfigureAwait(false);
+
+            var htspException = HtspLiveStreamException.Create(_channelId, lastException);
+            _logger.LogError(htspException, "HTSP live stream open failed for channel {ChannelId}; TVHeadend HTTP fallback is disabled", _channelId);
+            throw htspException;
+        }
+
+        private void ConfigureOpenedMediaSource()
+        {
+            var liveStreamPath = "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
+            MediaSource.Path = GetClientApiBaseUrl() + liveStreamPath;
+            MediaSource.EncoderPath = _appHost.GetApiUrlForLocalAccess() + liveStreamPath;
+            MediaSource.EncoderProtocol = MediaProtocol.Http;
+            MediaSource.Protocol = MediaProtocol.Http;
+            MediaSource.Container = "ts";
+            MediaSource.SupportsDirectPlay = true;
+            MediaSource.SupportsDirectStream = true;
+            MediaSource.SupportsTranscoding = true;
+        }
+
+        private async Task ConnectAndSubscribeAsync(
+            string hostname,
+            int port,
+            string username,
+            string password,
+            string profile,
+            CancellationToken cancellationToken,
+            bool waitForMuxPacket)
+        {
+            await _connectionSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
 
             try
             {
-                _connection.open(config.TVH_ServerName.Trim(), config.HTSP_Port);
-                if (!_connection.authenticate(config.Username.Trim(), config.Password.Trim(), false))
+                cancellationToken.ThrowIfCancellationRequested();
+                CloseCurrentConnection(unsubscribe: false);
+                ResetConnectionAttemptSignals();
+
+                _subscriptionId = Interlocked.Increment(ref _nextSubscriptionId);
+                var connection = new HTSConnectionAsync(this, "TVHclient4Jellyfin-HTSP", "" + HTSMessage.HTSP_VERSION, _loggerFactory);
+                lock (_connectionStateLock)
+                {
+                    _connection = connection;
+                }
+
+                connection.open(hostname, port, cancellationToken, maxAttempts: 1);
+                if (!connection.authenticate(username, password, false, cancellationToken, SubscribeResponseTimeout))
                 {
                     throw new InvalidOperationException("TVHeadend HTSP authentication failed.");
                 }
 
-                var subscribe = new HTSMessage { Method = "subscribe" };
-                subscribe.putField("channelId", HtspFieldHelper.ParseUInt32Id(_channelId, "channelId"));
-                subscribe.putField("subscriptionId", _subscriptionId);
-                subscribe.putField("weight", 100);
-                subscribe.putField("90khz", 1);
-                subscribe.putField("normts", 1);
-
-                if (!string.IsNullOrWhiteSpace(config.Profile))
-                {
-                    subscribe.putField("profile", config.Profile.Trim());
-                }
-
+                var subscribe = BuildSubscribeMessage(profile);
                 var response = new TaskResponseHandler();
-                _connection.sendMessage(subscribe, response);
-                var subscribeResponse = await response.Task.WaitAsync(openCancellationToken).ConfigureAwait(false);
-                ParseSubscribeResponse(subscribeResponse);
+                connection.sendMessage(subscribe, response);
 
-                var firstPacket = await Task.WhenAny(_firstPacket.Task, Task.Delay(TimeSpan.FromSeconds(10), openCancellationToken)).ConfigureAwait(false);
-                if (openCancellationToken.IsCancellationRequested)
+                var subscribeTask = response.Task;
+                var errorTask = GetConnectionErrorTask();
+                var subscribeTimeoutTask = Task.Delay(SubscribeResponseTimeout, cancellationToken);
+                var subscribeResult = await Task.WhenAny(subscribeTask, errorTask, subscribeTimeoutTask).ConfigureAwait(false);
+
+                if (subscribeResult == errorTask)
                 {
-                    throw new OperationCanceledException("HTSP live stream open cancelled.", openCancellationToken);
+                    throw await errorTask.ConfigureAwait(false);
                 }
 
-                if (firstPacket != _firstPacket.Task)
+                if (subscribeResult != subscribeTask)
                 {
-                    throw new TimeoutException("Timed out waiting for the first HTSP mux packet.");
+                    cancellationToken.ThrowIfCancellationRequested();
+                    throw new TimeoutException("Timed out waiting for HTSP subscribe response.");
                 }
 
-                await _firstPacket.Task.ConfigureAwait(false);
-                var liveStreamPath = "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
-                MediaSource.Path = GetClientApiBaseUrl() + liveStreamPath;
-                MediaSource.EncoderPath = _appHost.GetApiUrlForLocalAccess() + liveStreamPath;
-                MediaSource.EncoderProtocol = MediaProtocol.Http;
-                MediaSource.Protocol = MediaProtocol.Http;
-                MediaSource.Container = "ts";
-                MediaSource.IgnoreDts = true;
-                MediaSource.SupportsDirectPlay = false;
-                MediaSource.SupportsDirectStream = true;
-                MediaSource.SupportsTranscoding = true;
+                ParseSubscribeResponse(await subscribeTask.ConfigureAwait(false));
+
+                if (waitForMuxPacket)
+                {
+                    var firstPacketTask = GetConnectionFirstPacketTask();
+                    errorTask = GetConnectionErrorTask();
+                    var firstPacketTimeoutTask = Task.Delay(FirstPacketTimeout, cancellationToken);
+                    var firstPacketResult = await Task.WhenAny(firstPacketTask, errorTask, firstPacketTimeoutTask).ConfigureAwait(false);
+
+                    if (firstPacketResult == errorTask)
+                    {
+                        throw await errorTask.ConfigureAwait(false);
+                    }
+
+                    if (firstPacketResult != firstPacketTask)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        throw new TimeoutException("Timed out waiting for the first HTSP mux packet.");
+                    }
+
+                    await firstPacketTask.ConfigureAwait(false);
+                }
             }
-            catch (Exception ex) when (!(ex is OperationCanceledException && openCancellationToken.IsCancellationRequested))
+            finally
             {
-                await Close().ConfigureAwait(false);
-
-                if (ex is HtspLiveStreamException)
-                {
-                    throw;
-                }
-
-                var htspException = HtspLiveStreamException.Create(_channelId, ex);
-                _logger.LogError(htspException, "HTSP live stream open failed for channel {ChannelId}; TVHeadend HTTP fallback is disabled", _channelId);
-                throw htspException;
+                _connectionSemaphore.Release();
             }
-            catch
+        }
+
+        private HTSMessage BuildSubscribeMessage(string profile)
+        {
+            var subscribe = new HTSMessage { Method = "subscribe" };
+            subscribe.putField("channelId", HtspFieldHelper.ParseUInt32Id(_channelId, "channelId"));
+            subscribe.putField("subscriptionId", _subscriptionId);
+            subscribe.putField("weight", 100);
+            subscribe.putField("90khz", 1);
+            subscribe.putField("normts", 1);
+
+            if (!string.IsNullOrWhiteSpace(profile))
             {
-                await Close().ConfigureAwait(false);
-                throw;
+                subscribe.putField("profile", profile.Trim());
             }
+
+            return subscribe;
         }
 
         private string GetClientApiBaseUrl()
@@ -177,27 +312,17 @@ namespace TVHeadEnd
 
         public Task Close()
         {
+            if (Interlocked.Exchange(ref _closeRequested, 1) != 0)
+            {
+                return Task.CompletedTask;
+            }
+
             _closing = true;
             EnableStreamSharing = false;
+            CancelLifetime();
             _stream.Complete();
-
-            if (_connection != null)
-            {
-                try
-                {
-                    var unsubscribe = new HTSMessage { Method = "unsubscribe" };
-                    unsubscribe.putField("subscriptionId", _subscriptionId);
-                    var response = new TaskResponseHandler();
-                    _connection.sendMessage(unsubscribe, response);
-                    response.Task.Wait(TimeSpan.FromSeconds(2));
-                }
-                catch
-                {
-                }
-
-                _connection.stop();
-                _connection = null;
-            }
+            CloseCurrentConnection(unsubscribe: true);
+            NotifyClosed();
 
             return Task.CompletedTask;
         }
@@ -209,7 +334,9 @@ namespace TVHeadEnd
 
         public void onError(Exception ex)
         {
-            if (_closing)
+            NotifyConnectionError(ex);
+
+            if (IsClosingRequested)
             {
                 _logger.LogDebug(ex, "HTSP live stream connection closed");
                 _firstPacket.TrySetCanceled();
@@ -217,8 +344,85 @@ namespace TVHeadEnd
                 return;
             }
 
-            _logger.LogError(ex, "HTSP live stream error");
-            CompleteWithError(ex);
+            if (_recovering || !_started)
+            {
+                _logger.LogWarning(ex, "HTSP live stream connection error while {Phase}; retry controller will handle it", _recovering ? "recovering" : "opening");
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _reconnectScheduled, 1, 0) != 0)
+            {
+                _logger.LogDebug(ex, "HTSP live stream connection error ignored because a reconnect is already scheduled");
+                return;
+            }
+
+            _ = Task.Run(() => ReconnectLoopAsync(ex));
+        }
+
+        private async Task ReconnectLoopAsync(Exception initialException)
+        {
+            Exception lastException = initialException;
+            _recovering = true;
+
+            try
+            {
+                while (!IsClosingRequested)
+                {
+                    var attempt = Interlocked.Increment(ref _liveReconnectAttempts);
+                    if (attempt > MaxLiveReconnectAttempts)
+                    {
+                        break;
+                    }
+
+                    var delay = GetRetryDelay(attempt);
+                    _logger.LogWarning(
+                        lastException,
+                        "HTSP live stream socket failed for channel {ChannelId}; reconnect attempt {Attempt}/{MaxAttempts} in {DelayMs}ms",
+                        _channelId,
+                        attempt,
+                        MaxLiveReconnectAttempts,
+                        (int)delay.TotalMilliseconds);
+
+                    try
+                    {
+                        await Task.Delay(delay, _lifetimeCancellationTokenSource.Token).ConfigureAwait(false);
+
+                        var config = Plugin.Instance.Configuration;
+                        await ConnectAndSubscribeAsync(
+                            config.TVH_ServerName.Trim(),
+                            config.HTSP_Port,
+                            config.Username.Trim(),
+                            config.Password.Trim(),
+                            config.Profile?.Trim(),
+                            _lifetimeCancellationTokenSource.Token,
+                            waitForMuxPacket: true).ConfigureAwait(false);
+
+                        Interlocked.Exchange(ref _liveReconnectAttempts, 0);
+                        _logger.LogInformation("HTSP live stream reconnected for channel {ChannelId} on subscription {SubscriptionId}", _channelId, _subscriptionId);
+                        return;
+                    }
+                    catch (OperationCanceledException) when (IsClosingRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastException = ex;
+                        CloseCurrentConnection(unsubscribe: false);
+                    }
+                }
+
+                if (!IsClosingRequested)
+                {
+                    _logger.LogError(lastException, "HTSP live stream reconnect exhausted for channel {ChannelId}; closing Jellyfin stream", _channelId);
+                    CompleteWithError(lastException);
+                }
+            }
+            finally
+            {
+                _recovering = false;
+                Interlocked.Exchange(ref _reconnectScheduled, 0);
+            }
         }
 
         public void onMessage(HTSMessage response)
@@ -365,7 +569,7 @@ namespace TVHeadEnd
             var subscriptionError = response.getString("subscriptionError", string.Empty);
             var details = BuildStatusDetails(status, subscriptionError);
 
-            if (_closing)
+            if (IsClosingRequested)
             {
                 _stream.Complete();
                 return;
@@ -868,19 +1072,169 @@ namespace TVHeadEnd
 
         private void WriteOutput(byte[] chunk)
         {
+            if (IsClosingRequested)
+            {
+                return;
+            }
+
             _started = true;
-            _stream.WriteChunk(chunk);
+            if (!_stream.WriteChunk(chunk))
+            {
+                if (!IsClosingRequested)
+                {
+                    CompleteWithError(new IOException("HTSP output stream is no longer being consumed; closing Tvheadend subscription."));
+                }
+
+                return;
+            }
+
             _firstPacket.TrySetResult(true);
+            GetConnectionFirstPacketTaskSource().TrySetResult(true);
         }
 
         private void CompleteWithError(Exception ex)
         {
-            if (!_closing)
+            if (Interlocked.Exchange(ref _closeRequested, 1) == 0)
             {
-                _firstPacket.TrySetException(ex);
+                _closing = true;
+                EnableStreamSharing = false;
+                CancelLifetime();
+                CloseCurrentConnection(unsubscribe: false);
+                NotifyClosed();
             }
 
+            _firstPacket.TrySetException(ex);
             _stream.Complete(ex);
+        }
+
+        private void OnOutputStreamDisposed()
+        {
+            if (IsClosingRequested)
+            {
+                return;
+            }
+
+            _logger.LogInformation("HTSP output stream for channel {ChannelId} was disposed by Jellyfin/client; closing Tvheadend subscription", _channelId);
+            _ = Close();
+        }
+
+        private bool IsClosingRequested => Volatile.Read(ref _closeRequested) != 0 || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested;
+
+        private void CancelLifetime()
+        {
+            try
+            {
+                _lifetimeCancellationTokenSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private void NotifyClosed()
+        {
+            try
+            {
+                Closed?.Invoke(this);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "HTSP close notification failed for channel {ChannelId}", _channelId);
+            }
+        }
+
+        private void ResetConnectionAttemptSignals()
+        {
+            lock (_connectionStateLock)
+            {
+                _connectionFirstPacket = CreateFirstPacketSource();
+                _connectionError = CreateConnectionErrorSource();
+            }
+        }
+
+        private Task<bool> GetConnectionFirstPacketTask()
+        {
+            lock (_connectionStateLock)
+            {
+                return _connectionFirstPacket.Task;
+            }
+        }
+
+        private TaskCompletionSource<bool> GetConnectionFirstPacketTaskSource()
+        {
+            lock (_connectionStateLock)
+            {
+                return _connectionFirstPacket;
+            }
+        }
+
+        private Task<Exception> GetConnectionErrorTask()
+        {
+            lock (_connectionStateLock)
+            {
+                return _connectionError.Task;
+            }
+        }
+
+        private void NotifyConnectionError(Exception ex)
+        {
+            TaskCompletionSource<Exception> source;
+            lock (_connectionStateLock)
+            {
+                source = _connectionError;
+            }
+
+            source.TrySetResult(ex);
+        }
+
+        private void CloseCurrentConnection(bool unsubscribe)
+        {
+            HTSConnectionAsync connection;
+            lock (_connectionStateLock)
+            {
+                connection = _connection;
+                _connection = null;
+            }
+
+            if (connection == null)
+            {
+                return;
+            }
+
+            if (unsubscribe && _subscriptionId > 0)
+            {
+                try
+                {
+                    var unsubscribeMessage = new HTSMessage { Method = "unsubscribe" };
+                    unsubscribeMessage.putField("subscriptionId", _subscriptionId);
+                    var response = new TaskResponseHandler();
+                    connection.sendMessage(unsubscribeMessage, response);
+                    response.Task.Wait(TimeSpan.FromSeconds(2));
+                }
+                catch
+                {
+                }
+            }
+
+            try
+            {
+                connection.stop();
+            }
+            catch
+            {
+            }
+        }
+
+        private static TimeSpan GetRetryDelay(int attempt)
+        {
+            if (attempt <= 1)
+            {
+                return InitialReconnectDelay;
+            }
+
+            var multiplier = Math.Min(1 << Math.Min(attempt - 1, 4), 16);
+            var delay = TimeSpan.FromMilliseconds(InitialReconnectDelay.TotalMilliseconds * multiplier);
+            return delay > MaxReconnectDelay ? MaxReconnectDelay : delay;
         }
 
         private bool BelongsToCurrentSubscription(HTSMessage response)
@@ -952,6 +1306,8 @@ namespace TVHeadEnd
         {
             Close().GetAwaiter().GetResult();
             _stream.Dispose();
+            _lifetimeCancellationTokenSource.Dispose();
+            _connectionSemaphore.Dispose();
         }
 
         internal static bool LooksLikeTransportStream(byte[] payload)
@@ -987,11 +1343,21 @@ namespace TVHeadEnd
 
         private sealed class BlockingByteStream : Stream
         {
+            private const long MaxBufferedBytes = 64L * 1024L * 1024L;
+
             private readonly Queue<byte[]> _chunks = new Queue<byte[]>();
+            private readonly Action _onDisposed;
             private byte[] _current;
             private int _currentOffset;
+            private long _queuedBytes;
+            private int _disposeNotified;
             private bool _completed;
             private Exception _error;
+
+            public BlockingByteStream(Action onDisposed)
+            {
+                _onDisposed = onDisposed;
+            }
 
             public override bool CanRead => true;
             public override bool CanSeek => false;
@@ -1004,22 +1370,32 @@ namespace TVHeadEnd
                 set => throw new NotSupportedException();
             }
 
-            public void WriteChunk(byte[] chunk)
+            public bool WriteChunk(byte[] chunk)
             {
                 if (chunk == null || chunk.Length == 0)
                 {
-                    return;
+                    return true;
                 }
 
                 lock (_chunks)
                 {
                     if (_completed)
                     {
-                        return;
+                        return false;
+                    }
+
+                    if (_queuedBytes + chunk.Length > MaxBufferedBytes)
+                    {
+                        _error = new IOException("HTSP output buffer exceeded " + MaxBufferedBytes + " bytes; the Jellyfin client is no longer reading the live stream.");
+                        _completed = true;
+                        Monitor.PulseAll(_chunks);
+                        return false;
                     }
 
                     _chunks.Enqueue(chunk);
+                    _queuedBytes += chunk.Length;
                     Monitor.PulseAll(_chunks);
+                    return true;
                 }
             }
 
@@ -1042,6 +1418,7 @@ namespace TVHeadEnd
                         if (_chunks.Count > 0)
                         {
                             _current = _chunks.Dequeue();
+                            _queuedBytes -= _current.Length;
                             _currentOffset = 0;
                             break;
                         }
@@ -1083,6 +1460,20 @@ namespace TVHeadEnd
             public override void Write(byte[] buffer, int offset, int count)
             {
                 throw new NotSupportedException();
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    Complete();
+                    if (Interlocked.Exchange(ref _disposeNotified, 1) == 0)
+                    {
+                        _onDisposed?.Invoke();
+                    }
+                }
+
+                base.Dispose(disposing);
             }
         }
     }

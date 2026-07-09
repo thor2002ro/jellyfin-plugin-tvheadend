@@ -117,6 +117,11 @@ namespace TVHeadEnd.HTSP
 
         public void open(String hostname, int port)
         {
+            open(hostname, port, CancellationToken.None, 0);
+        }
+
+        public void open(String hostname, int port, CancellationToken cancellationToken, int maxAttempts)
+        {
             if (_connected)
             {
                 return;
@@ -132,8 +137,14 @@ namespace TVHeadEnd.HTSP
                 _needsRestart = false;
                 ResetCancellationTokenSources();
 
+                var attempts = 0;
+                Exception lastException = null;
+
                 while (!_connected)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    attempts++;
+
                     try
                     {
                         // Establish the remote endpoint for the socket.
@@ -162,12 +173,21 @@ namespace TVHeadEnd.HTSP
                         _connected = true;
                         _logger.LogDebug("[TVHclient] HTSConnectionAsync.open: socket connected");
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (!(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
                     {
+                        lastException = ex;
                         CloseSocket();
-                        _logger.LogError(ex, "[TVHclient] HTSConnectionAsync.open: exception caught");
+                        _logger.LogWarning(ex, "[TVHclient] HTSConnectionAsync.open: connection attempt {Attempt} failed", attempts);
 
-                        Thread.Sleep(2000);
+                        if (maxAttempts > 0 && attempts >= maxAttempts)
+                        {
+                            throw new IOException("Unable to open HTSP socket after " + attempts + " attempt(s).", lastException);
+                        }
+
+                        if (cancellationToken.WaitHandle.WaitOne(2000))
+                        {
+                            throw new OperationCanceledException(cancellationToken);
+                        }
                     }
                 }
 
@@ -200,6 +220,11 @@ namespace TVHeadEnd.HTSP
 
         public Boolean authenticate(String username, String password, bool enableAsyncMetadata)
         {
+            return authenticate(username, password, enableAsyncMetadata, CancellationToken.None, TimeSpan.Zero);
+        }
+
+        public Boolean authenticate(String username, String password, bool enableAsyncMetadata, CancellationToken cancellationToken, TimeSpan responseTimeout)
+        {
             _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: start");
 
             HTSMessage helloMessage = new HTSMessage();
@@ -211,7 +236,7 @@ namespace TVHeadEnd.HTSP
 
             LoopBackResponseHandler loopBackResponseHandler = new LoopBackResponseHandler();
             sendMessage(helloMessage, loopBackResponseHandler);
-            HTSMessage helloResponse = loopBackResponseHandler.getResponse();
+            HTSMessage helloResponse = GetResponse(loopBackResponseHandler, cancellationToken, responseTimeout);
             if (helloResponse != null)
             {
                 if (helloResponse.containsField("htspversion"))
@@ -268,7 +293,7 @@ namespace TVHeadEnd.HTSP
                 authMessage.putField("username", username);
                 authMessage.putField("digest", digest);
                 sendMessage(authMessage, loopBackResponseHandler);
-                HTSMessage authResponse = loopBackResponseHandler.getResponse();
+                HTSMessage authResponse = GetResponse(loopBackResponseHandler, cancellationToken, responseTimeout);
                 if (authResponse != null)
                 {
                     Boolean auth = authResponse.getInt("noaccess", 0) != 1;
@@ -277,7 +302,7 @@ namespace TVHeadEnd.HTSP
                         HTSMessage getDiskSpaceMessage = new HTSMessage();
                         getDiskSpaceMessage.Method = "getDiskSpace";
                         sendMessage(getDiskSpaceMessage, loopBackResponseHandler);
-                        HTSMessage diskSpaceResponse = loopBackResponseHandler.getResponse();
+                        HTSMessage diskSpaceResponse = GetResponse(loopBackResponseHandler, cancellationToken, responseTimeout);
                         if (diskSpaceResponse != null)
                         {
                             long freeDiskSpace = -1;
@@ -316,6 +341,13 @@ namespace TVHeadEnd.HTSP
             }
             _logger.LogError("[TVHclient] HTSConnectionAsync.authenticate: no hello response");
             return false;
+        }
+
+        private static HTSMessage GetResponse(LoopBackResponseHandler responseHandler, CancellationToken cancellationToken, TimeSpan responseTimeout)
+        {
+            return responseTimeout <= TimeSpan.Zero
+                ? responseHandler.getResponse()
+                : responseHandler.getResponse(cancellationToken, responseTimeout);
         }
 
         public int getServerProtocolVersion()

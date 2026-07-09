@@ -41,6 +41,7 @@ namespace TVHeadEnd
     {
         private const int MaxOpenAttempts = 3;
         private const int MaxLiveReconnectAttempts = 5;
+        private const int MuxPacketStatsIntervalSeconds = 30;
 
         private static readonly TimeSpan SubscribeResponseTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
@@ -58,20 +59,27 @@ namespace TVHeadEnd
         private readonly HtspTransportStreamMuxer _muxer = new HtspTransportStreamMuxer();
         private readonly TaskCompletionSource<bool> _firstPacket = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly HashSet<int> _ignoredMuxStreams = new HashSet<int>();
+        private readonly Dictionary<int, HtspTransportStreamMuxer.StreamInfo> _muxedStreamsByIndex = new Dictionary<int, HtspTransportStreamMuxer.StreamInfo>();
+        private readonly Dictionary<int, long> _muxPacketCounts = new Dictionary<int, long>();
+        private readonly Dictionary<int, long> _muxPacketBytes = new Dictionary<int, long>();
+        private readonly object _muxPacketStatsLock = new object();
         private readonly object _connectionStateLock = new object();
+        private readonly object _clientAbortSync = new object();
         private readonly SemaphoreSlim _connectionSemaphore = new SemaphoreSlim(1, 1);
         private readonly CancellationTokenSource _lifetimeCancellationTokenSource = new CancellationTokenSource();
 
+        private CancellationTokenRegistration _clientAbortRegistration;
         private HTSConnectionAsync _connection;
         private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
         private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
         private int _subscriptionId;
         private int _reconnectScheduled;
         private int _liveReconnectAttempts;
-        private int _closeRequested;
-        private volatile bool _closing;
+        private int _closeStarted;
+        private bool _closing;
         private bool _started;
         private bool _recovering;
+        private DateTime _lastMuxPacketStatsLogUtc = DateTime.MinValue;
 
         private static TaskCompletionSource<bool> CreateFirstPacketSource()
         {
@@ -91,7 +99,7 @@ namespace TVHeadEnd
             _appHost = appHost;
             _httpContextAccessor = httpContextAccessor;
             _logger = loggerFactory.CreateLogger<HtspLiveStream>();
-            _stream = new BlockingByteStream(OnOutputStreamDisposed);
+            _stream = new BlockingByteStream(OnConsumerClosed);
             UniqueId = Guid.NewGuid().ToString("N");
             OriginalStreamId = mediaSource?.Id;
             ConsumerCount = 1;
@@ -101,12 +109,6 @@ namespace TVHeadEnd
         public int ConsumerCount { get; set; }
 
         public string OriginalStreamId { get; set; }
-
-        public string ChannelId => _channelId;
-
-        public bool IsClosed => IsClosingRequested;
-
-        public Action<HtspLiveStream> Closed { get; set; }
 
         public string TunerHostId => null;
 
@@ -118,10 +120,8 @@ namespace TVHeadEnd
 
         public async Task Open(CancellationToken openCancellationToken)
         {
-            using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                openCancellationToken,
-                _lifetimeCancellationTokenSource.Token);
-            var cancellationToken = linkedCancellationTokenSource.Token;
+            using var openLifetime = CancellationTokenSource.CreateLinkedTokenSource(openCancellationToken, _lifetimeCancellationTokenSource.Token);
+            var openToken = openLifetime.Token;
             var config = Plugin.Instance.Configuration;
             var hostname = config.TVH_ServerName.Trim();
             var username = config.Username.Trim();
@@ -131,7 +131,7 @@ namespace TVHeadEnd
 
             for (var attempt = 1; attempt <= MaxOpenAttempts; attempt++)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                openToken.ThrowIfCancellationRequested();
 
                 try
                 {
@@ -141,13 +141,13 @@ namespace TVHeadEnd
                         username,
                         password,
                         profile,
-                        cancellationToken,
+                        openToken,
                         waitForMuxPacket: true).ConfigureAwait(false);
 
                     ConfigureOpenedMediaSource();
                     return;
                 }
-                catch (OperationCanceledException) when (openCancellationToken.IsCancellationRequested || IsClosingRequested)
+                catch (OperationCanceledException) when (openCancellationToken.IsCancellationRequested || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
                 {
                     await Close().ConfigureAwait(false);
                     throw;
@@ -171,7 +171,7 @@ namespace TVHeadEnd
                         _channelId,
                         (int)delay.TotalMilliseconds);
 
-                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(delay, openToken).ConfigureAwait(false);
                 }
             }
 
@@ -209,6 +209,11 @@ namespace TVHeadEnd
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
+                {
+                    throw new OperationCanceledException("HTSP live stream is closing.", cancellationToken);
+                }
+
                 CloseCurrentConnection(unsubscribe: false);
                 ResetConnectionAttemptSignals();
 
@@ -312,33 +317,102 @@ namespace TVHeadEnd
 
         public Task Close()
         {
-            if (Interlocked.Exchange(ref _closeRequested, 1) != 0)
+            if (Interlocked.Exchange(ref _closeStarted, 1) != 0)
             {
                 return Task.CompletedTask;
             }
 
             _closing = true;
             EnableStreamSharing = false;
-            CancelLifetime();
+            _lifetimeCancellationTokenSource.Cancel();
+            DisposeClientAbortRegistration();
             _stream.Complete();
             CloseCurrentConnection(unsubscribe: true);
-            NotifyClosed();
+
+            _logger.LogInformation(
+                "HTSP live stream closed for channel {ChannelId}; subscription {SubscriptionId} stopped",
+                _channelId,
+                _subscriptionId);
 
             return Task.CompletedTask;
         }
 
         public Stream GetStream()
         {
+            RegisterClientAbortCallback();
             return _stream;
+        }
+
+        private void RegisterClientAbortCallback()
+        {
+            try
+            {
+                var context = _httpContextAccessor?.HttpContext;
+                if (context == null || !context.RequestAborted.CanBeCanceled)
+                {
+                    return;
+                }
+
+                lock (_clientAbortSync)
+                {
+                    _clientAbortRegistration.Dispose();
+                    _clientAbortRegistration = context.RequestAborted.Register(
+                        state => ((HtspLiveStream)state).OnClientRequestAborted(),
+                        this);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Unable to register HTSP direct-stream client abort callback for channel {ChannelId}", _channelId);
+            }
+        }
+
+        private void OnClientRequestAborted()
+        {
+            OnConsumerClosed("Jellyfin streaming HTTP request was aborted");
+        }
+
+        private void OnConsumerClosed(string reason)
+        {
+            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+            {
+                return;
+            }
+
+            // Mark the stream as closing before scheduling the asynchronous cleanup.
+            // This prevents a queued socket error from starting a reconnect after the
+            // Jellyfin HTTP client has already gone away.
+            _closing = true;
+            _lifetimeCancellationTokenSource.Cancel();
+
+            _logger.LogInformation(
+                "HTSP live stream consumer disconnected for channel {ChannelId}; closing TVHeadend subscription {SubscriptionId}. Reason: {Reason}",
+                _channelId,
+                _subscriptionId,
+                reason);
+
+            _ = Task.Run(() => Close());
+        }
+
+        private void DisposeClientAbortRegistration()
+        {
+            lock (_clientAbortSync)
+            {
+                _clientAbortRegistration.Dispose();
+                _clientAbortRegistration = default;
+            }
         }
 
         public void onError(Exception ex)
         {
             NotifyConnectionError(ex);
 
-            if (IsClosingRequested)
+            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
             {
-                _logger.LogDebug(ex, "HTSP live stream connection closed");
+                _logger.LogDebug(ex, "HTSP live stream connection closed; suppressing reconnect");
                 _firstPacket.TrySetCanceled();
                 _stream.Complete();
                 return;
@@ -366,7 +440,7 @@ namespace TVHeadEnd
 
             try
             {
-                while (!IsClosingRequested)
+                while (!_closing && !_lifetimeCancellationTokenSource.IsCancellationRequested && !_stream.IsCompleted)
                 {
                     var attempt = Interlocked.Increment(ref _liveReconnectAttempts);
                     if (attempt > MaxLiveReconnectAttempts)
@@ -397,11 +471,17 @@ namespace TVHeadEnd
                             _lifetimeCancellationTokenSource.Token,
                             waitForMuxPacket: true).ConfigureAwait(false);
 
+                        if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
+                        {
+                            CloseCurrentConnection(unsubscribe: true);
+                            return;
+                        }
+
                         Interlocked.Exchange(ref _liveReconnectAttempts, 0);
                         _logger.LogInformation("HTSP live stream reconnected for channel {ChannelId} on subscription {SubscriptionId}", _channelId, _subscriptionId);
                         return;
                     }
-                    catch (OperationCanceledException) when (IsClosingRequested)
+                    catch (OperationCanceledException) when (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
                     {
                         return;
                     }
@@ -412,7 +492,7 @@ namespace TVHeadEnd
                     }
                 }
 
-                if (!IsClosingRequested)
+                if (!_closing && !_stream.IsCompleted)
                 {
                     _logger.LogError(lastException, "HTSP live stream reconnect exhausted for channel {ChannelId}; closing Jellyfin stream", _channelId);
                     CompleteWithError(lastException);
@@ -551,6 +631,8 @@ namespace TVHeadEnd
                 return;
             }
 
+            RecordMuxPacket(streamIndex, payload);
+
             var chunk = _muxer.WritePacket(
                 streamIndex,
                 payload,
@@ -563,13 +645,93 @@ namespace TVHeadEnd
             }
         }
 
+        private void RecordMuxPacket(int streamIndex, byte[] payload)
+        {
+            if (payload == null)
+            {
+                return;
+            }
+
+            HtspTransportStreamMuxer.StreamInfo streamInfo;
+            long packetCount;
+            long byteCount;
+            bool isFirstPacket;
+            string periodicSummary = null;
+            var now = DateTime.UtcNow;
+
+            lock (_muxPacketStatsLock)
+            {
+                _muxedStreamsByIndex.TryGetValue(streamIndex, out streamInfo);
+                _muxPacketCounts.TryGetValue(streamIndex, out var previousCount);
+                _muxPacketBytes.TryGetValue(streamIndex, out var previousBytes);
+
+                packetCount = previousCount + 1;
+                byteCount = previousBytes + payload.Length;
+                isFirstPacket = previousCount == 0;
+                _muxPacketCounts[streamIndex] = packetCount;
+                _muxPacketBytes[streamIndex] = byteCount;
+
+                if ((now - _lastMuxPacketStatsLogUtc).TotalSeconds >= MuxPacketStatsIntervalSeconds)
+                {
+                    periodicSummary = BuildMuxPacketSummaryLocked();
+                    _lastMuxPacketStatsLogUtc = now;
+                }
+            }
+
+            if (isFirstPacket)
+            {
+                _logger.LogInformation(
+                    "HTSP first mux packet for stream {Stream}: payload={PayloadBytes} bytes, firstBytes={FirstBytes}",
+                    DescribeMuxPacketStream(streamIndex, streamInfo),
+                    payload.Length,
+                    FormatFirstBytes(payload, 16));
+            }
+
+            if (!string.IsNullOrWhiteSpace(periodicSummary))
+            {
+                _logger.LogInformation("HTSP mux packet counters: {MuxPacketSummary}", periodicSummary);
+            }
+        }
+
+        private string BuildMuxPacketSummaryLocked()
+        {
+            var indexes = _muxedStreamsByIndex.Keys
+                .Concat(_muxPacketCounts.Keys)
+                .Distinct()
+                .OrderBy(i => i)
+                .ToList();
+
+            return string.Join("; ", indexes.Select(i =>
+            {
+                _muxedStreamsByIndex.TryGetValue(i, out var streamInfo);
+                _muxPacketCounts.TryGetValue(i, out var packetCount);
+                _muxPacketBytes.TryGetValue(i, out var byteCount);
+                return DescribeMuxPacketStream(i, streamInfo) + ": packets=" + packetCount + ", bytes=" + byteCount;
+            }));
+        }
+
+        private static string DescribeMuxPacketStream(int streamIndex, HtspTransportStreamMuxer.StreamInfo streamInfo)
+        {
+            return streamInfo == null ? streamIndex + ":UNKNOWN" : DescribeHtspStream(streamInfo);
+        }
+
+        private static string FormatFirstBytes(byte[] payload, int maxBytes)
+        {
+            if (payload == null || payload.Length == 0)
+            {
+                return string.Empty;
+            }
+
+            return string.Join(" ", payload.Take(Math.Max(0, maxBytes)).Select(i => i.ToString("X2")));
+        }
+
         private void ProcessSubscriptionStop(HTSMessage response)
         {
             var status = response.getString("status", string.Empty);
             var subscriptionError = response.getString("subscriptionError", string.Empty);
             var details = BuildStatusDetails(status, subscriptionError);
 
-            if (IsClosingRequested)
+            if (_closing)
             {
                 _stream.Complete();
                 return;
@@ -634,20 +796,25 @@ namespace TVHeadEnd
                 });
             }
 
-            var orderedStreams = streams.OrderBy(i => i.Index).ToList();
-            var playableStreams = orderedStreams
-                .Where(IsPlayableForJellyfinTransportStream)
+            var orderedStreams = streams
+                .OrderBy(i => i.Index)
+                .Select(PrepareHtspStreamForMuxing)
+                .ToList();
+            var muxStreams = orderedStreams
+                .Where(ShouldMuxHtspTransportStream)
                 .ToList();
             var droppedStreams = orderedStreams
-                .Where(i => !IsPlayableForJellyfinTransportStream(i))
+                .Where(i => !ShouldMuxHtspTransportStream(i))
                 .ToList();
 
             _ignoredMuxStreams.Clear();
-            _muxer.SetStreams(playableStreams);
-            UpdateMediaSourceStreamMetadata(playableStreams);
+            ResetMuxPacketStats(muxStreams);
+            _muxer.SetStreams(muxStreams);
+            UpdateMediaSourceStreamMetadata(muxStreams);
+            LogDvbSubtitlePageIds(muxStreams);
             LogSourceInfo(response);
             _logger.LogInformation(
-                "HTSP stream metadata received: {TotalCount} stream(s), muxing {MuxedCount} Kodi-style playable stream(s): {StreamSummary}",
+                "HTSP stream metadata received: {TotalCount} stream(s), muxing {MuxedCount} player-selectable/non-CA stream(s): {StreamSummary}",
                 orderedStreams.Count,
                 _muxer.SupportedStreamCount,
                 _muxer.StreamSummary);
@@ -655,17 +822,63 @@ namespace TVHeadEnd
             if (droppedStreams.Count > 0)
             {
                 _logger.LogInformation(
-                    "HTSP ignored {DroppedCount} non-playable/private stream(s) from Jellyfin MPEG-TS output: {DroppedStreams}",
+                    "HTSP ignored {DroppedCount} CA/private/data stream(s) from Jellyfin MPEG-TS output: {DroppedStreams}",
                     droppedStreams.Count,
                     string.Join(", ", droppedStreams.Select(DescribeHtspStream)));
             }
 
-            if (playableStreams.Count > 0 && _muxer.SupportedStreamCount != playableStreams.Count)
+            if (muxStreams.Count > 0 && _muxer.SupportedStreamCount != muxStreams.Count)
             {
                 _logger.LogWarning(
-                    "HTSP stream metadata contained {PlayableCount} Jellyfin-playable stream(s), but only {MuxedCount} could be routed into MPEG-TS.",
-                    playableStreams.Count,
+                    "HTSP stream metadata selected {MuxCandidateCount} stream(s) for MPEG-TS, but only {MuxedCount} could be routed into MPEG-TS.",
+                    muxStreams.Count,
                     _muxer.SupportedStreamCount);
+            }
+        }
+
+        private void ResetMuxPacketStats(IReadOnlyList<HtspTransportStreamMuxer.StreamInfo> streams)
+        {
+            lock (_muxPacketStatsLock)
+            {
+                _muxedStreamsByIndex.Clear();
+                _muxPacketCounts.Clear();
+                _muxPacketBytes.Clear();
+                _lastMuxPacketStatsLogUtc = DateTime.UtcNow;
+
+                foreach (var stream in streams ?? Array.Empty<HtspTransportStreamMuxer.StreamInfo>())
+                {
+                    _muxedStreamsByIndex[stream.Index] = stream;
+                }
+            }
+        }
+
+        private void LogDvbSubtitlePageIds(IReadOnlyList<HtspTransportStreamMuxer.StreamInfo> streams)
+        {
+            if (streams == null)
+            {
+                return;
+            }
+
+            foreach (var stream in streams.Where(IsDvbSubtitleStream))
+            {
+                var compositionId = stream.CompositionId & 0xFFFF;
+                var ancillaryId = stream.AncillaryId & 0xFFFF;
+                if (compositionId == 0)
+                {
+                    compositionId = 1;
+                }
+
+                if (ancillaryId == 0)
+                {
+                    ancillaryId = compositionId;
+                }
+
+                _logger.LogInformation(
+                    "HTSP DVB subtitle stream {StreamIndex}: lang={Language}, composition_id={CompositionId}, ancillary_id={AncillaryId}",
+                    stream.Index,
+                    string.IsNullOrWhiteSpace(stream.Language) ? "und" : stream.Language,
+                    compositionId,
+                    ancillaryId);
             }
         }
 
@@ -713,16 +926,112 @@ namespace TVHeadEnd
             MediaSource.SupportsProbing = false;
 
             _logger.LogInformation(
-                "HTSP exposed {Count} playable stream(s) to Jellyfin metadata: {Streams}; private/data streams are ignored in the MPEG-TS output",
+                "HTSP exposed {Count} playable stream(s) to Jellyfin metadata: {Streams}; all muxable audio/subtitle streams are carried, CA/private control streams are ignored",
                 mediaStreams.Count,
                 string.Join(", ", mediaStreams.Select(i => $"#{i.Index}:{i.Type}:{i.Codec}{(string.IsNullOrWhiteSpace(i.Language) ? string.Empty : ":" + i.Language)}")));
         }
 
-        private static bool IsPlayableForJellyfinTransportStream(HtspTransportStreamMuxer.StreamInfo stream)
+        private static HtspTransportStreamMuxer.StreamInfo PrepareHtspStreamForMuxing(HtspTransportStreamMuxer.StreamInfo stream)
         {
-            return stream != null
-                && HtspTransportStreamMuxer.CanMuxCodec(stream.Codec)
-                && TryGetMediaStreamType(stream.Codec, out _);
+            if (stream == null)
+            {
+                return null;
+            }
+
+            stream.MuxAsPrivateData = ShouldMuxAsFallbackPrivateData(stream);
+            return stream;
+        }
+
+        private static bool ShouldMuxHtspTransportStream(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null || IsPrivateOrControlHtspStream(stream))
+            {
+                return false;
+            }
+
+            if (HtspTransportStreamMuxer.CanMuxCodec(stream.Codec))
+            {
+                return true;
+            }
+
+            return ShouldMuxAsFallbackPrivateData(stream);
+        }
+
+        private static bool ShouldMuxAsFallbackPrivateData(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null || IsPrivateOrControlHtspStream(stream) || HtspTransportStreamMuxer.CanMuxCodec(stream.Codec))
+            {
+                return false;
+            }
+
+            return LooksLikePlayableButUnsupportedStream(stream);
+        }
+
+        private static bool LooksLikePlayableButUnsupportedStream(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            var codec = NormalizeCodec(stream.Codec);
+
+            if (codec.Contains("AUDIO", StringComparison.Ordinal)
+                || codec.Contains("SOUND", StringComparison.Ordinal)
+                || codec.Contains("SUB", StringComparison.Ordinal)
+                || codec.Contains("CAPTION", StringComparison.Ordinal)
+                || codec.Contains("CC", StringComparison.Ordinal)
+                || codec.Contains("TTXT", StringComparison.Ordinal)
+                || codec.Contains("TELETEXT", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (stream.Channels > 0 || stream.Rate >= 8000)
+            {
+                return true;
+            }
+
+            return stream.CompositionId != 0 || stream.AncillaryId != 0;
+        }
+
+        private static bool IsPrivateOrControlHtspStream(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null)
+            {
+                return true;
+            }
+
+            switch (NormalizeCodec(stream.Codec))
+            {
+                case "CA":
+                case "CAT":
+                case "ECM":
+                case "EMM":
+                case "PAT":
+                case "PMT":
+                case "PCR":
+                case "PRIVATE":
+                case "DATA":
+                case "BINDATA":
+                case "BINARY":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsDvbSubtitleStream(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null)
+            {
+                return false;
+            }
+
+            switch (NormalizeCodec(stream.Codec))
+            {
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private static string DescribeHtspStream(HtspTransportStreamMuxer.StreamInfo stream)
@@ -866,7 +1175,15 @@ namespace TVHeadEnd
                 case "DVBSUB":
                 case "DVBSUBTITLE":
                 case "DVB_SUBTITLE":
+                case "DVDSUB":
+                case "DVDSUBTITLE":
+                case "DVD_SUBTITLE":
+                case "PGS":
+                case "PGSSUB":
+                case "PGSSUBTITLE":
+                case "HDMVPGSSUBTITLE":
                 case "TELETEXT":
+                case "TTXT":
                 case "TEXTSUB":
                 case "TEXTSUBTITLE":
                 case "SRT":
@@ -938,8 +1255,18 @@ namespace TVHeadEnd
                     // "dvb_subtitle" is mistakenly treated as text, while "dvbsub"
                     // is correctly treated as non-text / non-extractable.
                     return "dvbsub";
+                case "DVDSUB":
+                case "DVDSUBTITLE":
+                case "DVD_SUBTITLE":
+                    return "dvdsub";
+                case "PGS":
+                case "PGSSUB":
+                case "PGSSUBTITLE":
+                case "HDMVPGSSUBTITLE":
+                    return "pgssub";
                 case "TELETEXT":
-                    // Keep this non-text too.  Embedded live-TV teletext is carried
+                case "TTXT":
+                    // Keep this non-text too. Embedded live-TV teletext is carried
                     // inside the MPEG-TS stream, not as an external text attachment.
                     return "dvbsub_teletext";
                 case "SRT":
@@ -1072,75 +1399,28 @@ namespace TVHeadEnd
 
         private void WriteOutput(byte[] chunk)
         {
-            if (IsClosingRequested)
+            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
             {
                 return;
             }
 
             _started = true;
-            if (!_stream.WriteChunk(chunk))
-            {
-                if (!IsClosingRequested)
-                {
-                    CompleteWithError(new IOException("HTSP output stream is no longer being consumed; closing Tvheadend subscription."));
-                }
-
-                return;
-            }
-
+            _stream.WriteChunk(chunk);
             _firstPacket.TrySetResult(true);
             GetConnectionFirstPacketTaskSource().TrySetResult(true);
         }
 
         private void CompleteWithError(Exception ex)
         {
-            if (Interlocked.Exchange(ref _closeRequested, 1) == 0)
+            if (!_closing)
             {
-                _closing = true;
-                EnableStreamSharing = false;
-                CancelLifetime();
-                CloseCurrentConnection(unsubscribe: false);
-                NotifyClosed();
+                _firstPacket.TrySetException(ex);
             }
 
-            _firstPacket.TrySetException(ex);
+            _closing = true;
+            _lifetimeCancellationTokenSource.Cancel();
             _stream.Complete(ex);
-        }
-
-        private void OnOutputStreamDisposed()
-        {
-            if (IsClosingRequested)
-            {
-                return;
-            }
-
-            _logger.LogInformation("HTSP output stream for channel {ChannelId} was disposed by Jellyfin/client; closing Tvheadend subscription", _channelId);
-            _ = Close();
-        }
-
-        private bool IsClosingRequested => Volatile.Read(ref _closeRequested) != 0 || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested;
-
-        private void CancelLifetime()
-        {
-            try
-            {
-                _lifetimeCancellationTokenSource.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-        }
-
-        private void NotifyClosed()
-        {
-            try
-            {
-                Closed?.Invoke(this);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "HTSP close notification failed for channel {ChannelId}", _channelId);
-            }
+            CloseCurrentConnection(unsubscribe: true);
         }
 
         private void ResetConnectionAttemptSignals()
@@ -1305,6 +1585,7 @@ namespace TVHeadEnd
         public void Dispose()
         {
             Close().GetAwaiter().GetResult();
+            DisposeClientAbortRegistration();
             _stream.Dispose();
             _lifetimeCancellationTokenSource.Dispose();
             _connectionSemaphore.Dispose();
@@ -1343,20 +1624,21 @@ namespace TVHeadEnd
 
         private sealed class BlockingByteStream : Stream
         {
-            private const long MaxBufferedBytes = 64L * 1024L * 1024L;
+            private const long MaxBufferedBytes = 128L * 1024L * 1024L;
 
             private readonly Queue<byte[]> _chunks = new Queue<byte[]>();
-            private readonly Action _onDisposed;
+            private readonly Action<string> _onConsumerClosed;
             private byte[] _current;
             private int _currentOffset;
-            private long _queuedBytes;
-            private int _disposeNotified;
             private bool _completed;
+            private bool _disposed;
+            private long _bufferedBytes;
             private Exception _error;
+            private int _consumerClosedNotified;
 
-            public BlockingByteStream(Action onDisposed)
+            public BlockingByteStream(Action<string> onConsumerClosed)
             {
-                _onDisposed = onDisposed;
+                _onConsumerClosed = onConsumerClosed;
             }
 
             public override bool CanRead => true;
@@ -1364,38 +1646,54 @@ namespace TVHeadEnd
             public override bool CanWrite => false;
             public override long Length => throw new NotSupportedException();
 
+            public bool IsCompleted
+            {
+                get
+                {
+                    lock (_chunks)
+                    {
+                        return _completed || _disposed;
+                    }
+                }
+            }
+
             public override long Position
             {
                 get => throw new NotSupportedException();
                 set => throw new NotSupportedException();
             }
 
-            public bool WriteChunk(byte[] chunk)
+            public void WriteChunk(byte[] chunk)
             {
                 if (chunk == null || chunk.Length == 0)
                 {
-                    return true;
+                    return;
                 }
 
+                var consumerTooSlow = false;
                 lock (_chunks)
                 {
-                    if (_completed)
+                    if (_completed || _disposed)
                     {
-                        return false;
-                    }
-
-                    if (_queuedBytes + chunk.Length > MaxBufferedBytes)
-                    {
-                        _error = new IOException("HTSP output buffer exceeded " + MaxBufferedBytes + " bytes; the Jellyfin client is no longer reading the live stream.");
-                        _completed = true;
-                        Monitor.PulseAll(_chunks);
-                        return false;
+                        return;
                     }
 
                     _chunks.Enqueue(chunk);
-                    _queuedBytes += chunk.Length;
+                    _bufferedBytes += chunk.Length;
+                    if (_bufferedBytes > MaxBufferedBytes)
+                    {
+                        _completed = true;
+                        _chunks.Clear();
+                        _bufferedBytes = 0;
+                        consumerTooSlow = true;
+                    }
+
                     Monitor.PulseAll(_chunks);
-                    return true;
+                }
+
+                if (consumerTooSlow)
+                {
+                    SignalConsumerClosed("Jellyfin stopped draining the direct stream buffer");
                 }
             }
 
@@ -1411,14 +1709,34 @@ namespace TVHeadEnd
 
             public override int Read(byte[] buffer, int offset, int count)
             {
+                if (buffer == null)
+                {
+                    throw new ArgumentNullException(nameof(buffer));
+                }
+
+                if (offset < 0 || count < 0 || offset + count > buffer.Length)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(offset));
+                }
+
                 lock (_chunks)
                 {
                     while (_current == null || _currentOffset >= _current.Length)
                     {
+                        if (_disposed)
+                        {
+                            return 0;
+                        }
+
                         if (_chunks.Count > 0)
                         {
                             _current = _chunks.Dequeue();
-                            _queuedBytes -= _current.Length;
+                            _bufferedBytes -= _current.Length;
+                            if (_bufferedBytes < 0)
+                            {
+                                _bufferedBytes = 0;
+                            }
+
                             _currentOffset = 0;
                             break;
                         }
@@ -1443,6 +1761,35 @@ namespace TVHeadEnd
                 }
             }
 
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    lock (_chunks)
+                    {
+                        _disposed = true;
+                        _completed = true;
+                        _chunks.Clear();
+                        _bufferedBytes = 0;
+                        _current = null;
+                        _currentOffset = 0;
+                        Monitor.PulseAll(_chunks);
+                    }
+
+                    SignalConsumerClosed("Jellyfin disposed the direct stream");
+                }
+
+                base.Dispose(disposing);
+            }
+
+            private void SignalConsumerClosed(string reason)
+            {
+                if (Interlocked.Exchange(ref _consumerClosedNotified, 1) == 0)
+                {
+                    _onConsumerClosed?.Invoke(reason);
+                }
+            }
+
             public override void Flush()
             {
             }
@@ -1460,20 +1807,6 @@ namespace TVHeadEnd
             public override void Write(byte[] buffer, int offset, int count)
             {
                 throw new NotSupportedException();
-            }
-
-            protected override void Dispose(bool disposing)
-            {
-                if (disposing)
-                {
-                    Complete();
-                    if (Interlocked.Exchange(ref _disposeNotified, 1) == 0)
-                    {
-                        _onDisposed?.Invoke();
-                    }
-                }
-
-                base.Dispose(disposing);
             }
         }
     }

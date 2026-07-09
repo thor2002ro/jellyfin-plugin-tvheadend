@@ -11,7 +11,7 @@ namespace TVHeadEnd
         private const int PacketSize = 188;
         private const int PmtPid = 0x100;
         private const int FirstElementaryPid = 0x101;
-        private const int RepeatTablesEveryPesPackets = 64;
+        private const int RepeatTablesEveryPesPackets = 16;
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
@@ -29,7 +29,7 @@ namespace TVHeadEnd
 
         public string StreamSummary => string.Join(", ", _streams.Values
             .OrderBy(i => i.Pid)
-            .Select(i => $"{i.Index}:{(i.Codec ?? "UNKNOWN")}->{i.StreamTypeDescription}@0x{i.Pid:X}"));
+            .Select(i => $"{i.Index}:{(i.Codec ?? "UNKNOWN")}->{i.StreamTypeDescription}@0x{i.Pid:X}/type0x{i.StreamType:X2}"));
 
         public void SetTimestampsAre90Khz(bool timestampsAre90Khz)
         {
@@ -95,7 +95,8 @@ namespace TVHeadEnd
 
             var tsDts = ToTsTimestamp(dts);
             var tsPts = ToTsTimestamp(pts);
-            var pes = BuildPes(stream.StreamId, payload, tsPts, tsDts);
+            var pesPayload = PreparePayloadForPes(stream, payload);
+            var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts);
             var pcr = stream.Pid == _pcrPid ? tsDts ?? tsPts : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr);
             _packetsSinceTables++;
@@ -107,7 +108,18 @@ namespace TVHeadEnd
             var normalizedCodec = NormalizeCodec(stream.Codec);
             if (!TryGetTsType(normalizedCodec, out var streamType, out var kind, out var privateStreamId))
             {
-                return false;
+                if (!stream.MuxAsPrivateData)
+                {
+                    return false;
+                }
+
+                stream.IsFallbackPrivateData = true;
+                stream.Kind = ElementaryStreamKind.Private;
+                stream.StreamType = 0x06;
+                stream.StreamId = 0xBD;
+                stream.StreamTypeDescription = "PRIVATE(" + (string.IsNullOrWhiteSpace(stream.Codec) ? "UNKNOWN" : stream.Codec.Trim()) + ")";
+                stream.Descriptors = BuildDescriptors(stream, normalizedCodec);
+                return true;
             }
 
             stream.IsFallbackPrivateData = false;
@@ -184,6 +196,71 @@ namespace TVHeadEnd
 
             AppendCrc(section);
             return section.ToArray();
+        }
+
+        private static byte[] PreparePayloadForPes(StreamInfo stream, byte[] payload)
+        {
+            if (stream == null || payload == null || payload.Length == 0)
+            {
+                return payload;
+            }
+
+            switch (NormalizeCodec(stream.Codec))
+            {
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
+                    return PrepareDvbSubtitlePayload(payload);
+                default:
+                    return payload;
+            }
+        }
+
+        private static byte[] PrepareDvbSubtitlePayload(byte[] payload)
+        {
+            if (payload == null || payload.Length == 0)
+            {
+                return payload;
+            }
+
+            // HTSP muxpkt carries the actual frame data for a stream. DVB subtitle
+            // PES payloads in an MPEG-TS private_stream_1 need the DVB subtitle
+            // data_identifier/subtitle_stream_id prefix before raw 0x0F subtitle
+            // segments, followed by an end marker.
+            if (payload.Length >= 2 && payload[0] == 0x20)
+            {
+                return EnsureDvbSubtitleEndMarker(payload);
+            }
+
+            if (payload[0] != 0x0F)
+            {
+                return payload;
+            }
+
+            var addEndMarker = payload[payload.Length - 1] != 0xFF;
+            var result = new byte[payload.Length + 2 + (addEndMarker ? 1 : 0)];
+            result[0] = 0x20;
+            result[1] = 0x00;
+            Array.Copy(payload, 0, result, 2, payload.Length);
+            if (addEndMarker)
+            {
+                result[result.Length - 1] = 0xFF;
+            }
+
+            return result;
+        }
+
+        private static byte[] EnsureDvbSubtitleEndMarker(byte[] payload)
+        {
+            if (payload.Length > 0 && payload[payload.Length - 1] == 0xFF)
+            {
+                return payload;
+            }
+
+            var result = new byte[payload.Length + 1];
+            Array.Copy(payload, 0, result, 0, payload.Length);
+            result[result.Length - 1] = 0xFF;
+            return result;
         }
 
         private static byte[] BuildPes(int streamId, byte[] payload, long? pts, long? dts)
@@ -373,26 +450,34 @@ namespace TVHeadEnd
                     kind = ElementaryStreamKind.Audio;
                     return true;
                 case "MPEG1AUDIO":
-                case "MPEG2AUDIO":
-                case "MP2":
                 case "MP3":
-                case "MPA":
                     streamType = 0x03;
                     kind = ElementaryStreamKind.Audio;
                     return true;
+                case "MPEG2AUDIO":
+                case "MP2":
+                case "MPA":
+                    streamType = 0x04;
+                    kind = ElementaryStreamKind.Audio;
+                    return true;
                 case "AC3":
-                    streamType = 0x81;
+                    // DVB-C/Cable TS expects AC-3 as private data (0x06) with
+                    // AC-3 descriptors. 0x81 is the ATSC stream type and is
+                    // less reliably discovered by Android/ExoPlayer in DVB TS.
+                    streamType = 0x06;
                     kind = ElementaryStreamKind.Audio;
                     privateStreamId = 0xBD;
                     return true;
                 case "EAC3":
-                    streamType = 0x87;
+                    // Same as AC-3: use DVB private-data stream type plus E-AC-3
+                    // descriptors instead of the ATSC 0x87 stream type.
+                    streamType = 0x06;
                     kind = ElementaryStreamKind.Audio;
                     privateStreamId = 0xBD;
                     return true;
                 case "DTS":
                 case "DCA":
-                    streamType = 0x8A;
+                    streamType = 0x06;
                     kind = ElementaryStreamKind.Audio;
                     privateStreamId = 0xBD;
                     return true;
@@ -406,7 +491,15 @@ namespace TVHeadEnd
                 case "DVBSUB":
                 case "DVBSUBTITLE":
                 case "DVB_SUBTITLE":
+                case "DVDSUB":
+                case "DVDSUBTITLE":
+                case "DVD_SUBTITLE":
+                case "PGS":
+                case "PGSSUB":
+                case "PGSSUBTITLE":
+                case "HDMVPGSSUBTITLE":
                 case "TELETEXT":
+                case "TTXT":
                 case "TEXTSUB":
                 case "TEXTSUBTITLE":
                 case "SRT":
@@ -445,10 +538,12 @@ namespace TVHeadEnd
             switch (normalizedCodec)
             {
                 case "AC3":
-                    AddDescriptor(descriptors, 0x6A);
+                    AddRegistrationDescriptor(descriptors, "AC-3");
+                    AddDescriptor(descriptors, 0x6A, 0x00);
                     break;
                 case "EAC3":
-                    AddDescriptor(descriptors, 0x7A);
+                    AddRegistrationDescriptor(descriptors, "EAC3");
+                    AddDescriptor(descriptors, 0x7A, 0x00);
                     break;
                 case "DTS":
                 case "DCA":
@@ -472,7 +567,19 @@ namespace TVHeadEnd
                     AddDvbSubtitleDescriptor(descriptors, stream);
                     break;
                 case "TELETEXT":
+                case "TTXT":
                     AddTeletextDescriptor(descriptors, stream);
+                    break;
+                case "DVDSUB":
+                case "DVDSUBTITLE":
+                case "DVD_SUBTITLE":
+                    AddPrivateDataDescriptor(descriptors, "DVDSUB");
+                    break;
+                case "PGS":
+                case "PGSSUB":
+                case "PGSSUBTITLE":
+                case "HDMVPGSSUBTITLE":
+                    AddPrivateDataDescriptor(descriptors, "PGSSUB");
                     break;
                 case "TEXTSUB":
                 case "TEXTSUBTITLE":
@@ -498,6 +605,16 @@ namespace TVHeadEnd
             var lang = GetIsoLanguageBytes(stream.Language);
             var compositionId = stream.CompositionId & 0xFFFF;
             var ancillaryId = stream.AncillaryId & 0xFFFF;
+            if (compositionId == 0)
+            {
+                compositionId = 1;
+            }
+
+            if (ancillaryId == 0)
+            {
+                ancillaryId = compositionId;
+            }
+
             AddDescriptor(
                 descriptors,
                 0x59,
@@ -635,6 +752,8 @@ namespace TVHeadEnd
             internal ElementaryStreamKind Kind { get; set; }
 
             internal byte[] Descriptors { get; set; }
+
+            public bool MuxAsPrivateData { get; set; }
 
             internal bool IsFallbackPrivateData { get; set; }
 

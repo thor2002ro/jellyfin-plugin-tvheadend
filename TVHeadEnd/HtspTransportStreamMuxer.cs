@@ -11,7 +11,7 @@ namespace TVHeadEnd
         private const int PacketSize = 188;
         private const int PmtPid = 0x100;
         private const int FirstElementaryPid = 0x101;
-        private const int RepeatTablesEveryPesPackets = 16;
+        private const int RepeatTablesEveryPesPackets = 4;
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
@@ -22,6 +22,8 @@ namespace TVHeadEnd
         private int _nextAudioStreamId;
         private int _packetsSinceTables;
         private int _pcrPid = PmtPid;
+        private long? _timestampBase;
+        private long? _lastMuxClock;
 
         public bool HasStreams => _streams.Count > 0;
 
@@ -46,6 +48,8 @@ namespace TVHeadEnd
             _nextAudioStreamId = 0;
             _packetsSinceTables = 0;
             _pcrPid = PmtPid;
+            _timestampBase = null;
+            _lastMuxClock = null;
 
             foreach (var stream in (streams ?? Enumerable.Empty<StreamInfo>())
                 .Where(i => i != null)
@@ -95,8 +99,24 @@ namespace TVHeadEnd
 
             var tsDts = ToTsTimestamp(dts);
             var tsPts = ToTsTimestamp(pts);
+            var effectiveClock = tsDts ?? tsPts;
+            if (effectiveClock.HasValue)
+            {
+                _lastMuxClock = effectiveClock.Value;
+            }
+
+            if (IsDvbSubtitleCodec(stream.Codec) && !tsPts.HasValue && _lastMuxClock.HasValue)
+            {
+                // Android/ExoPlayer is stricter than FFmpeg for live TS subtitles:
+                // DVB subtitle PES packets without PTS can be demuxed but not scheduled
+                // for rendering. If TVHeadend omits a subtitle PTS, schedule it at
+                // the latest known mux clock rather than emitting an undated PES.
+                tsPts = _lastMuxClock.Value;
+            }
+
             var pesPayload = PreparePayloadForPes(stream, payload);
-            var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts);
+            var dataAligned = stream.Kind == ElementaryStreamKind.Video || IsDvbSubtitleCodec(stream.Codec);
+            var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned);
             var pcr = stream.Pid == _pcrPid ? tsDts ?? tsPts : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr);
             _packetsSinceTables++;
@@ -198,6 +218,19 @@ namespace TVHeadEnd
             return section.ToArray();
         }
 
+        private static bool IsDvbSubtitleCodec(string codec)
+        {
+            switch (NormalizeCodec(codec))
+            {
+                case "DVBSUB":
+                case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         private static byte[] PreparePayloadForPes(StreamInfo stream, byte[] payload)
         {
             if (stream == null || payload == null || payload.Length == 0)
@@ -263,7 +296,7 @@ namespace TVHeadEnd
             return result;
         }
 
-        private static byte[] BuildPes(int streamId, byte[] payload, long? pts, long? dts)
+        private static byte[] BuildPes(int streamId, byte[] payload, long? pts, long? dts, bool dataAligned)
         {
             var hasPts = pts.HasValue;
             var hasDts = dts.HasValue && dts.Value != pts.GetValueOrDefault();
@@ -279,7 +312,7 @@ namespace TVHeadEnd
             output.WriteByte((byte)streamId);
             output.WriteByte(useZeroLength ? (byte)0x00 : (byte)((pesPacketLength >> 8) & 0xFF));
             output.WriteByte(useZeroLength ? (byte)0x00 : (byte)(pesPacketLength & 0xFF));
-            output.WriteByte(0x80);
+            output.WriteByte(dataAligned ? (byte)0x84 : (byte)0x80);
             output.WriteByte(hasDts ? (byte)0xC0 : (hasPts ? (byte)0x80 : (byte)0x00));
             output.WriteByte((byte)headerDataLength);
 
@@ -375,7 +408,14 @@ namespace TVHeadEnd
                 return null;
             }
 
-            return _timestampsAre90Khz ? htspTimestamp.Value : htspTimestamp.Value * 90 / 1000;
+            var timestamp = _timestampsAre90Khz ? htspTimestamp.Value : htspTimestamp.Value * 90 / 1000;
+            if (!_timestampBase.HasValue)
+            {
+                _timestampBase = timestamp;
+            }
+
+            var normalized = timestamp - _timestampBase.Value;
+            return normalized >= 0 ? normalized : timestamp;
         }
 
         private static void WriteTimestamp(Stream output, int marker, long timestamp)
@@ -614,6 +654,12 @@ namespace TVHeadEnd
             {
                 ancillaryId = compositionId;
             }
+
+            // Some Android TS extractors are stricter about stream metadata than
+            // FFmpeg. Keep the DVB subtitling descriptor, but also include the
+            // generic ISO-639 language descriptor so the embedded track is easier
+            // for the direct-play track selector to expose.
+            AddDescriptor(descriptors, 0x0A, lang[0], lang[1], lang[2], 0x00);
 
             AddDescriptor(
                 descriptors,

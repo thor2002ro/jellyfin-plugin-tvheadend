@@ -10,6 +10,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Helper;
 using TVHeadEnd.HTSP;
@@ -43,24 +44,28 @@ namespace TVHeadEnd
         private readonly string _channelId;
         private readonly ILoggerFactory _loggerFactory;
         private readonly IServerApplicationHost _appHost;
+        private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly ILogger<HtspLiveStream> _logger;
         private readonly BlockingByteStream _stream = new BlockingByteStream();
         private readonly HtspTransportStreamMuxer _muxer = new HtspTransportStreamMuxer();
         private readonly TaskCompletionSource<bool> _firstPacket = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly HashSet<int> _ignoredMuxStreams = new HashSet<int>();
 
         private HTSConnectionAsync _connection;
         private int _subscriptionId;
         private bool _closing;
         private bool _started;
 
-        public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost)
+        public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
         {
             MediaSource = mediaSource;
             _channelId = channelId;
             _loggerFactory = loggerFactory;
             _appHost = appHost;
+            _httpContextAccessor = httpContextAccessor;
             _logger = loggerFactory.CreateLogger<HtspLiveStream>();
             UniqueId = Guid.NewGuid().ToString("N");
+            OriginalStreamId = mediaSource?.Id;
             ConsumerCount = 1;
             EnableStreamSharing = false;
         }
@@ -120,9 +125,16 @@ namespace TVHeadEnd
                 }
 
                 await _firstPacket.Task.ConfigureAwait(false);
-                MediaSource.Path = _appHost.GetApiUrlForLocalAccess() + "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
+                var liveStreamPath = "/LiveTv/LiveStreamFiles/" + UniqueId + "/stream.ts";
+                MediaSource.Path = GetClientApiBaseUrl() + liveStreamPath;
+                MediaSource.EncoderPath = _appHost.GetApiUrlForLocalAccess() + liveStreamPath;
+                MediaSource.EncoderProtocol = MediaProtocol.Http;
                 MediaSource.Protocol = MediaProtocol.Http;
-                MediaSource.Container = "ts";
+                MediaSource.Container = "mpegts";
+                MediaSource.IgnoreDts = true;
+                MediaSource.SupportsDirectPlay = false;
+                MediaSource.SupportsDirectStream = true;
+                MediaSource.SupportsTranscoding = true;
             }
             catch (Exception ex) when (!(ex is OperationCanceledException && openCancellationToken.IsCancellationRequested))
             {
@@ -141,6 +153,25 @@ namespace TVHeadEnd
             {
                 await Close().ConfigureAwait(false);
                 throw;
+            }
+        }
+
+        private string GetClientApiBaseUrl()
+        {
+            try
+            {
+                var request = _httpContextAccessor?.HttpContext?.Request;
+                if (request != null)
+                {
+                    return _appHost.GetSmartApiUrl(request).TrimEnd('/');
+                }
+
+                return _appHost.GetSmartApiUrl(string.Empty).TrimEnd('/');
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to resolve a client-facing Jellyfin URL; falling back to the local API URL for HTSP live stream {UniqueId}", UniqueId);
+                return _appHost.GetApiUrlForLocalAccess().TrimEnd('/');
             }
         }
 
@@ -291,9 +322,16 @@ namespace TVHeadEnd
                 return;
             }
 
-            if (!response.containsField("stream"))
+            var streamIndex = response.getInt("stream");
+            if (!_muxer.IsStreamKnown(streamIndex))
             {
-                _logger.LogWarning("Ignoring HTSP mux packet without stream index");
+                if (_ignoredMuxStreams.Add(streamIndex))
+                {
+                    _logger.LogDebug(
+                        "HTSP dropping mux packets for non-playable or unsupported stream index {StreamIndex}; this mirrors Kodi pvr.hts demux behavior for unknown/private streams",
+                        streamIndex);
+                }
+
                 return;
             }
 
@@ -304,7 +342,7 @@ namespace TVHeadEnd
             }
 
             var chunk = _muxer.WritePacket(
-                response.getInt("stream"),
+                streamIndex,
                 payload,
                 response.containsField("pts") ? response.getLong("pts") : null,
                 response.containsField("dts") ? response.getLong("dts") : null);
@@ -387,20 +425,36 @@ namespace TVHeadEnd
             }
 
             var orderedStreams = streams.OrderBy(i => i.Index).ToList();
-            _muxer.SetStreams(orderedStreams);
-            UpdateMediaSourceStreamMetadata(orderedStreams);
+            var playableStreams = orderedStreams
+                .Where(IsPlayableForJellyfinTransportStream)
+                .ToList();
+            var droppedStreams = orderedStreams
+                .Where(i => !IsPlayableForJellyfinTransportStream(i))
+                .ToList();
+
+            _ignoredMuxStreams.Clear();
+            _muxer.SetStreams(playableStreams);
+            UpdateMediaSourceStreamMetadata(playableStreams);
             LogSourceInfo(response);
             _logger.LogInformation(
-                "HTSP stream metadata received: {TotalCount} stream(s), muxing all {MuxedCount} stream(s): {StreamSummary}",
+                "HTSP stream metadata received: {TotalCount} stream(s), muxing {MuxedCount} Kodi-style playable stream(s): {StreamSummary}",
                 orderedStreams.Count,
                 _muxer.SupportedStreamCount,
                 _muxer.StreamSummary);
 
-            if (orderedStreams.Count > 0 && _muxer.SupportedStreamCount != orderedStreams.Count)
+            if (droppedStreams.Count > 0)
+            {
+                _logger.LogInformation(
+                    "HTSP ignored {DroppedCount} non-playable/private stream(s) from Jellyfin MPEG-TS output: {DroppedStreams}",
+                    droppedStreams.Count,
+                    string.Join(", ", droppedStreams.Select(DescribeHtspStream)));
+            }
+
+            if (playableStreams.Count > 0 && _muxer.SupportedStreamCount != playableStreams.Count)
             {
                 _logger.LogWarning(
-                    "HTSP stream metadata contained {TotalCount} stream(s), but only {MuxedCount} stream(s) could be routed. This should only happen for malformed duplicate/missing stream indexes.",
-                    orderedStreams.Count,
+                    "HTSP stream metadata contained {PlayableCount} Jellyfin-playable stream(s), but only {MuxedCount} could be routed into MPEG-TS.",
+                    playableStreams.Count,
                     _muxer.SupportedStreamCount);
             }
         }
@@ -449,9 +503,27 @@ namespace TVHeadEnd
             MediaSource.SupportsProbing = false;
 
             _logger.LogInformation(
-                "HTSP exposed {Count} playable stream(s) to Jellyfin metadata: {Streams}; private/data streams remain preserved in the MPEG-TS output",
+                "HTSP exposed {Count} playable stream(s) to Jellyfin metadata: {Streams}; private/data streams are ignored in the MPEG-TS output",
                 mediaStreams.Count,
                 string.Join(", ", mediaStreams.Select(i => $"#{i.Index}:{i.Type}:{i.Codec}{(string.IsNullOrWhiteSpace(i.Language) ? string.Empty : ":" + i.Language)}")));
+        }
+
+        private static bool IsPlayableForJellyfinTransportStream(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            return stream != null
+                && HtspTransportStreamMuxer.CanMuxCodec(stream.Codec)
+                && TryGetMediaStreamType(stream.Codec, out _);
+        }
+
+        private static string DescribeHtspStream(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null)
+            {
+                return "<null>";
+            }
+
+            var codec = string.IsNullOrWhiteSpace(stream.Codec) ? "UNKNOWN" : stream.Codec;
+            return stream.Index + ":" + codec + (string.IsNullOrWhiteSpace(stream.Language) ? string.Empty : ":" + stream.Language);
         }
 
         private static MediaStream CreateMediaStream(HtspTransportStreamMuxer.StreamInfo stream, int ffmpegStreamIndex)

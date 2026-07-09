@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +13,7 @@ using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Configuration;
 using TVHeadEnd.Helper;
@@ -30,17 +32,19 @@ namespace TVHeadEnd
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly IServerApplicationHost _appHost;
+        private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly HTSConnectionHandler _htsConnectionHandler;
         private readonly AccessTicketHandler _channelTicketHandler;
 
         private readonly ILogger<LiveTvService> _logger;
         public DateTime _lastRecordingChange = DateTime.MinValue;
 
-        public LiveTvService(ILoggerFactory loggerFactory, IMediaEncoder mediaEncoder, HTSConnectionHandler connectionHandler, IServerApplicationHost appHost)
+        public LiveTvService(ILoggerFactory loggerFactory, IMediaEncoder mediaEncoder, HTSConnectionHandler connectionHandler, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
         {
             //System.Diagnostics.StackTrace t = new System.Diagnostics.StackTrace();
             _loggerFactory = loggerFactory;
             _appHost = appHost;
+            _httpContextAccessor = httpContextAccessor;
             _logger = loggerFactory.CreateLogger<LiveTvService>();
             _logger.LogDebug("LiveTvService()");
 
@@ -388,7 +392,7 @@ namespace TVHeadEnd
             {
                 try
                 {
-                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost);
+                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost, _httpContextAccessor);
                     await stream.Open(cancellationToken).ConfigureAwait(false);
                     return stream;
                 }
@@ -408,21 +412,49 @@ namespace TVHeadEnd
             return new MediaSourceLiveStream(mediaSource, () => CloseLiveStream(mediaSource.Id, CancellationToken.None));
         }
 
+        private string GetClientApiBaseUrl()
+        {
+            try
+            {
+                var request = _httpContextAccessor?.HttpContext?.Request;
+                if (request != null)
+                {
+                    return _appHost.GetSmartApiUrl(request).TrimEnd('/');
+                }
+
+                return _appHost.GetSmartApiUrl(string.Empty).TrimEnd('/');
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to resolve a client-facing Jellyfin URL; falling back to the local API URL for HTSP live stream metadata");
+                return _appHost.GetApiUrlForLocalAccess().TrimEnd('/');
+            }
+        }
+
         private MediaSourceInfo CreateHtspMediaSource(string channelId)
         {
             return new MediaSourceInfo
             {
-                // This ID is used by Jellyfin's HLS/subtitle paths as a media source ID.
-                // Keep the TVHeadend channel ID separate and expose a GUID-shaped media
-                // source ID so subtitle filter/attachment code paths do not try to
-                // Guid.Parse() a numeric TVH channel ID.
-                Id = Guid.NewGuid().ToString("N"),
-                Path = _appHost.GetApiUrlForLocalAccess(),
+            // This ID is used by Jellyfin's HLS/subtitle paths as a media source ID.
+            // Keep the TVHeadend channel ID separate and expose a GUID-shaped media
+            // source ID so subtitle filter/attachment code paths do not try to
+            // Guid.Parse() a numeric TVH channel ID.
+                Id = GetStableHtspMediaSourceId(channelId),
+                Path = GetClientApiBaseUrl(),
+                EncoderPath = _appHost.GetApiUrlForLocalAccess(),
+                EncoderProtocol = MediaProtocol.Http,
                 Protocol = MediaProtocol.Http,
                 AnalyzeDurationMs = 2000,
+                // HTSP is demuxed by Tvheadend and rebuilt by this plugin into a
+                // Jellyfin-facing MPEG-TS.  Do not advertise it as client-direct
+                // playable like Tvheadend's native HTTP TS mux.  Let Jellyfin use
+                // its HLS/remux/transcode path for remote clients and track changes.
+                SupportsDirectPlay = false,
                 SupportsDirectStream = true,
+                SupportsTranscoding = true,
                 SupportsProbing = true,
-                Container = "ts",
+                IgnoreDts = true,
+                Container = "mpegts",
                 RequiresOpening = true,
                 RequiresClosing = true,
                 IsInfiniteStream = true,
@@ -743,6 +775,20 @@ namespace TVHeadEnd
         private Task<int> WaitForInitialLoadTask(CancellationToken cancellationToken)
         {
             return Task.Factory.StartNew(() => _htsConnectionHandler.WaitForInitialLoad(cancellationToken), cancellationToken);
+        }
+
+        private static string GetStableHtspMediaSourceId(string channelId)
+        {
+            var normalizedChannelId = string.IsNullOrWhiteSpace(channelId) ? string.Empty : channelId.Trim();
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes("tvheadend-htsp:" + normalizedChannelId));
+            var guidBytes = hash.Take(16).ToArray();
+
+            // Make the deterministic value GUID-shaped for Jellyfin code paths that
+            // parse MediaSourceInfo.Id as a Guid, while keeping it stable across
+            // repeated GetChannelStreamMediaSources/GetChannelStream calls.
+            guidBytes[7] = (byte)((guidBytes[7] & 0x0F) | 0x40);
+            guidBytes[8] = (byte)((guidBytes[8] & 0x3F) | 0x80);
+            return new Guid(guidBytes).ToString("N");
         }
 
         private static string Dump(List<DayOfWeek> days)

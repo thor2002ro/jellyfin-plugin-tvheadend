@@ -416,7 +416,7 @@ namespace TVHeadEnd.HTSP
                 {
                     return;
                 }
-                catch (SocketException ex) when (cancellationToken.IsCancellationRequested || !_connected)
+                catch (SocketException) when (cancellationToken.IsCancellationRequested || !_connected)
                 {
                     return;
                 }
@@ -456,7 +456,7 @@ namespace TVHeadEnd.HTSP
                 {
                     return;
                 }
-                catch (SocketException ex) when (cancellationToken.IsCancellationRequested || !_connected)
+                catch (SocketException) when (cancellationToken.IsCancellationRequested || !_connected)
                 {
                     return;
                 }

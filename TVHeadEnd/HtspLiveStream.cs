@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Http;
@@ -796,13 +797,15 @@ namespace TVHeadEnd
                 return;
             }
 
-            RecordMuxPacket(streamIndex, payload);
+            var pts = response.containsField("pts") ? response.getLong("pts") : (long?)null;
+            var dts = response.containsField("dts") ? response.getLong("dts") : (long?)null;
+            RecordMuxPacket(streamIndex, payload, pts, dts);
 
             var chunk = _muxer.WritePacket(
                 streamIndex,
                 payload,
-                response.containsField("pts") ? response.getLong("pts") : null,
-                response.containsField("dts") ? response.getLong("dts") : null);
+                pts,
+                dts);
 
             if (chunk.Length > 0)
             {
@@ -810,7 +813,7 @@ namespace TVHeadEnd
             }
         }
 
-        private void RecordMuxPacket(int streamIndex, byte[] payload)
+        private void RecordMuxPacket(int streamIndex, byte[] payload, long? pts, long? dts)
         {
             if (payload == null)
             {
@@ -846,9 +849,11 @@ namespace TVHeadEnd
             if (isFirstPacket)
             {
                 _logger.LogInformation(
-                    "HTSP first mux packet for stream {Stream}: payload={PayloadBytes} bytes, firstBytes={FirstBytes}",
+                    "HTSP first mux packet for stream {Stream}: payload={PayloadBytes} bytes, pts={Pts}, dts={Dts}, firstBytes={FirstBytes}",
                     DescribeMuxPacketStream(streamIndex, streamInfo),
                     payload.Length,
+                    pts.HasValue ? pts.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
+                    dts.HasValue ? dts.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
                     FormatFirstBytes(payload, 16));
             }
 
@@ -1254,6 +1259,16 @@ namespace TVHeadEnd
                 {
                     mediaStream.SampleRate = sampleRate.Value;
                 }
+            }
+            else if (mediaStreamType == MediaStreamType.Subtitle)
+            {
+                // The Android TV direct-play path receives the raw MPEG-TS and
+                // must select/render embedded subtitle PIDs locally. Mark DVB
+                // subtitles explicitly as embedded so the app/profile path does
+                // not treat the stream like an external/no-delivery subtitle.
+                mediaStream.DeliveryMethod = SubtitleDeliveryMethod.Embed;
+                mediaStream.IsExternal = false;
+                mediaStream.SupportsExternalStream = false;
             }
 
             return mediaStream;

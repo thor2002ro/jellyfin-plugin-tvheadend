@@ -323,7 +323,7 @@ namespace TVHeadEnd
                 livetvasset.SupportsDirectStream = false;
                 livetvasset.RequiresClosing = true;
                 livetvasset.SupportsProbing = false;
-                livetvasset.Container = "mpegts";
+                livetvasset.Container = "ts";
                 livetvasset.RequiresOpening = true;
                 livetvasset.IsInfiniteStream  = true;
 
@@ -359,7 +359,7 @@ namespace TVHeadEnd
                     AnalyzeDurationMs = 2000,
                     SupportsDirectStream = false,
                     SupportsProbing = false,
-                    Container = "mpegts",
+                    Container = "ts",
                     MediaStreams = new List<MediaStream>
                     {
                         new MediaStream
@@ -412,13 +412,17 @@ namespace TVHeadEnd
         {
             return new MediaSourceInfo
             {
-                Id = channelId,
+                // This ID is used by Jellyfin's HLS/subtitle paths as a media source ID.
+                // Keep the TVHeadend channel ID separate and expose a GUID-shaped media
+                // source ID so subtitle filter/attachment code paths do not try to
+                // Guid.Parse() a numeric TVH channel ID.
+                Id = Guid.NewGuid().ToString("N"),
                 Path = _appHost.GetApiUrlForLocalAccess(),
                 Protocol = MediaProtocol.Http,
                 AnalyzeDurationMs = 2000,
                 SupportsDirectStream = true,
                 SupportsProbing = true,
-                Container = "mpegts",
+                Container = "ts",
                 RequiresOpening = true,
                 RequiresClosing = true,
                 IsInfiniteStream = true,

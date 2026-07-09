@@ -283,7 +283,7 @@ namespace TVHeadEnd
                         Path = path,
                         Protocol = path.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? MediaProtocol.Http : MediaProtocol.File,
                         Id = item.Id,
-                        Container = "mpegts",
+                        Container = "ts",
                         AnalyzeDurationMs = 2000,
                         MediaStreams = new List<MediaStream>
                         {

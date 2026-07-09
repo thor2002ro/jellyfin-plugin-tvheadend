@@ -27,6 +27,10 @@ namespace TVHeadEnd
 
         public int SupportedStreamCount => _streams.Count;
 
+        public string StreamSummary => string.Join(", ", _streams.Values
+            .OrderBy(i => i.Pid)
+            .Select(i => $"{i.Index}:{(i.Codec ?? "UNKNOWN")}->{i.StreamTypeDescription}@0x{i.Pid:X}"));
+
         public void SetTimestampsAre90Khz(bool timestampsAre90Khz)
         {
             _timestampsAre90Khz = timestampsAre90Khz;
@@ -43,13 +47,11 @@ namespace TVHeadEnd
             _packetsSinceTables = 0;
             _pcrPid = PmtPid;
 
-            foreach (var stream in streams ?? Enumerable.Empty<StreamInfo>())
+            foreach (var stream in (streams ?? Enumerable.Empty<StreamInfo>())
+                .Where(i => i != null)
+                .OrderBy(i => i.Index))
             {
-                if (!ConfigureStream(stream))
-                {
-                    continue;
-                }
-
+                ConfigureStream(stream);
                 stream.Pid = _nextPid++;
                 _streams[stream.Index] = stream;
             }
@@ -86,24 +88,29 @@ namespace TVHeadEnd
             return output.ToArray();
         }
 
-        private bool ConfigureStream(StreamInfo stream)
+        private void ConfigureStream(StreamInfo stream)
         {
-            if (stream == null || !TryGetTsType(stream.Codec, out var streamType, out var kind))
+            var normalizedCodec = NormalizeCodec(stream.Codec);
+            if (!TryGetTsType(normalizedCodec, out var streamType, out var kind, out var privateStreamId))
             {
-                return false;
+                streamType = 0x06;
+                kind = ElementaryStreamKind.Private;
+                privateStreamId = 0xBD;
+                stream.IsFallbackPrivateData = true;
             }
 
             stream.Kind = kind;
             stream.StreamType = streamType;
-            stream.Descriptors = BuildDescriptors(stream);
+            stream.Descriptors = BuildDescriptors(stream, normalizedCodec);
+            stream.StreamTypeDescription = stream.IsFallbackPrivateData
+                ? "PRIVATE(" + (string.IsNullOrWhiteSpace(stream.Codec) ? "UNKNOWN" : stream.Codec) + ")"
+                : stream.Codec;
             stream.StreamId = kind switch
             {
-                ElementaryStreamKind.Video => 0xE0 + _nextVideoStreamId++,
-                ElementaryStreamKind.Audio => 0xC0 + _nextAudioStreamId++,
-                _ => 0xBD
+                ElementaryStreamKind.Video => 0xE0 + Math.Min(_nextVideoStreamId++, 0x0F),
+                ElementaryStreamKind.Audio when !privateStreamId.HasValue => 0xC0 + Math.Min(_nextAudioStreamId++, 0x1F),
+                _ => privateStreamId ?? 0xBD
             };
-
-            return true;
         }
 
         private void WriteTables(Stream output)
@@ -304,10 +311,12 @@ namespace TVHeadEnd
             packet[offset + 5] = 0x00;
         }
 
-        private static bool TryGetTsType(string codec, out byte streamType, out ElementaryStreamKind kind)
+        private static bool TryGetTsType(string normalizedCodec, out byte streamType, out ElementaryStreamKind kind, out int? privateStreamId)
         {
             kind = ElementaryStreamKind.Private;
-            switch ((codec ?? string.Empty).Replace("-", string.Empty, StringComparison.Ordinal).Replace("_", string.Empty, StringComparison.Ordinal).ToUpperInvariant())
+            privateStreamId = null;
+
+            switch (normalizedCodec)
             {
                 case "MPEG1VIDEO":
                     streamType = 0x01;
@@ -329,8 +338,20 @@ namespace TVHeadEnd
                     streamType = 0x24;
                     kind = ElementaryStreamKind.Video;
                     return true;
+                case "MPEG4VIDEO":
+                case "MPEG4PART2":
+                    streamType = 0x10;
+                    kind = ElementaryStreamKind.Video;
+                    return true;
+                case "VC1":
+                    streamType = 0xEA;
+                    kind = ElementaryStreamKind.Video;
+                    privateStreamId = 0xFD;
+                    return true;
                 case "AAC":
                 case "AACADTS":
+                case "AACLC":
+                case "HEAAC":
                 case "MPEG4AUDIO":
                     streamType = 0x0F;
                     kind = ElementaryStreamKind.Audio;
@@ -351,32 +372,58 @@ namespace TVHeadEnd
                 case "AC3":
                     streamType = 0x81;
                     kind = ElementaryStreamKind.Audio;
+                    privateStreamId = 0xBD;
                     return true;
                 case "EAC3":
                     streamType = 0x87;
                     kind = ElementaryStreamKind.Audio;
+                    privateStreamId = 0xBD;
                     return true;
                 case "DTS":
+                case "DCA":
                     streamType = 0x8A;
                     kind = ElementaryStreamKind.Audio;
+                    privateStreamId = 0xBD;
+                    return true;
+                case "VORBIS":
+                case "OPUS":
+                case "TRUEHD":
+                    streamType = 0x06;
+                    kind = ElementaryStreamKind.Audio;
+                    privateStreamId = 0xBD;
                     return true;
                 case "DVBSUB":
                 case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
                 case "TELETEXT":
-                case "VORBIS":
+                case "TEXTSUB":
+                case "TEXTSUBTITLE":
+                case "SRT":
+                case "SUBRIP":
+                case "SSA":
+                case "ASS":
                     streamType = 0x06;
                     kind = ElementaryStreamKind.Private;
+                    privateStreamId = 0xBD;
                     return true;
                 default:
-                    streamType = 0;
+                    streamType = 0x06;
                     return false;
             }
         }
 
-        private static byte[] BuildDescriptors(StreamInfo stream)
+        private static string NormalizeCodec(string codec)
+        {
+            return (codec ?? string.Empty)
+                .Replace("-", string.Empty, StringComparison.Ordinal)
+                .Replace("_", string.Empty, StringComparison.Ordinal)
+                .Replace(" ", string.Empty, StringComparison.Ordinal)
+                .ToUpperInvariant();
+        }
+
+        private static byte[] BuildDescriptors(StreamInfo stream, string normalizedCodec)
         {
             var descriptors = new List<byte>();
-            var normalizedCodec = (stream.Codec ?? string.Empty).Replace("-", string.Empty, StringComparison.Ordinal).Replace("_", string.Empty, StringComparison.Ordinal).ToUpperInvariant();
 
             if (stream.Kind == ElementaryStreamKind.Audio && HasLanguage(stream.Language))
             {
@@ -393,15 +440,43 @@ namespace TVHeadEnd
                     AddDescriptor(descriptors, 0x7A);
                     break;
                 case "DTS":
+                case "DCA":
                     AddDescriptor(descriptors, 0x7B);
+                    break;
+                case "VORBIS":
+                    AddRegistrationDescriptor(descriptors, "VORB");
+                    break;
+                case "OPUS":
+                    AddRegistrationDescriptor(descriptors, "Opus");
+                    break;
+                case "TRUEHD":
+                    AddRegistrationDescriptor(descriptors, "HDMV");
+                    break;
+                case "VC1":
+                    AddRegistrationDescriptor(descriptors, "VC-1");
                     break;
                 case "DVBSUB":
                 case "DVBSUBTITLE":
+                case "DVB_SUBTITLE":
                     AddDvbSubtitleDescriptor(descriptors, stream);
                     break;
                 case "TELETEXT":
                     AddTeletextDescriptor(descriptors, stream);
                     break;
+                case "TEXTSUB":
+                case "TEXTSUBTITLE":
+                case "SRT":
+                case "SUBRIP":
+                case "SSA":
+                case "ASS":
+                    AddPrivateDataDescriptor(descriptors, normalizedCodec);
+                    break;
+            }
+
+            if (stream.IsFallbackPrivateData)
+            {
+                AddRegistrationDescriptor(descriptors, "HTSP");
+                AddPrivateDataDescriptor(descriptors, string.IsNullOrWhiteSpace(stream.Codec) ? "UNKNOWN" : stream.Codec);
             }
 
             return descriptors.ToArray();
@@ -431,6 +506,31 @@ namespace TVHeadEnd
             AddDescriptor(descriptors, 0x56, lang[0], lang[1], lang[2], 0x20, 0x00);
         }
 
+        private static void AddRegistrationDescriptor(List<byte> descriptors, string fourCc)
+        {
+            AddDescriptor(descriptors, 0x05, ToFourCcBytes(fourCc));
+        }
+
+        private static void AddPrivateDataDescriptor(List<byte> descriptors, string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes((text ?? string.Empty).Trim());
+            if (bytes.Length > 253)
+            {
+                bytes = bytes.Take(253).ToArray();
+            }
+
+            var payload = new byte[bytes.Length + 1];
+            payload[0] = 0x01;
+            Array.Copy(bytes, 0, payload, 1, bytes.Length);
+            AddDescriptor(descriptors, 0x80, payload);
+        }
+
+        private static byte[] ToFourCcBytes(string fourCc)
+        {
+            var result = Encoding.ASCII.GetBytes((fourCc ?? string.Empty).PadRight(4).Substring(0, 4));
+            return result;
+        }
+
         private static bool HasLanguage(string language)
         {
             return !string.IsNullOrWhiteSpace(language);
@@ -453,6 +553,11 @@ namespace TVHeadEnd
 
         private static void AddDescriptor(List<byte> descriptors, byte tag, params byte[] data)
         {
+            if ((data?.Length ?? 0) > 255)
+            {
+                throw new InvalidOperationException("MPEG-TS descriptor payload is too large.");
+            }
+
             descriptors.Add(tag);
             descriptors.Add((byte)(data?.Length ?? 0));
             if (data != null && data.Length > 0)
@@ -519,6 +624,10 @@ namespace TVHeadEnd
             internal ElementaryStreamKind Kind { get; set; }
 
             internal byte[] Descriptors { get; set; }
+
+            internal bool IsFallbackPrivateData { get; set; }
+
+            internal string StreamTypeDescription { get; set; }
         }
     }
 }

@@ -45,5 +45,33 @@ namespace TVHeadEnd.Helper
                 return item;
             }
         }
+
+        public bool TryDequeue(out T item, CancellationToken cancellationToken, TimeSpan waitTimeout)
+        {
+            item = default(T);
+            lock (_queue)
+            {
+                while (_queue.Count == 0)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        return false;
+                    }
+
+                    if (!Monitor.Wait(_queue, waitTimeout))
+                    {
+                        return false;
+                    }
+                }
+
+                item = _queue.Dequeue();
+                if (_queue.Count == _maxSize - 1)
+                {
+                    // wake up any blocked enqueue
+                    Monitor.PulseAll(_queue);
+                }
+                return true;
+            }
+        }
     }
 }

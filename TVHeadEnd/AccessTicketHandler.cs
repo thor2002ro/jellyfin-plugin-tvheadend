@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.HTSP;
 using TVHeadEnd.HTSP_Responses;
+using TVHeadEnd.Helper;
 using TVHeadEnd.TimeoutHelper;
 
 namespace TVHeadEnd;
@@ -103,7 +104,7 @@ public class AccessTicketHandler
     private async Task<HTSMessage> RequestTicket(string itemId, CancellationToken cancellation)
     {
         var request = new HTSMessage { Method = "getTicket" };
-        request.putField(_ticketItemType, itemId);
+        request.putField(_ticketItemType, HtspFieldHelper.ParseUInt32Id(itemId, _ticketItemType));
 
         for (int attempt = 1, lastAttempt = 1 + _requestRetries;
              attempt <= lastAttempt && !cancellation.IsCancellationRequested;

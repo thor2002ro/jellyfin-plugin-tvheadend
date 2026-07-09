@@ -117,7 +117,7 @@ namespace TVHeadEnd
 
             HTSMessage cancelTimerMessage = new HTSMessage();
             cancelTimerMessage.Method = "cancelDvrEntry";
-            cancelTimerMessage.putField("id", timerId);
+            cancelTimerMessage.putField("id", HtspFieldHelper.ParseUInt32Id(timerId, "id"));
 
             TaskWithTimeoutRunner<HTSMessage> twtr = new TaskWithTimeoutRunner<HTSMessage>(_timeout);
             TaskWithTimeoutResult<HTSMessage> twtRes = await twtr.RunWithTimeout(Task.Factory.StartNew(() =>
@@ -178,7 +178,7 @@ namespace TVHeadEnd
 
             HTSMessage createTimerMessage = new HTSMessage();
             createTimerMessage.Method = "addDvrEntry";
-            createTimerMessage.putField("channelId", info.ChannelId);
+            createTimerMessage.putField("channelId", HtspFieldHelper.ParseUInt32Id(info.ChannelId, "channelId"));
             createTimerMessage.putField("start", DateTimeHelper.getUnixUTCTimeFromUtcDateTime(info.StartDate));
             createTimerMessage.putField("stop", DateTimeHelper.getUnixUTCTimeFromUtcDateTime(info.EndDate));
             createTimerMessage.putField("startExtra", (long)(info.PrePaddingSeconds / 60));
@@ -230,7 +230,7 @@ namespace TVHeadEnd
 
             HTSMessage deleteRecordingMessage = new HTSMessage();
             deleteRecordingMessage.Method = "deleteDvrEntry";
-            deleteRecordingMessage.putField("id", recordingId);
+            deleteRecordingMessage.putField("id", HtspFieldHelper.ParseUInt32Id(recordingId, "id"));
 
             TaskWithTimeoutRunner<HTSMessage> twtr = new TaskWithTimeoutRunner<HTSMessage>(_timeout);
             TaskWithTimeoutResult<HTSMessage> twtRes = await twtr.RunWithTimeout(Task.Factory.StartNew(() =>
@@ -299,6 +299,9 @@ namespace TVHeadEnd
             var streamingMethod = _htsConnectionHandler.GetStreamingMethod();
             if (streamingMethod == StreamingMethods.Htsp)
             {
+                _logger.LogInformation(
+                    "LiveTvService.GetChannelStream: HTSP streaming is selected for channel {ChannelId}; TVHeadend HTTP fallback is disabled",
+                    channelId);
                 return CreateHtspMediaSource(channelId);
             }
 
@@ -383,9 +386,22 @@ namespace TVHeadEnd
         {
             if (_htsConnectionHandler.GetStreamingMethod() == StreamingMethods.Htsp)
             {
-                var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost);
-                await stream.Open(cancellationToken).ConfigureAwait(false);
-                return stream;
+                try
+                {
+                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), channelId, _loggerFactory, _appHost);
+                    await stream.Open(cancellationToken).ConfigureAwait(false);
+                    return stream;
+                }
+                catch (HtspLiveStreamException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (!(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+                {
+                    var htspException = HtspLiveStreamException.Create(channelId, ex);
+                    _logger.LogError(htspException, "HTSP direct stream provider failed for channel {ChannelId}; TVHeadend HTTP fallback is disabled", channelId);
+                    throw htspException;
+                }
             }
 
             var mediaSource = await GetChannelStream(channelId, streamId, cancellationToken).ConfigureAwait(false);
@@ -595,7 +611,7 @@ namespace TVHeadEnd
 
             HTSMessage queryEvents = new HTSMessage();
             queryEvents.Method = "getEvents";
-            queryEvents.putField("channelId", Convert.ToInt32(channelId));
+            queryEvents.putField("channelId", HtspFieldHelper.ParseUInt32Id(channelId, "channelId"));
             queryEvents.putField("maxTime", ((DateTimeOffset)endDateUtc).ToUnixTimeSeconds());
             _htsConnectionHandler.SendMessage(queryEvents, currGetEventsResponseHandler);
 
@@ -681,7 +697,7 @@ namespace TVHeadEnd
 
             HTSMessage updateTimerMessage = new HTSMessage();
             updateTimerMessage.Method = "updateDvrEntry";
-            updateTimerMessage.putField("id", info.Id);
+            updateTimerMessage.putField("id", HtspFieldHelper.ParseUInt32Id(info.Id, "id"));
             updateTimerMessage.putField("startExtra", (long)(info.PrePaddingSeconds / 60));
             updateTimerMessage.putField("stopExtra", (long)(info.PostPaddingSeconds / 60));
 

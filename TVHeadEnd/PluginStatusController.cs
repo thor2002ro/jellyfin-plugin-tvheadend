@@ -71,6 +71,9 @@ namespace TVHeadEnd
         public string PluginVersion { get; set; }
         public string StreamingMethod { get; set; }
         public string Server { get; set; }
+        public bool Connected { get; set; }
+        public string ServerVersion { get; set; }
+        public int? HtspProtocolVersion { get; set; }
         public int ActiveProducerCount { get; set; }
         public IReadOnlyList<HtspProducerStatus> Producers { get; set; }
     }
@@ -80,11 +83,19 @@ namespace TVHeadEnd
     [Route("TVHeadEnd/Status")]
     public sealed class PluginStatusController : ControllerBase
     {
+        private readonly HTSConnectionHandler _connectionHandler;
+
+        public PluginStatusController(HTSConnectionHandler connectionHandler)
+        {
+            _connectionHandler = connectionHandler;
+        }
+
         [HttpGet]
         public ActionResult<PluginRuntimeStatus> GetStatus()
         {
             var configuration = Plugin.Instance?.Configuration;
             var producers = HtspLiveStream.GetActiveProducerStatuses();
+            var connection = _connectionHandler.GetConnectionStatus();
             return Ok(new PluginRuntimeStatus
             {
                 GeneratedUtc = DateTime.UtcNow,
@@ -93,6 +104,9 @@ namespace TVHeadEnd
                     ?? "unknown",
                 StreamingMethod = configuration?.StreamingMethod ?? string.Empty,
                 Server = configuration == null ? string.Empty : configuration.TVH_ServerName + ":" + configuration.HTSP_Port,
+                Connected = connection.Connected,
+                ServerVersion = connection.ServerVersion,
+                HtspProtocolVersion = connection.ProtocolVersion,
                 ActiveProducerCount = producers.Count,
                 Producers = producers
             });

@@ -273,6 +273,14 @@ namespace TVHeadEnd
             return _htsConnection.getServerProtocolVersion();
         }
 
+        public (bool Connected, string ServerVersion, int? ProtocolVersion) GetConnectionStatus()
+        {
+            var connection = _htsConnection;
+            return _connected && connection != null
+                ? (true, connection.getServerversion(), connection.getServerProtocolVersion())
+                : (false, null, null);
+        }
+
         public String GetDiskSpace()
         {
             ensureConnection();

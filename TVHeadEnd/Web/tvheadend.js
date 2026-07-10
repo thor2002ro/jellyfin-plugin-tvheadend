@@ -69,6 +69,42 @@ export default function (view, params) {
         if (tuners) tuners.setAttribute('aria-busy', busy ? 'true' : 'false');
     }
 
+    function installControlTooltips(page) {
+        const fallbackTooltips = {
+            chkHideRecordingsChannel: 'Hide the synthetic TVHeadend Recordings channel from Jellyfin channel lists.'
+        };
+
+        page.querySelectorAll('.checkboxContainer input[type="checkbox"]').forEach(input => {
+            const container = input.closest('.checkboxContainer');
+            const label = input.closest('label');
+            const description = container ? container.querySelector('.fieldDescription') : null;
+            const labelText = label ? label.textContent.replace(/\s+/g, ' ').trim() : '';
+            const tooltip = (description && description.textContent.replace(/\s+/g, ' ').trim())
+                || fallbackTooltips[input.id]
+                || `Toggle ${labelText || input.id}.`;
+
+            input.title = tooltip;
+            if (label) label.title = tooltip;
+
+            if (description) {
+                if (!description.id) description.id = `${input.id}Description`;
+                input.setAttribute('aria-describedby', description.id);
+            }
+        });
+
+        const refreshButton = page.querySelector('#btnRefreshStatus');
+        if (refreshButton) {
+            refreshButton.title = 'Refresh live plugin and tuner status now. Status also refreshes automatically every five seconds.';
+            refreshButton.setAttribute('aria-label', 'Refresh live plugin and tuner status');
+        }
+
+        const saveButton = page.querySelector('.TVHclientConfigurationForm button[type="submit"]');
+        if (saveButton) {
+            saveButton.title = 'Save all TVHeadend plugin settings shown on this page.';
+            saveButton.setAttribute('aria-label', 'Save TVHeadend plugin settings');
+        }
+    }
+
     function updateDependentState(page) {
         const recoveryEnabled = page.querySelector('#chkHTSPSignalRecoveryEnabled').checked;
         const recovery = page.querySelector('#signalRecoverySettings');
@@ -169,6 +205,8 @@ export default function (view, params) {
     function stopStatusPolling() {
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
     }
+
+    installControlTooltips(view);
 
     view.addEventListener('viewshow', function () {
         Dashboard.showLoadingMsg();

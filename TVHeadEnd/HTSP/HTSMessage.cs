@@ -11,10 +11,8 @@ namespace TVHeadEnd.HTSP
 {
     public class HTSMessage
     {
-        // Tvheadend master currently supports newer server-side protocol versions,
-        // but advertising the server maximum would enable features this client does
-        // not implement. Keep this at the client feature level.
-        public const long HTSP_CLIENT_VERSION = 34;
+        // Protocol 44 adds absolute signal strength (dBm) and SNR (dB) fields.
+        public const long HTSP_CLIENT_VERSION = 44;
         public const long HTSP_MIN_SERVER_VERSION = 19;
 
         // Backwards-compatible alias used by existing call sites and UI strings.

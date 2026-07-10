@@ -156,7 +156,11 @@ namespace TVHeadEnd
 
             public int? SignalRaw { get; set; }
 
+            public long? SignalAbsolute { get; set; }
+
             public int? SnrRaw { get; set; }
+
+            public long? SnrAbsolute { get; set; }
 
             public long? Ber { get; set; }
 
@@ -3192,7 +3196,9 @@ namespace TVHeadEnd
                 UpdatedUtc = DateTime.UtcNow,
                 Status = response.getString("feStatus", string.Empty),
                 SnrRaw = GetNullableInt(response, "feSNR"),
+                SnrAbsolute = GetNullableLong(response, "feAbsoluteSNR"),
                 SignalRaw = GetNullableInt(response, "feSignal"),
+                SignalAbsolute = GetNullableLong(response, "feAbsoluteSignal"),
                 Ber = GetNullableLong(response, "feBER"),
                 Unc = GetNullableLong(response, "feUNC")
             };
@@ -3210,8 +3216,8 @@ namespace TVHeadEnd
             var lockChanged = !firstValidStatus && lockWasPresent != lockIsPresent;
             var uncIncrease = GetCounterIncrease(previous?.Unc, current.Unc);
             var berIncrease = GetCounterIncrease(previous?.Ber, current.Ber);
-            var signalChanged = HasMeaningfulFrontendChange(previous?.SignalRaw, current.SignalRaw);
-            var snrChanged = HasMeaningfulFrontendChange(previous?.SnrRaw, current.SnrRaw);
+            var signalChanged = HasMeaningfulFrontendChange(previous?.SignalRaw, current.SignalRaw, previous?.SignalAbsolute, current.SignalAbsolute);
+            var snrChanged = HasMeaningfulFrontendChange(previous?.SnrRaw, current.SnrRaw, previous?.SnrAbsolute, current.SnrAbsolute);
             var summary = FormatSignalSummary(current);
 
             EvaluateSignalRecovery(current, lockIsPresent, uncIncrease);
@@ -3342,15 +3348,20 @@ namespace TVHeadEnd
             }
 
             return "status=" + (string.IsNullOrWhiteSpace(signal.Status) ? "unknown" : signal.Status)
-                + ", signal=" + FormatFrontendValue(signal.SignalRaw)
-                + ", snr=" + FormatFrontendValue(signal.SnrRaw)
+                + ", signal=" + FormatFrontendValue(signal.SignalRaw, signal.SignalAbsolute, "dBm")
+                + ", snr=" + FormatFrontendValue(signal.SnrRaw, signal.SnrAbsolute, "dB")
                 + ", ber=" + (signal.Ber.HasValue ? signal.Ber.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "n/a")
                 + ", unc=" + (signal.Unc.HasValue ? signal.Unc.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "n/a")
                 + ", ageMs=" + Math.Max(0, (long)(DateTime.UtcNow - signal.UpdatedUtc).TotalMilliseconds);
         }
 
-        private static string FormatFrontendValue(int? rawValue)
+        private static string FormatFrontendValue(int? rawValue, long? absoluteValue, string absoluteUnit)
         {
+            if (absoluteValue.HasValue)
+            {
+                return (absoluteValue.Value / 1000.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + " " + absoluteUnit;
+            }
+
             var percent = NormalizeFrontendValue(rawValue);
             if (!rawValue.HasValue)
             {
@@ -3382,8 +3393,18 @@ namespace TVHeadEnd
             return null;
         }
 
-        private static bool HasMeaningfulFrontendChange(int? previous, int? current)
+        private static bool HasMeaningfulFrontendChange(int? previous, int? current, long? previousAbsolute, long? currentAbsolute)
         {
+            if (previousAbsolute.HasValue && currentAbsolute.HasValue)
+            {
+                return Math.Abs(currentAbsolute.Value - previousAbsolute.Value) >= 1000;
+            }
+
+            if (previousAbsolute.HasValue != currentAbsolute.HasValue)
+            {
+                return true;
+            }
+
             var previousPercent = NormalizeFrontendValue(previous);
             var currentPercent = NormalizeFrontendValue(current);
             return previousPercent.HasValue
@@ -3607,8 +3628,10 @@ namespace TVHeadEnd
                 HasLock = HasFrontendLock(signal?.Status),
                 SignalRaw = signal?.SignalRaw,
                 SignalPercent = NormalizeFrontendValue(signal?.SignalRaw),
+                SignalDbm = signal?.SignalAbsolute / 1000.0,
                 SnrRaw = signal?.SnrRaw,
                 SnrPercent = NormalizeFrontendValue(signal?.SnrRaw),
+                SnrDb = signal?.SnrAbsolute / 1000.0,
                 Ber = signal?.Ber,
                 Unc = signal?.Unc,
                 SignalAgeMs = signal == null || signal.UpdatedUtc == default ? null : Math.Max(0, (long)(DateTime.UtcNow - signal.UpdatedUtc).TotalMilliseconds),

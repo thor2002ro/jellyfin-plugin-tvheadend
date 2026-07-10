@@ -169,6 +169,23 @@ namespace TVHeadEnd
             MarkDiscontinuityForAllPids();
         }
 
+        public void MarkStreamDiscontinuity(int streamIndex, bool repeatProgramTables)
+        {
+            if (!_streams.TryGetValue(streamIndex, out var stream))
+            {
+                return;
+            }
+
+            _pendingDiscontinuityPids.Add(stream.Pid);
+            if (repeatProgramTables)
+            {
+                _wroteTables = false;
+                _packetsSinceTables = 0;
+                _pendingDiscontinuityPids.Add(0);
+                _pendingDiscontinuityPids.Add(PmtPid);
+            }
+        }
+
         public bool IsStreamKnown(int streamIndex)
         {
             return _streams.ContainsKey(streamIndex);

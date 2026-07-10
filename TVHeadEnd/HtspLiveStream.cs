@@ -3758,7 +3758,7 @@ namespace TVHeadEnd
 
             try
             {
-                connection.stop();
+                connection.Dispose();
             }
             catch
             {

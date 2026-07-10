@@ -54,7 +54,7 @@ namespace TVHeadEnd.DataHelper
 
             lock (_data)
             {
-                if (!_data.TryGetValue(id, out HTSMessage? oldMessage) || oldMessage == null)
+                if (!_data.TryGetValue(id, out HTSMessage oldMessage) || oldMessage == null)
                 {
                     _logger.LogDebug("[TVHclient] DvrDataHelper.dvrEntryUpdate id not in database - skipping");
                     return;

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
@@ -75,7 +75,7 @@ namespace TVHeadEnd
     }
 
     [ApiController]
-    [Authorize]
+    [Authorize(Policy = "RequiresElevation")]
     [Route("TVHeadEnd/Status")]
     public sealed class PluginStatusController : ControllerBase
     {
@@ -97,7 +97,33 @@ namespace TVHeadEnd
     }
 
     [ApiController]
-    [Authorize]
+    [Route("TVHeadEnd/Recordings")]
+    public sealed class PluginRecordingStreamController : ControllerBase
+    {
+        private readonly LiveTvService _liveTvService;
+
+        public PluginRecordingStreamController(LiveTvService liveTvService)
+        {
+            _liveTvService = liveTvService;
+        }
+
+        [HttpGet("{recordingId}/{token}/Stream")]
+        [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
+        public async Task<IActionResult> GetStream(string recordingId, string token, CancellationToken cancellationToken)
+        {
+            // Jellyfin fetches remote channel media server-side without forwarding the user's authorization header.
+            if (!_liveTvService.IsRecordingStreamTokenValid(recordingId, token))
+            {
+                return NotFound();
+            }
+
+            var streamUrl = await _liveTvService.GetRecordingStreamUrl(recordingId, cancellationToken).ConfigureAwait(false);
+            return Redirect(streamUrl);
+        }
+    }
+
+    [ApiController]
+    [Authorize(Policy = "RequiresElevation")]
     [Route("TVHeadEnd/Profiles")]
     public sealed class PluginProfilesController : ControllerBase
     {
@@ -114,12 +140,14 @@ namespace TVHeadEnd
             var configuration = Plugin.Instance.Configuration;
             var webRoot = (configuration.WebRoot ?? string.Empty).Trim('/');
             var path = "/" + (webRoot.Length == 0 ? string.Empty : webRoot + "/") + "api/dvr/config/grid";
-            var uri = new UriBuilder(Uri.UriSchemeHttp, configuration.TVH_ServerName.Trim(), configuration.HTTP_Port, path) { Query = "limit=999999" }.Uri;
+            var scheme = configuration.UseHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
+            var uri = new UriBuilder(scheme, configuration.TVH_ServerName.Trim(), configuration.HTTP_Port, path) { Query = "limit=999999" }.Uri;
 
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
             var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes(configuration.Username + ":" + configuration.Password));
             request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
-            using var response = await _httpClientFactory.CreateClient().SendAsync(request, cancellationToken).ConfigureAwait(false);
+            using var client = _httpClientFactory.CreateClient();
+            using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
 
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);

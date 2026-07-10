@@ -253,7 +253,9 @@
                     <summary>Connection and authentication</summary>
                     <div class="tvhSectionBody tvhGrid">
                         <div class="inputContainer"><input is="emby-input" type="text" id="txtTVH_ServerName" label="TVHeadend hostname or IP address" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="text" id="txtTVH_TimeZoneId" label="TVHeadend timezone" placeholder="Europe/Bucharest" /><div class="fieldDescription">IANA timezone of the TVHeadend host. Leave empty to use Jellyfin's timezone when the current offsets match. Set this when the hosts use different timezones so future daylight-saving transitions remain exact.</div></div>
                         <div class="inputContainer"><input is="emby-input" type="number" min="1" max="65535" id="txtHTTP_Port" label="HTTP port" /></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkUseHttps" /><span>Use HTTPS for TVHeadend web requests</span></label><div class="fieldDescription checkboxFieldDescription">Enable when the configured HTTP port is served through TLS. Credentials and playback tickets are then encrypted in transit.</div></div>
                         <div class="inputContainer"><input is="emby-input" type="number" min="1" max="65535" id="txtHTSP_Port" label="HTSP port" /></div>
                         <div class="inputContainer"><input is="emby-input" type="text" id="txtWebRoot" label="Web root" /><div class="fieldDescription">Usually <code>/</code>. Used for TVHeadend HTTP requests.</div></div>
                         <div class="inputContainer"><input is="emby-input" type="text" id="txtUserName" autocomplete="username" label="Username" /></div>
@@ -302,7 +304,7 @@
                 <details class="tvhSection">
                     <summary>Recordings and channel presentation</summary>
                     <div class="tvhSectionBody tvhGrid">
-                        <div class="selectContainer"><select is="emby-select" id="txtPriority" label="Recording priority" title="Priority assigned to new TVHeadend recordings created by Jellyfin."><option value="0">Important</option><option value="1">High</option><option value="2">Normal</option><option value="3">Low</option><option value="4">Unimportant</option></select><div class="fieldDescription">Priority assigned to new recordings.</div></div>
+                        <div class="selectContainer"><select is="emby-select" id="txtPriority" label="Recording priority" title="Priority assigned to new TVHeadend recordings created by Jellyfin."><option value="6">Default</option><option value="0">Important</option><option value="1">High</option><option value="2">Normal</option><option value="3">Low</option><option value="4">Unimportant</option></select><div class="fieldDescription">Priority assigned to new recordings. Default uses the selected TVHeadend DVR profile.</div></div>
                         <div class="selectContainer"><select is="emby-select" id="txtProfile" label="TVHeadend recording profile" title="TVHeadend DVR profile used for new recordings created by Jellyfin."><option value="">Default</option></select><div id="profileStatus" class="fieldDescription">Recording profiles are loaded from TVHeadend.</div></div>
                         <div class="inputContainer"><input is="emby-input" type="number" min="0" id="txtPrePadding" label="Pre-recording padding (seconds)" /></div>
                         <div class="inputContainer"><input is="emby-input" type="number" min="0" id="txtPostPadding" label="Post-recording padding (seconds)" /></div>

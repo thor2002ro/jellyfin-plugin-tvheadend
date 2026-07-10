@@ -16,19 +16,16 @@ namespace TVHeadEnd.HTSP.Responses
         private readonly DateTime _startDateTimeUtc;
         private readonly DateTime _endDateTimeUtc;
         private readonly ILogger<LiveTvService> _logger;
-        private readonly CancellationToken _cancellationToken;
 
         private readonly List<ProgramInfo> _result;
+        private readonly TaskCompletionSource<IEnumerable<ProgramInfo>> _events = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        private volatile bool _dataReady;
-
-        public GetEventsResponseHandler(DateTime startDateTimeUtc, DateTime endDateTimeUtc, ILogger<LiveTvService> logger, CancellationToken cancellationToken)
+        public GetEventsResponseHandler(DateTime startDateTimeUtc, DateTime endDateTimeUtc, ILogger<LiveTvService> logger)
         {
             _startDateTimeUtc = startDateTimeUtc;
             _endDateTimeUtc = endDateTimeUtc;
 
             _logger = logger;
-            _cancellationToken = cancellationToken;
 
             _result = new List<ProgramInfo>();
         }
@@ -757,8 +754,7 @@ namespace TVHeadEnd.HTSP.Responses
                     _result.Add(pi);
                 }
             }
-
-            _dataReady = true;
+            _events.TrySetResult(_result);
         }
 
         private string CreatePiInfo(ProgramInfo pi)
@@ -793,19 +789,9 @@ namespace TVHeadEnd.HTSP.Responses
             return sb.ToString();
         }
 
-        public Task<IEnumerable<ProgramInfo>> GetEvents(string channelId, CancellationToken cancellationToken)
+        public Task<IEnumerable<ProgramInfo>> GetEvents(CancellationToken cancellationToken)
         {
-            return Task.Run<IEnumerable<ProgramInfo>>(() =>
-            {
-                while (!_dataReady || cancellationToken.IsCancellationRequested)
-                {
-                    Thread.Sleep(500);
-                }
-
-                // _logger.LogDebug("[TVHclient] GetEventsResponseHandler.GetEvents: channelId={Cid}  / dataReady={Dr}  / cancellationToken.IsCancellationRequested={Cancelreq}",
-                //    channelId, _dataReady, cancellationToken.IsCancellationRequested);
-                return _result;
-            });
+            return _events.Task.WaitAsync(cancellationToken);
         }
     }
 }

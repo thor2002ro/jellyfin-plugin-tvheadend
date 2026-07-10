@@ -82,8 +82,10 @@ namespace TVHeadEnd.DataHelper
 
         public string? GetChannelIcon4ChannelId(string channelId)
         {
-            _piconData.TryGetValue(channelId, out string? result);
-            return result;
+            lock (_data)
+            {
+                return _piconData.TryGetValue(channelId, out string result) ? result : null;
+            }
         }
 
         public long ResolveChannelId(string channelId)
@@ -144,16 +146,19 @@ namespace TVHeadEnd.DataHelper
 
                             if (m.ContainsField("channelIcon"))
                             {
-                                string? channelIcon = m.GetString("channelIcon");
-                                bool uriCheckResult = Uri.TryCreate(channelIcon, UriKind.Absolute, out Uri? uriResult) && uriResult.Scheme == Uri.UriSchemeHttp;
+                                string channelIcon = m.getString("channelIcon");
+                                Uri uriResult;
+                                bool uriCheckResult = Uri.TryCreate(channelIcon, UriKind.Absolute, out uriResult)
+                                    && (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps);
                                 if (uriCheckResult)
                                 {
                                     ci.ImageUrl = channelIcon;
+                                    _piconData.Remove(ci.Id);
                                 }
                                 else if (channelIcon != null)
                                 {
                                     ci.HasImage = true;
-                                    _piconData.TryAdd(ci.Id, channelIcon);
+                                    _piconData[ci.Id] = channelIcon;
                                 }
                             }
 

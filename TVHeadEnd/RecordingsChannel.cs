@@ -21,13 +21,18 @@ namespace TVHeadEnd
 {
     public class RecordingsChannel : IChannel, ISupportsDelete, ISupportsLatestMedia, IHasFolderAttributes
     {
-        private readonly TimeSpan _timeout = TimeSpan.FromMinutes(5);
+        private static readonly DateTime MediaSourceRevisionUtc = new DateTime(2026, 7, 11, 0, 0, 0, DateTimeKind.Utc);
+        private readonly HTSConnectionHandler _htsConnectionHandler;
+        private readonly LiveTvService _liveTvService;
+        private readonly TimeSpan TIMEOUT = TimeSpan.FromMinutes(5);
+
         private readonly ILogger<LiveTvService> _logger;
         private readonly HTSConnectionHandler _htsConnectionHandler;
 
-        public RecordingsChannel(ILoggerFactory loggerFactory, HTSConnectionHandler htsConnectionHandler)
+        public RecordingsChannel(ILoggerFactory loggerFactory, HTSConnectionHandler htsConnectionHandler, LiveTvService liveTvService)
         {
             _htsConnectionHandler = htsConnectionHandler;
+            _liveTvService = liveTvService;
             _logger = loggerFactory.CreateLogger<LiveTvService>();
             _logger.LogDebug("[TVHclient] RecordingsChannel()");
         }
@@ -58,7 +63,7 @@ namespace TVHeadEnd
         {
             get
             {
-                return "1";
+                return "2";
             }
         }
 
@@ -86,7 +91,7 @@ namespace TVHeadEnd
 
             values.Add(Math.Floor(minute).ToString(CultureInfo.InvariantCulture));
 
-            values.Add(GetService().LastRecordingChange.Ticks.ToString(CultureInfo.InvariantCulture));
+            values.Add(_liveTvService._lastRecordingChange.Ticks.ToString(CultureInfo.InvariantCulture));
 
             return string.Join("-", values.ToArray());
         }
@@ -141,23 +146,12 @@ namespace TVHeadEnd
             return !Plugin.Instance.Configuration.HideRecordingsChannel;
         }
 
-        private LiveTvService GetService()
-        {
-            return _htsConnectionHandler.GetLiveTvService()
-                ?? throw new InvalidOperationException("The TVHeadend LiveTvService has not been registered yet");
-        }
-
-        private Task<int> WaitForInitialLoadTask(CancellationToken cancellationToken)
-        {
-            return Task.Run(() => _htsConnectionHandler.WaitForInitialLoad(cancellationToken), cancellationToken);
-        }
-
         public async Task<IEnumerable<MyRecordingInfo>> GetAllRecordingsAsync(CancellationToken cancellationToken)
         {
             // retrieve all 'Pending', 'Inprogress' and 'Completed' recordings
             // we don't deliver the 'Pending' recordings
 
-            int timeOut = await WaitForInitialLoadTask(cancellationToken).ConfigureAwait(false);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("[TVHclient] GetAllRecordingsAsync - Not initialized ");
@@ -182,7 +176,7 @@ namespace TVHeadEnd
 
         public Task DeleteItem(string id, CancellationToken cancellationToken)
         {
-            return GetService().DeleteRecordingAsync(id, cancellationToken);
+            return _liveTvService.DeleteRecordingAsync(id, cancellationToken);
         }
 
         public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
@@ -254,7 +248,7 @@ namespace TVHeadEnd
 
         private ChannelItemInfo ConvertToChannelItem(MyRecordingInfo item)
         {
-            var path = buildRecordingPath(_htsConnectionHandler.ResolveDvrId(item.Id).ToString(CultureInfo.InvariantCulture));
+            var path = BuildRecordingPath(_htsConnectionHandler.ResolveDvrId(item.Id).ToString(CultureInfo.InvariantCulture));
 
             _logger.LogDebug("[TVHclient] ConvertToChannelItem - Creating ChannelItemInfo");
 
@@ -307,7 +301,7 @@ namespace TVHeadEnd
                 // ProductionYear = item.ProductionYear,
                 // Studios = item.Studios,
                 Type = ChannelItemType.Media,
-                DateModified = item.DateLastUpdated,
+                DateModified = item.DateLastUpdated > MediaSourceRevisionUtc ? item.DateLastUpdated : MediaSourceRevisionUtc,
                 Overview = item.Overview,
                 // People = item.People
                 Etag = item.Status.ToString()
@@ -318,17 +312,7 @@ namespace TVHeadEnd
 
         private string BuildRecordingPath(string id)
         {
-            try
-            {
-                // Built through the connection handler so the recording URL uses the web root
-                // TVHeadend reports, exactly like channel icons and stream URLs do.
-                return _htsConnectionHandler.GetAuthenticatedUrl("dvrfile/" + id);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "[TVHclient] RecordingsChannel: could not build a playback path for recording {RecordingId}", id);
-                return string.Empty;
-            }
+            return _liveTvService.GetRecordingProxyUrl(id);
         }
 
         private async Task<ChannelItemResult> GetRecordingGroups(InternalChannelItemQuery query, CancellationToken cancellationToken)

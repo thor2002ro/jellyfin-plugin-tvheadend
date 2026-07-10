@@ -149,10 +149,13 @@ export default function (view, params) {
 
     function renderStatus(page, status) {
         const producers = Array.isArray(status.Producers) ? status.Producers : [];
+        const serverStatus = status.Connected
+            ? `${status.Server || 'not configured'} · Connected · ${status.ServerVersion || 'unknown version'} · HTSP ${status.HtspProtocolVersion == null ? 'unknown' : status.HtspProtocolVersion}`
+            : `${status.Server || 'not configured'} · Disconnected`;
         page.querySelector('#statusUpdated').textContent = `Updated ${new Date(status.GeneratedUtc).toLocaleTimeString()}`;
         page.querySelector('#statusSummary').innerHTML =
             metric('Plugin version', status.PluginVersion || 'unknown') +
-            metric('TVHeadend server', status.Server || 'not configured') +
+            metric('TVHeadend server', serverStatus) +
             metric('Streaming method', status.StreamingMethod || 'legacy/default') +
             metric('Active producers', String(status.ActiveProducerCount || 0));
 

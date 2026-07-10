@@ -28,6 +28,9 @@ export default function (view, params) {
             page.querySelector('#chkHideRecordingsChannel').checked = config.HideRecordingsChannel || false;
             page.querySelector('#selStreamingMethod').value = getStreamingMethod(config);
             page.querySelector('#chkForceDeinterlace').checked = config.ForceDeinterlace || false;
+            page.querySelector('#txtHTSPQueueDepth').value = Number.isFinite(config.HTSPQueueDepth) ? config.HTSPQueueDepth : 2000000;
+            page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(config.HTSPStallTimeoutSeconds) ? config.HTSPStallTimeoutSeconds : 15;
+            page.querySelector('#chkHTSPFilterControlStreams').checked = config.HTSPFilterControlStreams === true;
             Dashboard.hideLoadingMsg();
         });
     });
@@ -51,6 +54,9 @@ export default function (view, params) {
             config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
             config.EnableSubsMaudios = config.StreamingMethod === 'HttpBasic';
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
+            config.HTSPQueueDepth = Math.max(0, Math.min(20000000, parseInt(form.querySelector('#txtHTSPQueueDepth').value, 10) || 0));
+            config.HTSPStallTimeoutSeconds = Math.max(0, Math.min(120, parseInt(form.querySelector('#txtHTSPStallTimeoutSeconds').value, 10) || 0));
+            config.HTSPFilterControlStreams = form.querySelector('#chkHTSPFilterControlStreams').checked;
             ApiClient.updatePluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId, config).then(Dashboard.processPluginConfigurationUpdateResult);
         });
         return false;

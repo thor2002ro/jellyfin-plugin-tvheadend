@@ -16,6 +16,7 @@ namespace TVHeadEnd
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
+        private readonly HashSet<int> _pendingDiscontinuityPids = new HashSet<int>();
         private bool _wroteTables;
         private bool _timestampsAre90Khz;
         private int _nextPid = FirstElementaryPid;
@@ -25,10 +26,14 @@ namespace TVHeadEnd
         private int _pcrPid = PmtPid;
         private long? _timestampBase;
         private long? _lastMuxClock;
+        private string _streamLayoutSignature;
+        private byte _pmtVersion;
 
         public bool HasStreams => _streams.Count > 0;
 
         public int SupportedStreamCount => _streams.Count;
+
+        public int PmtVersion => _pmtVersion;
 
         public string StreamSummary => string.Join(", ", _streams.Values
             .OrderBy(i => i.Pid)
@@ -39,26 +44,48 @@ namespace TVHeadEnd
             _timestampsAre90Khz = timestampsAre90Khz;
         }
 
-        public void SetStreams(IEnumerable<StreamInfo> streams)
+        public bool SetStreams(IEnumerable<StreamInfo> streams, bool sourceDiscontinuity = false)
         {
+            var previousStreams = _streams.ToDictionary(i => i.Key, i => i.Value);
+            var hadPreviousLayout = _streamLayoutSignature != null;
+            var preserveTimeline = hadPreviousLayout && !sourceDiscontinuity;
+
             _streams.Clear();
-            _continuityCounters.Clear();
+            if (!preserveTimeline)
+            {
+                _continuityCounters.Clear();
+                _timestampBase = null;
+                _lastMuxClock = null;
+            }
+
+            // Preserve any one-shot discontinuity flags that have not yet been
+            // emitted. A duplicate subscriptionStart can arrive before the first
+            // packet; clearing here would silently lose the required signal.
             _wroteTables = false;
             _nextPid = FirstElementaryPid;
             _nextVideoStreamId = 0;
             _nextAudioStreamId = 0;
             _packetsSinceTables = 0;
             _pcrPid = PmtPid;
-            _timestampBase = null;
-            _lastMuxClock = null;
 
             foreach (var stream in (streams ?? Enumerable.Empty<StreamInfo>())
                 .Where(i => i != null)
                 .OrderBy(i => i.Index))
             {
-                stream.LastPts90Khz = null;
-                stream.LastDts90Khz = null;
-                stream.TimestampCorrectionCount = 0;
+                if (preserveTimeline
+                    && previousStreams.TryGetValue(stream.Index, out var previous)
+                    && string.Equals(NormalizeCodec(previous.Codec), NormalizeCodec(stream.Codec), StringComparison.Ordinal))
+                {
+                    stream.LastPts90Khz = previous.LastPts90Khz;
+                    stream.LastDts90Khz = previous.LastDts90Khz;
+                    stream.TimestampCorrectionCount = previous.TimestampCorrectionCount;
+                }
+                else
+                {
+                    stream.LastPts90Khz = null;
+                    stream.LastDts90Khz = null;
+                    stream.TimestampCorrectionCount = 0;
+                }
 
                 if (!TryConfigureStream(stream))
                 {
@@ -75,6 +102,71 @@ namespace TVHeadEnd
             {
                 _pcrPid = pcrStream.Pid;
             }
+
+            var newSignature = BuildStreamLayoutSignature();
+            var layoutChanged = hadPreviousLayout
+                && !string.Equals(_streamLayoutSignature, newSignature, StringComparison.Ordinal);
+            if (layoutChanged)
+            {
+                _pmtVersion = (byte)((_pmtVersion + 1) & 0x1F);
+            }
+
+            _streamLayoutSignature = newSignature;
+
+            var validPids = new HashSet<int>(_streams.Values.Select(i => i.Pid)) { 0, PmtPid };
+            foreach (var pid in _continuityCounters.Keys.Where(i => !validPids.Contains(i)).ToList())
+            {
+                _continuityCounters.Remove(pid);
+            }
+
+            _pendingDiscontinuityPids.RemoveWhere(pid => !validPids.Contains(pid));
+            if (sourceDiscontinuity || layoutChanged)
+            {
+                _pendingDiscontinuityPids.Clear();
+                MarkDiscontinuityForAllPids();
+            }
+
+            return layoutChanged;
+        }
+
+        private string BuildStreamLayoutSignature()
+        {
+            return string.Join(
+                "|",
+                _streams.Values
+                    .OrderBy(i => i.Pid)
+                    .Select(i => string.Join(
+                        ":",
+                        i.Index,
+                        i.Pid,
+                        i.StreamType,
+                        NormalizeCodec(i.Codec),
+                        i.Language ?? string.Empty,
+                        i.Channels,
+                        i.Rate,
+                        i.CompositionId,
+                        i.AncillaryId,
+                        Convert.ToHexString(i.Descriptors ?? Array.Empty<byte>()))));
+        }
+
+        private void MarkDiscontinuityForAllPids()
+        {
+            _pendingDiscontinuityPids.Add(0);
+            _pendingDiscontinuityPids.Add(PmtPid);
+            foreach (var pid in _streams.Values.Select(i => i.Pid))
+            {
+                _pendingDiscontinuityPids.Add(pid);
+            }
+        }
+
+        public void MarkSourceDiscontinuity()
+        {
+            _wroteTables = false;
+            _packetsSinceTables = 0;
+            _continuityCounters.Clear();
+            _timestampBase = null;
+            _lastMuxClock = null;
+            MarkDiscontinuityForAllPids();
         }
 
         public bool IsStreamKnown(int streamIndex)
@@ -82,12 +174,23 @@ namespace TVHeadEnd
             return _streams.ContainsKey(streamIndex);
         }
 
+        public StreamInfo GetStreamInfo(int streamIndex)
+        {
+            return _streams.TryGetValue(streamIndex, out var stream) ? stream : null;
+        }
+
         internal static bool CanMuxCodec(string codec)
         {
             return TryGetTsType(NormalizeCodec(codec), out _, out _, out _);
         }
 
-        public byte[] WritePacket(int streamIndex, byte[] payload, long? pts, long? dts)
+        public byte[] WritePacket(
+            int streamIndex,
+            byte[] payload,
+            long? pts,
+            long? dts,
+            bool forceProgramTables = false,
+            bool randomAccess = false)
         {
             if (!_streams.TryGetValue(streamIndex, out var stream) || payload == null || payload.Length == 0)
             {
@@ -95,6 +198,11 @@ namespace TVHeadEnd
             }
 
             using var output = new MemoryStream();
+            if (forceProgramTables)
+            {
+                _wroteTables = false;
+            }
+
             if (!_wroteTables || _packetsSinceTables >= RepeatTablesEveryPesPackets)
             {
                 WriteTables(output);
@@ -126,7 +234,7 @@ namespace TVHeadEnd
             var dataAligned = stream.Kind == ElementaryStreamKind.Video || IsDvbSubtitleCodec(stream.Codec);
             var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned);
             var pcr = stream.Pid == _pcrPid ? tsDts ?? tsPts : null;
-            WriteTsPackets(output, stream.Pid, true, pes, pcr);
+            WriteTsPackets(output, stream.Pid, true, pes, pcr, randomAccess);
             _packetsSinceTables++;
             return output.ToArray();
         }
@@ -244,7 +352,7 @@ namespace TVHeadEnd
                 (byte)(sectionLength & 0xFF),
                 0x00,
                 0x01,
-                0xC1,
+                (byte)(0xC1 | ((_pmtVersion & 0x1F) << 1)),
                 0x00,
                 0x00,
                 (byte)(0xE0 | ((_pcrPid >> 8) & 0x1F)),
@@ -385,10 +493,10 @@ namespace TVHeadEnd
             var data = new byte[section.Length + 1];
             data[0] = 0x00;
             Array.Copy(section, 0, data, 1, section.Length);
-            WriteTsPackets(output, pid, true, data, null);
+            WriteTsPackets(output, pid, true, data, null, false);
         }
 
-        private void WriteTsPackets(Stream output, int pid, bool payloadUnitStart, byte[] data, long? pcr)
+        private void WriteTsPackets(Stream output, int pid, bool payloadUnitStart, byte[] data, long? pcr, bool randomAccess)
         {
             var offset = 0;
             var first = true;
@@ -401,9 +509,14 @@ namespace TVHeadEnd
 
                 var remaining = data.Length - offset;
                 var writePcr = first && pcr.HasValue;
-                var minAdaptationLength = writePcr ? 7 : 0; // flags byte + 6-byte PCR
+                var writeDiscontinuity = first && _pendingDiscontinuityPids.Remove(pid);
+                var writeRandomAccess = first && randomAccess;
+                var adaptationFlags = (byte)((writeDiscontinuity ? 0x80 : 0x00)
+                    | (writeRandomAccess ? 0x40 : 0x00)
+                    | (writePcr ? 0x10 : 0x00));
+                var minAdaptationLength = adaptationFlags != 0 ? 1 + (writePcr ? 6 : 0) : 0;
                 var maxPayloadWithAdaptation = 183 - minAdaptationLength;
-                var useAdaptation = writePcr || remaining < 184;
+                var useAdaptation = adaptationFlags != 0 || remaining < 184;
                 int payloadCapacity;
 
                 if (useAdaptation)
@@ -416,7 +529,7 @@ namespace TVHeadEnd
                     if (adaptationLength > 0)
                     {
                         var adaptationOffset = 5;
-                        packet[adaptationOffset++] = writePcr ? (byte)0x10 : (byte)0x00;
+                        packet[adaptationOffset++] = adaptationFlags;
                         if (writePcr)
                         {
                             WritePcr(packet, adaptationOffset, pcr.Value);

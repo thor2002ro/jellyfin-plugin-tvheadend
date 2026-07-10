@@ -56,6 +56,21 @@
                     </select>
                     <div class="fieldDescription">HTTP ticket and HTTP basic use TVHeadend HTTP streaming. HTSP uses TVHeadend's native subscription protocol; when HTSP is selected, TVHeadend HTTP fallback is disabled and playback failures are reported as HTSP errors.</div>
                 </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="0" max="20000000" step="100000" id="txtHTSPQueueDepth" label="HTSP queue depth (bytes)" />
+                    <div class="fieldDescription">Tvheadend defaults to 500000 bytes. A conservative 2000000-byte queue reduces I/P/B frame drops without the large per-subscription memory cost of Kodi's 10000000-byte setting. Set 0 to use the Tvheadend default.</div>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="0" max="120" step="1" id="txtHTSPStallTimeoutSeconds" label="HTSP silent-stream watchdog (seconds)" />
+                    <div class="fieldDescription">Reconnect an active shared HTSP producer if no playable mux packet arrives for this many seconds. Recommended: 15. Set 0 to disable.</div>
+                </div>
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="chkHTSPFilterControlStreams" />
+                        <span>Filter CA/control/data streams upstream over HTSP</span>
+                    </label>
+                    <div class="fieldDescription checkboxFieldDescription">Optional and disabled by default. Uses subscriptionFilterStream on HTSP v12+ and disables only CA/ECM/EMM/PAT/PMT/PCR/private data indexes. Audio, video and subtitle streams remain enabled for player-side selection.</div>
+                </div>
                 <div class="checkboxContainer checkboxContainer-withDescription">
                     <label>
                         <input is="emby-checkbox" type="checkbox" id="chkForceDeinterlace" />

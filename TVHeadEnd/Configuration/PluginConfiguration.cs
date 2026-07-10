@@ -23,6 +23,9 @@ namespace TVHeadEnd.Configuration
         public bool EnableSubsMaudios { get; set; }
         public string StreamingMethod { get; set; }
         public bool ForceDeinterlace { get; set; }
+        public int HTSPQueueDepth { get; set; }
+        public int HTSPStallTimeoutSeconds { get; set; }
+        public bool HTSPFilterControlStreams { get; set; }
 
         public PluginConfiguration()
         {
@@ -41,6 +44,9 @@ namespace TVHeadEnd.Configuration
             EnableSubsMaudios = false;
             StreamingMethod = "";
             ForceDeinterlace = false;
+            HTSPQueueDepth = 2000000;
+            HTSPStallTimeoutSeconds = 15;
+            HTSPFilterControlStreams = false;
         }
     }
 }

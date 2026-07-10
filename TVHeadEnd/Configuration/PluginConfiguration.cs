@@ -47,11 +47,12 @@ namespace TVHeadEnd.Configuration
         {
             TVH_ServerName = "localhost";
             HTTP_Port = 9981;
-            HTSP_Port = 9982;
-            Username = string.Empty;
-            Password = string.Empty;
-            Priority = 5;
-            Profile = string.Empty;
+			HTSP_Port = 9982;
+            WebRoot = "/";
+            Username = "";
+            Password = "";
+            Priority = 2;
+            Profile = "";
             Pre_Padding = 0;
             Post_Padding = 0;
             ChannelType = "Ignore";

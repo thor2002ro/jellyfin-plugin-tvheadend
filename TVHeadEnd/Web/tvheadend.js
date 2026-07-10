@@ -17,6 +17,29 @@ export default function (view, params) {
         return Math.max(min, Math.min(max, value));
     }
 
+    function loadProfiles(page, selectedProfile) {
+        const select = page.querySelector('#txtProfile');
+        const status = page.querySelector('#profileStatus');
+        const setOptions = profiles => {
+            select.options.length = 0;
+            select.add(new Option('Default', ''));
+            profiles.forEach(profile => select.add(new Option(profile, profile)));
+            if (selectedProfile && !profiles.includes(selectedProfile)) select.add(new Option(`${selectedProfile} (unavailable)`, selectedProfile));
+            select.value = selectedProfile;
+        };
+
+        setOptions([]);
+        select.disabled = true;
+        return ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('TVHeadEnd/Profiles'), dataType: 'json' })
+            .then(profiles => {
+                const names = Array.isArray(profiles) ? profiles : [];
+                setOptions(names);
+                status.textContent = `${names.length + 1} recording profile${names.length ? 's' : ''} loaded from TVHeadend.`;
+            })
+            .catch(() => { status.textContent = 'Profiles could not be loaded; the saved selection is retained.'; })
+            .finally(() => { select.disabled = false; });
+    }
+
     function escapeHtml(value) {
         return String(value == null ? '' : value)
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -220,8 +243,8 @@ export default function (view, params) {
             page.querySelector('#txtWebRoot').value = config.WebRoot || '/';
             page.querySelector('#txtUserName').value = config.Username || '';
             page.querySelector('#txtPassword').value = config.Password || '';
-            page.querySelector('#txtPriority').value = Number.isFinite(config.Priority) ? config.Priority : 5;
-            page.querySelector('#txtProfile').value = config.Profile || '';
+            page.querySelector('#txtPriority').value = Number.isInteger(config.Priority) && config.Priority >= 0 && config.Priority <= 4 ? config.Priority : 2;
+            loadProfiles(page, config.Profile || '');
             page.querySelector('#txtPrePadding').value = Number.isFinite(config.Pre_Padding) ? config.Pre_Padding : 0;
             page.querySelector('#txtPostPadding').value = Number.isFinite(config.Post_Padding) ? config.Post_Padding : 0;
             page.querySelector('#selChannelType').value = config.ChannelType || 'Ignore';
@@ -265,7 +288,7 @@ export default function (view, params) {
             config.WebRoot = form.querySelector('#txtWebRoot').value.trim() || '/';
             config.Username = form.querySelector('#txtUserName').value;
             config.Password = form.querySelector('#txtPassword').value;
-            config.Priority = intValue(form.querySelector('#txtPriority'), 5, 0, 5);
+            config.Priority = intValue(form.querySelector('#txtPriority'), 2, 0, 4);
             config.Profile = form.querySelector('#txtProfile').value.trim();
             config.Pre_Padding = intValue(form.querySelector('#txtPrePadding'), 0, 0, 86400);
             config.Post_Padding = intValue(form.querySelector('#txtPostPadding'), 0, 0, 86400);
@@ -293,6 +316,7 @@ export default function (view, params) {
         }).then(result => {
             Dashboard.processPluginConfigurationUpdateResult(result);
             loadStatus(view, false);
+            loadProfiles(view, form.querySelector('#txtProfile').value.trim());
         });
         return false;
     });

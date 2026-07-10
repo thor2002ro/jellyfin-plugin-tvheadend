@@ -1,5 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -84,6 +91,49 @@ namespace TVHeadEnd
                 ActiveProducerCount = producers.Count,
                 Producers = producers
             });
+        }
+    }
+
+    [ApiController]
+    [Authorize]
+    [Route("TVHeadEnd/Profiles")]
+    public sealed class PluginProfilesController : ControllerBase
+    {
+        private readonly IHttpClientFactory _httpClientFactory;
+
+        public PluginProfilesController(IHttpClientFactory httpClientFactory)
+        {
+            _httpClientFactory = httpClientFactory;
+        }
+
+        [HttpGet]
+        public async Task<ActionResult<IReadOnlyList<string>>> GetProfiles(CancellationToken cancellationToken)
+        {
+            var configuration = Plugin.Instance.Configuration;
+            var webRoot = (configuration.WebRoot ?? string.Empty).Trim('/');
+            var path = "/" + (webRoot.Length == 0 ? string.Empty : webRoot + "/") + "api/dvr/config/grid";
+            var uri = new UriBuilder(Uri.UriSchemeHttp, configuration.TVH_ServerName.Trim(), configuration.HTTP_Port, path) { Query = "limit=999999" }.Uri;
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes(configuration.Username + ":" + configuration.Password));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
+            using var response = await _httpClientFactory.CreateClient().SendAsync(request, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (!document.RootElement.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array)
+            {
+                return Ok(Array.Empty<string>());
+            }
+
+            return Ok(entries.EnumerateArray()
+                .Where(entry => !entry.TryGetProperty("enabled", out var enabled) || enabled.ValueKind != JsonValueKind.False)
+                .Select(entry => entry.TryGetProperty("name", out var name) ? name.GetString() : null)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .ToArray());
         }
     }
 }

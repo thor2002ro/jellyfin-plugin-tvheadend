@@ -1795,7 +1795,7 @@ namespace TVHeadEnd
                 if (_ignoredMuxStreams.Add(streamIndex))
                 {
                     _logger.LogDebug(
-                        "HTSP dropping mux packets for non-playable or unsupported stream index {StreamIndex}; this mirrors Kodi pvr.hts demux behavior for unknown/private streams",
+                        "HTSP dropping mux packets for non-playable or unsupported stream index {StreamIndex}",
                         streamIndex);
                 }
 

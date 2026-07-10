@@ -1459,7 +1459,11 @@ namespace TVHeadEnd
                 _muxedStreamsByIndex.TryGetValue(i, out var streamInfo);
                 _muxPacketCounts.TryGetValue(i, out var packetCount);
                 _muxPacketBytes.TryGetValue(i, out var byteCount);
-                return DescribeMuxPacketStream(i, streamInfo) + ": packets=" + packetCount + ", bytes=" + byteCount;
+                var timestampFixes = streamInfo?.TimestampCorrectionCount ?? 0;
+                return DescribeMuxPacketStream(i, streamInfo)
+                    + ": packets=" + packetCount
+                    + ", bytes=" + byteCount
+                    + (timestampFixes > 0 ? ", timestampFixes=" + timestampFixes : string.Empty);
             }));
         }
 
@@ -1538,6 +1542,7 @@ namespace TVHeadEnd
                     Index = stream.getInt("index"),
                     Codec = stream.getString("type", "UNKNOWN"),
                     Language = stream.getString("language", string.Empty),
+                    DisplayName = GetStreamDisplayName(stream),
                     Meta = stream.containsField("meta") ? stream.getByteArray("meta") : null,
                     Width = GetInt(stream, "width", 0),
                     Height = GetInt(stream, "height", 0),
@@ -1587,6 +1592,67 @@ namespace TVHeadEnd
                     muxStreams.Count,
                     _muxer.SupportedStreamCount);
             }
+        }
+
+        private static string GetStreamDisplayName(HTSMessage stream)
+        {
+            if (stream == null)
+            {
+                return string.Empty;
+            }
+
+            // Tvheadend does not guarantee a human-readable stream label, but
+            // different versions/backends have used several aliases. Preserve
+            // the first non-empty value so Jellyfin clients can display the
+            // broadcaster/TVH track name instead of only language + codec.
+            foreach (var field in new[]
+            {
+                "name",
+                "title",
+                "displayName",
+                "displayname",
+                "streamName",
+                "stream_name",
+                "description",
+                "comment",
+                "label"
+            })
+            {
+                if (!stream.containsField(field))
+                {
+                    continue;
+                }
+
+                var value = stream.getString(field, string.Empty);
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value.Trim();
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static string GetFallbackStreamTitle(HtspTransportStreamMuxer.StreamInfo stream)
+        {
+            if (stream == null)
+            {
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(stream.DisplayName))
+            {
+                return stream.DisplayName.Trim();
+            }
+
+            // ISO-639/DVB audio_type values carried by Tvheadend.
+            return stream.AudioType switch
+            {
+                1 => "Clean effects",
+                2 => "Hearing impaired",
+                3 => "Audio description",
+                _ => null
+            };
         }
 
         private void ResetMuxPacketStats(IReadOnlyList<HtspTransportStreamMuxer.StreamInfo> streams)
@@ -1795,7 +1861,9 @@ namespace TVHeadEnd
             }
 
             var codec = string.IsNullOrWhiteSpace(stream.Codec) ? "UNKNOWN" : stream.Codec;
-            return stream.Index + ":" + codec + (string.IsNullOrWhiteSpace(stream.Language) ? string.Empty : ":" + stream.Language);
+            var language = string.IsNullOrWhiteSpace(stream.Language) ? string.Empty : ":" + stream.Language;
+            var title = string.IsNullOrWhiteSpace(stream.DisplayName) ? string.Empty : ":\"" + stream.DisplayName + "\"";
+            return stream.Index + ":" + codec + language + title;
         }
 
         private static MediaStream CreateMediaStream(HtspTransportStreamMuxer.StreamInfo stream, int ffmpegStreamIndex)
@@ -1814,6 +1882,13 @@ namespace TVHeadEnd
                 TimeBase = "1/90000",
                 IsExternal = false
             };
+
+            var streamTitle = GetFallbackStreamTitle(stream);
+            if (!string.IsNullOrWhiteSpace(streamTitle))
+            {
+                mediaStream.Title = streamTitle;
+                mediaStream.Comment = streamTitle;
+            }
 
             if (mediaStreamType == MediaStreamType.Video)
             {
@@ -1842,6 +1917,8 @@ namespace TVHeadEnd
                 {
                     mediaStream.SampleRate = sampleRate.Value;
                 }
+
+                mediaStream.IsHearingImpaired = stream.AudioType == 2;
             }
             else if (mediaStreamType == MediaStreamType.Subtitle)
             {

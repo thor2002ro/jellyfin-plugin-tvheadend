@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -87,7 +88,9 @@ namespace TVHeadEnd
             return Ok(new PluginRuntimeStatus
             {
                 GeneratedUtc = DateTime.UtcNow,
-                PluginVersion = typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
+                PluginVersion = typeof(Plugin).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                    ?? typeof(Plugin).Assembly.GetName().Version?.ToString()
+                    ?? "unknown",
                 StreamingMethod = configuration?.StreamingMethod ?? string.Empty,
                 Server = configuration == null ? string.Empty : configuration.TVH_ServerName + ":" + configuration.HTSP_Port,
                 ActiveProducerCount = producers.Count,

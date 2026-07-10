@@ -1438,12 +1438,98 @@ namespace TVHeadEnd
                     pts.HasValue ? pts.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
                     dts.HasValue ? dts.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
                     FormatFirstBytes(payload, 16));
+
+                LogAacTransport(streamIndex, streamInfo, payload);
             }
 
             if (!string.IsNullOrWhiteSpace(periodicSummary))
             {
                 _logger.LogInformation("HTSP mux packet counters: {MuxPacketSummary}", periodicSummary);
             }
+        }
+
+        private void LogAacTransport(int streamIndex, HtspTransportStreamMuxer.StreamInfo streamInfo, byte[] payload)
+        {
+            if (streamInfo == null || !IsAacCodec(streamInfo.Codec))
+            {
+                return;
+            }
+
+            var declaredCodec = NormalizeCodec(streamInfo.Codec);
+            var detectedTransport = DetectAacTransport(payload);
+            var declaredLatm = declaredCodec == "AACLATM" || declaredCodec == "LATM";
+            var transportMatchesDeclaration = declaredLatm
+                ? string.Equals(detectedTransport, "LOAS/LATM", StringComparison.Ordinal)
+                : string.Equals(detectedTransport, "ADTS", StringComparison.Ordinal);
+
+            if (transportMatchesDeclaration)
+            {
+                _logger.LogInformation(
+                    "HTSP AAC transport for stream {Stream}: declaredCodec={DeclaredCodec}, detectedTransport={DetectedTransport}, firstBytes={FirstBytes}",
+                    DescribeMuxPacketStream(streamIndex, streamInfo),
+                    streamInfo.Codec ?? "AAC",
+                    detectedTransport,
+                    FormatFirstBytes(payload, 16));
+                return;
+            }
+
+            _logger.LogWarning(
+                "HTSP AAC transport mismatch for stream {Stream}: declaredCodec={DeclaredCodec}, detectedTransport={DetectedTransport}, firstBytes={FirstBytes}. Payload is passed through unchanged; framing correction is only needed if playback fails.",
+                DescribeMuxPacketStream(streamIndex, streamInfo),
+                streamInfo.Codec ?? "AAC",
+                detectedTransport,
+                FormatFirstBytes(payload, 16));
+        }
+
+        private static bool IsAacCodec(string codec)
+        {
+            switch (NormalizeCodec(codec))
+            {
+                case "AAC":
+                case "AACADTS":
+                case "AACLC":
+                case "HEAAC":
+                case "MPEG4AUDIO":
+                case "AACLATM":
+                case "LATM":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static string DetectAacTransport(byte[] payload)
+        {
+            if (payload == null || payload.Length < 2)
+            {
+                return "empty";
+            }
+
+            // ADTS: 12-bit 0xFFF sync word and a zero layer field. The MPEG ID
+            // and protection-absent bits are allowed to vary.
+            if (payload[0] == 0xFF && (payload[1] & 0xF6) == 0xF0)
+            {
+                if (payload.Length < 7)
+                {
+                    return "ADTS-truncated";
+                }
+
+                var frameLength = ((payload[3] & 0x03) << 11)
+                    | (payload[4] << 3)
+                    | ((payload[5] & 0xE0) >> 5);
+
+                return frameLength >= 7 && frameLength <= payload.Length
+                    ? "ADTS"
+                    : "ADTS-invalid-frame-length";
+            }
+
+            // LOAS/LATM: 11-bit AudioSyncStream sync word 0x2B7.
+            if (payload[0] == 0x56 && (payload[1] & 0xE0) == 0xE0)
+            {
+                return "LOAS/LATM";
+            }
+
+            return "unframed-or-unknown";
         }
 
         private string BuildMuxPacketSummaryLocked()

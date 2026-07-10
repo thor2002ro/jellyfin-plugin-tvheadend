@@ -18,7 +18,7 @@ namespace TVHeadEnd.Configuration
                 return streamingMethod;
             }
 
-            return enableSubsMaudios ? HttpBasic : HttpTicket;
+            return enableSubsMaudios ? HttpBasic : Htsp;
         }
     }
 }

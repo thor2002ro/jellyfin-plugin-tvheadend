@@ -54,7 +54,7 @@ namespace TVHeadEnd.Configuration
             ChannelType = "Ignore";
             HideRecordingsChannel = false;
             EnableSubsMaudios = false;
-            StreamingMethod = "";
+            StreamingMethod = StreamingMethods.Htsp;
             ForceDeinterlace = false;
             HTSPQueueDepth = 2000000;
             HTSPStallTimeoutSeconds = 15;

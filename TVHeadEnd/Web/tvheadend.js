@@ -8,7 +8,7 @@ export default function (view, params) {
 
     function getStreamingMethod(config) {
         if (config.StreamingMethod) return config.StreamingMethod;
-        return config.EnableSubsMaudios ? 'HttpBasic' : 'HttpTicket';
+        return config.EnableSubsMaudios ? 'HttpBasic' : 'Htsp';
     }
 
     function intValue(element, fallback, min, max) {

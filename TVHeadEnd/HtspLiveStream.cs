@@ -3322,6 +3322,18 @@ namespace TVHeadEnd
                 signal = _signalSnapshot?.Clone();
             }
 
+            List<BlockingByteStream> consumerQueues;
+            int pendingBootstrapReaders;
+            lock (_broadcastLock)
+            {
+                consumerQueues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
+                pendingBootstrapReaders = _pendingBootstrapQueues.Count;
+            }
+
+            var consumerBufferBytes = consumerQueues.Select(i => i.BufferedBytes).ToList();
+            var totalConsumerBufferBytes = consumerBufferBytes.Sum();
+            var maxConsumerBufferBytes = consumerBufferBytes.Count > 0 ? consumerBufferBytes.Max() : 0;
+
             var lastPacketTicks = Interlocked.Read(ref _lastPlayableMuxPacketUtcTicks);
             var lastPacketAgeMs = lastPacketTicks > 0
                 ? Math.Max(0, (long)(DateTime.UtcNow - new DateTime(lastPacketTicks, DateTimeKind.Utc)).TotalMilliseconds)
@@ -3335,6 +3347,9 @@ namespace TVHeadEnd
                 + "/" + Interlocked.Read(ref _lastQueuePdrops)
                 + "/" + Interlocked.Read(ref _lastQueueBdrops)
                 + ", lastMuxPacketMs=" + lastPacketAgeMs
+                + ", outputConsumers=" + consumerQueues.Count
+                + ", outputBufferedBytes=" + totalConsumerBufferBytes + "/" + maxConsumerBufferBytes
+                + ", pendingBootstrapReaders=" + pendingBootstrapReaders
                 + ", reconnectAttempts=" + Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0)
                 + ", signalRecoveryAttempts=" + Interlocked.CompareExchange(ref _signalRecoveryAttempts, 0, 0)
                 + ", awaitingCleanVideo=" + (Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) != 0);
@@ -4049,6 +4064,17 @@ namespace TVHeadEnd
                     lock (_chunks)
                     {
                         return _completed || _disposed;
+                    }
+                }
+            }
+
+            public long BufferedBytes
+            {
+                get
+                {
+                    lock (_chunks)
+                    {
+                        return _bufferedBytes;
                     }
                 }
             }

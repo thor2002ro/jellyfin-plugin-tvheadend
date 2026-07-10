@@ -74,10 +74,11 @@ export default function (view, params) {
         return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span></div>`;
     }
 
-    function signalMetric(label, percent, raw) {
+    function signalMetric(label, percent, raw, absolute, absoluteUnit) {
         const numericPercent = percent == null ? null : Math.max(0, Math.min(100, Number(percent)));
         const meter = numericPercent == null ? '' : `<div class="tvhMeter" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${numericPercent.toFixed(1)}"><span class="tvhMeterFill" style="width:${numericPercent.toFixed(1)}%"></span></div>`;
-        return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(formatPercent(percent, raw))}</span>${meter}</div>`;
+        const value = absolute == null ? formatPercent(percent, raw) : `${Number(absolute).toFixed(1)} ${absoluteUnit}`;
+        return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span>${meter}</div>`;
     }
 
     function setRefreshState(page, busy) {
@@ -176,8 +177,8 @@ export default function (view, params) {
                 <div class="tvhStatusSummary">
                     ${metric('Adapter', producer.Adapter || '—')}
                     ${metric('Network / mux', [producer.Network, producer.Mux].filter(Boolean).join(' · ') || '—')}
-                    ${signalMetric('Signal', producer.SignalPercent, producer.SignalRaw)}
-                    ${signalMetric('SNR', producer.SnrPercent, producer.SnrRaw)}
+                    ${signalMetric('Signal', producer.SignalPercent, producer.SignalRaw, producer.SignalDbm, 'dBm')}
+                    ${signalMetric('SNR', producer.SnrPercent, producer.SnrRaw, producer.SnrDb, 'dB')}
                     ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`)}
                     ${metric('Queue drops I/P/B', `${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)}`)}
                     ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`)}

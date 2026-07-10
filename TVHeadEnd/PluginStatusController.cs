@@ -42,8 +42,10 @@ namespace TVHeadEnd
         public bool HasLock { get; set; }
         public int? SignalRaw { get; set; }
         public double? SignalPercent { get; set; }
+        public double? SignalDbm { get; set; }
         public int? SnrRaw { get; set; }
         public double? SnrPercent { get; set; }
+        public double? SnrDb { get; set; }
         public long? Ber { get; set; }
         public long? Unc { get; set; }
         public long? SignalAgeMs { get; set; }

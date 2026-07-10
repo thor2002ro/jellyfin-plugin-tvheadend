@@ -93,37 +93,27 @@ namespace TVHeadEnd.DataHelper
                         HTSMessage m = entry.Value;
                         SeriesTimerInfo sti = new SeriesTimerInfo();
 
-                        try
+                        if (m.TryGetString("id", out var id))
                         {
-                            if (m.containsField("id"))
-                            {
-                                sti.Id = m.getString("id");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Id = id;
                         }
 
-                        try
+                        if (m.TryGetInt("broadcastType", out var broadcastType))
                         {
-                            if (m.containsField("daysOfWeek"))
-                            {
-                                int daysOfWeek = m.getInt("daysOfWeek");
-                                sti.Days = getDayOfWeekListFromInt(daysOfWeek);
-                            }
+                            sti.RecordNewOnly = broadcastType == 1 || broadcastType == 3;
                         }
-                        catch (InvalidCastException)
+
+                        if (m.TryGetInt("daysOfWeek", out var daysOfWeek))
                         {
+                            sti.Days = getDayOfWeekListFromInt(daysOfWeek);
                         }
 
                         sti.StartDate = DateTime.Now.ToUniversalTime();
 
-                        try
+                        if (m.TryGetInt("retention", out var retentionInDays))
                         {
-                            if (m.containsField("retention"))
+                            try
                             {
-                                int retentionInDays = m.getInt("retention");
-
                                 if (DateTime.MaxValue.AddDays(-retentionInDays) < DateTime.Now)
                                 {
                                     _logger.LogError("[TVHclient] AutorecDataHelper.buildAutorecInfos: change during 'EndDate' calculation: set retention value from '{days}' to '365' days", retentionInDays);
@@ -134,89 +124,48 @@ namespace TVHeadEnd.DataHelper
                                     sti.EndDate = DateTime.Now.AddDays(retentionInDays).ToUniversalTime();
                                 }
                             }
-                        }
-                        catch (Exception e)
-                        {
-                            _logger.LogError(e, "[TVHclient] AutorecDataHelper.buildAutorecInfos: exception during 'EndDate' calculation. HTSMessage: {m}", m.ToString());
-                        }
-
-                        try
-                        {
-                            if (m.containsField("channel"))
+                            catch (ArgumentOutOfRangeException e)
                             {
-                                sti.ChannelId = "" + m.getInt("channel");
+                                _logger.LogError(e, "[TVHclient] AutorecDataHelper.buildAutorecInfos: exception during 'EndDate' calculation. HTSMessage: {m}", m.ToString());
                             }
                         }
-                        catch (InvalidCastException)
+
+                        if (m.TryGetLong("channel", out var channel))
                         {
+                            sti.ChannelId = channel.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
-                        try
+                        if (m.TryGetLong("startExtra", out var startExtra))
                         {
-                            if (m.containsField("startExtra"))
-                            {
-                                sti.PrePaddingSeconds = (int)m.getLong("startExtra") * 60;
-                                sti.IsPrePaddingRequired = true;
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.PrePaddingSeconds = (int)startExtra * 60;
+                            sti.IsPrePaddingRequired = true;
                         }
 
-                        try
+                        if (m.TryGetLong("stopExtra", out var stopExtra))
                         {
-                            if (m.containsField("stopExtra"))
-                            {
-                                sti.PostPaddingSeconds = (int)m.getLong("stopExtra") * 60;
-                                sti.IsPostPaddingRequired = true;
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.PostPaddingSeconds = (int)stopExtra * 60;
+                            sti.IsPostPaddingRequired = true;
                         }
 
-                        try
+                        if (m.TryGetString("title", out var title))
                         {
-                            if (m.containsField("title"))
-                            {
-                                sti.Name = m.getString("title");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Name = title;
+                            sti.SeriesId = title;
                         }
 
-                        try
+                        if (m.TryGetString("description", out var description))
                         {
-                            if (m.containsField("description"))
-                            {
-                                sti.Overview = m.getString("description");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Overview = description;
                         }
 
-                        try
+                        if (string.IsNullOrWhiteSpace(sti.Overview) && m.TryGetString("comment", out var comment))
                         {
-                            if (m.containsField("priority"))
-                            {
-                                sti.Priority = m.getInt("priority");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Overview = comment;
                         }
 
-                        try
+                        if (m.TryGetInt("priority", out var priority))
                         {
-                            if (m.containsField("title"))
-                            {
-                                sti.SeriesId = m.getString("title");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Priority = priority;
                         }
 
                         /*

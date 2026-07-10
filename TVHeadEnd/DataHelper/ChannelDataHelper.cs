@@ -13,21 +13,17 @@ namespace TVHeadEnd.DataHelper
     public class ChannelDataHelper
     {
         private readonly ILogger<ChannelDataHelper> _logger;
-        private readonly TunerDataHelper _tunerDataHelper;
-        private readonly Dictionary<int, HTSMessage> _data;
+        private readonly Dictionary<long, HTSMessage> _data;
         private readonly Dictionary<string, string> _piconData;
         private string _channelType4Other = "Ignore";
 
-        public ChannelDataHelper(ILogger<ChannelDataHelper> logger, TunerDataHelper tunerDataHelper)
+        public ChannelDataHelper(ILogger<ChannelDataHelper> logger)
         {
             _logger = logger;
-            _tunerDataHelper = tunerDataHelper;
 
-            _data = new Dictionary<int, HTSMessage>();
+            _data = new Dictionary<long, HTSMessage>();
             _piconData = new Dictionary<string, string>();
         }
-
-        public ChannelDataHelper(ILogger<ChannelDataHelper> logger) : this(logger, null) {}
 
         public void SetChannelType4Other(string channelType4Other)
         {
@@ -39,26 +35,17 @@ namespace TVHeadEnd.DataHelper
             lock (_data)
             {
                 _data.Clear();
-                if (_tunerDataHelper != null)
-                {
-                    _tunerDataHelper.clean();
-                }
+                _piconData.Clear();
             }
         }
 
         public void Add(HTSMessage message)
         {
-            if (_tunerDataHelper != null)
-            {
-                // TVHeadend don't send the information we need
-                // _tunerDataHelper.addTunerInfo(message);
-            }
-
             lock (_data)
             {
                 try
                 {
-                    int channelID = message.getInt("channelId");
+                    long channelID = message.getLong("channelId");
                     if (_data.ContainsKey(channelID))
                     {
                         HTSMessage storedMessage = _data[channelID];
@@ -103,6 +90,38 @@ namespace TVHeadEnd.DataHelper
             return result;
         }
 
+        public long ResolveChannelId(string channelId)
+        {
+            if (uint.TryParse(channelId, out var numericId))
+            {
+                return numericId;
+            }
+
+            lock (_data)
+            {
+                foreach (var entry in _data)
+                {
+                    if (entry.Value.containsField("channelIdStr")
+                        && string.Equals(entry.Value.getString("channelIdStr"), channelId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return entry.Key;
+                    }
+                }
+            }
+
+            throw new ArgumentException("Unknown TVHeadend channel identifier.", nameof(channelId));
+        }
+
+        public string GetExternalChannelId(long channelId)
+        {
+            lock (_data)
+            {
+                return _data.TryGetValue(channelId, out var message) && message.containsField("channelIdStr")
+                    ? message.getString("channelIdStr")
+                    : channelId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+
         public Task<IEnumerable<ChannelInfo>> BuildChannelInfos(CancellationToken cancellationToken)
         {
             return Task.Factory.StartNew<IEnumerable<ChannelInfo>>(() =>
@@ -110,7 +129,7 @@ namespace TVHeadEnd.DataHelper
                 lock (_data)
                 {
                     List<ChannelInfo> result = new List<ChannelInfo>();
-                    foreach (KeyValuePair<int, HTSMessage> entry in _data)
+                    foreach (KeyValuePair<long, HTSMessage> entry in _data)
                     {
                         if (cancellationToken.IsCancellationRequested)
                         {
@@ -123,7 +142,7 @@ namespace TVHeadEnd.DataHelper
                         try
                         {
                             ChannelInfo ci = new ChannelInfo();
-                            ci.Id = "" + entry.Key;
+                            ci.Id = m.containsField("channelIdStr") ? m.getString("channelIdStr") : "" + entry.Key;
 
                             ci.ImagePath = "";
 
@@ -173,6 +192,10 @@ namespace TVHeadEnd.DataHelper
                                 if (tunerInfoList != null && tunerInfoList.Count > 0)
                                 {
                                     HTSMessage firstServiceInList = (HTSMessage)tunerInfoList[0];
+                                    if (firstServiceInList.containsField("providername"))
+                                    {
+                                        ci.ChannelGroup = firstServiceInList.getString("providername");
+                                    }
                                     if (firstServiceInList.containsField("type"))
                                     {
                                         string type = firstServiceInList.getString("type").ToLower();

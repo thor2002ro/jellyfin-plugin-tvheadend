@@ -7,8 +7,7 @@ export default function (view, params) {
     let statusRequestInFlight = null;
 
     function getStreamingMethod(config) {
-        if (config.StreamingMethod) return config.StreamingMethod;
-        return config.EnableSubsMaudios ? 'HttpBasic' : 'Htsp';
+        return config.StreamingMethod || 'Htsp';
     }
 
     function intValue(element, fallback, min, max) {
@@ -23,18 +22,22 @@ export default function (view, params) {
         const setOptions = profiles => {
             select.options.length = 0;
             select.add(new Option('Default', ''));
-            profiles.forEach(profile => select.add(new Option(profile, profile)));
-            if (selectedProfile && !profiles.includes(selectedProfile)) select.add(new Option(`${selectedProfile} (unavailable)`, selectedProfile));
-            select.value = selectedProfile;
+            profiles.forEach(profile => select.add(new Option(profile.Name, profile.Id || profile.Name)));
+            const selected = profiles.find(profile => profile.Id === selectedProfile || profile.Name === selectedProfile);
+            if (selected) select.value = selected.Id || selected.Name;
+            else if (selectedProfile) {
+                select.add(new Option(`${selectedProfile} (unavailable)`, selectedProfile));
+                select.value = selectedProfile;
+            }
         };
 
         setOptions([]);
         select.disabled = true;
         return ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('TVHeadEnd/Profiles'), dataType: 'json' })
             .then(profiles => {
-                const names = Array.isArray(profiles) ? profiles : [];
-                setOptions(names);
-                status.textContent = `${names.length + 1} recording profile${names.length ? 's' : ''} loaded from TVHeadend.`;
+                const items = Array.isArray(profiles) ? profiles : [];
+                setOptions(items);
+                status.textContent = `${items.length + 1} recording profile${items.length ? 's' : ''} loaded from TVHeadend.`;
             })
             .catch(() => { status.textContent = 'Profiles could not be loaded; the saved selection is retained.'; })
             .finally(() => { select.disabled = false; });
@@ -296,7 +299,6 @@ export default function (view, params) {
             config.ChannelType = form.querySelector('#selChannelType').value;
             config.HideRecordingsChannel = form.querySelector('#chkHideRecordingsChannel').checked;
             config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
-            config.EnableSubsMaudios = config.StreamingMethod === 'HttpBasic';
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
             config.HTSPQueueDepth = intValue(form.querySelector('#txtHTSPQueueDepth'), 2000000, 0, 20000000);
             config.HTSPStallTimeoutSeconds = intValue(form.querySelector('#txtHTSPStallTimeoutSeconds'), 15, 0, 120);

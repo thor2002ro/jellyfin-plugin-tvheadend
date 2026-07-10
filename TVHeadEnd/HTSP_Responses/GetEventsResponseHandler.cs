@@ -90,17 +90,17 @@ namespace TVHeadEnd.HTSP_Responses
 
                     if (currEventMessage.containsField("channelId"))
                     {
-                        pi.ChannelId = "" + currEventMessage.getInt("channelId");
+                        pi.ChannelId = "" + currEventMessage.getLong("channelId");
                     }
 
                     if (currEventMessage.containsField("eventId"))
                     {
-                        pi.Id = "" + currEventMessage.getInt("eventId");
+                        pi.Id = "" + currEventMessage.getLong("eventId");
                     }
 
                     if (currEventMessage.containsField("serieslinkId"))
                     {
-                        pi.SeriesId = "" + currEventMessage.getInt("serieslinkId");
+                        pi.SeriesId = "" + currEventMessage.getLong("serieslinkId");
                     }
 
                     if (currEventMessage.containsField("episodeNumber"))
@@ -131,6 +131,11 @@ namespace TVHeadEnd.HTSP_Responses
                         pi.Overview = currEventMessage.getString("description");
                     }
 
+                    if (currEventMessage.containsField("summary"))
+                    {
+                        pi.ShortOverview = currEventMessage.getString("summary");
+                    }
+
                     if (currEventMessage.containsField("subtitle"))
                     {
                         pi.EpisodeTitle = currEventMessage.getString("subtitle");
@@ -143,9 +148,28 @@ namespace TVHeadEnd.HTSP_Responses
                         pi.OriginalAirDate = _initialDateTimeUTC.AddSeconds(firstAiredUtcLong).ToUniversalTime();
                     }
 
+                    if (currEventMessage.containsField("ratingLabel"))
+                    {
+                        pi.OfficialRating = currEventMessage.getString("ratingLabel");
+                    }
+                    else if (currEventMessage.containsField("ageRating") && currEventMessage.getInt("ageRating") > 0)
+                    {
+                        pi.OfficialRating = currEventMessage.getInt("ageRating") + "+";
+                    }
+
                     if (currEventMessage.containsField("starRating"))
                     {
-                        pi.OfficialRating = "" + currEventMessage.getInt("starRating");
+                        pi.CommunityRating = Math.Clamp(currEventMessage.getInt("starRating") * 2.0f, 0, 10);
+                    }
+
+                    if (currEventMessage.containsField("isNew") && currEventMessage.getInt("isNew") != 0)
+                    {
+                        pi.IsPremiere = true;
+                    }
+
+                    if (currEventMessage.containsField("copyrightYear"))
+                    {
+                        pi.ProductionYear = currEventMessage.getInt("copyrightYear");
                     }
 
                     if (currEventMessage.containsField("image"))

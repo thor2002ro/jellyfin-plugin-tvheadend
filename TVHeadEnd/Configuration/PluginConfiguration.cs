@@ -20,7 +20,6 @@ namespace TVHeadEnd.Configuration
         public int Post_Padding { get; set; }
         public string ChannelType { get; set; }
         public bool HideRecordingsChannel { get; set; }
-        public bool EnableSubsMaudios { get; set; }
         public string StreamingMethod { get; set; }
         public bool ForceDeinterlace { get; set; }
         public int HTSPQueueDepth { get; set; }
@@ -53,7 +52,6 @@ namespace TVHeadEnd.Configuration
             Post_Padding = 0;
             ChannelType = "Ignore";
             HideRecordingsChannel = false;
-            EnableSubsMaudios = false;
             StreamingMethod = StreamingMethods.Htsp;
             ForceDeinterlace = false;
             HTSPQueueDepth = 2000000;

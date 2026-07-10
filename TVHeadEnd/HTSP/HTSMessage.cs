@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using TVHeadEnd.Helper;
 
 namespace TVHeadEnd.HTSP
 {
@@ -108,6 +107,21 @@ namespace TVHeadEnd.HTSP
             return getLong(name);
         }
 
+        public bool TryGetLong(string name, out long value)
+        {
+            value = default;
+            if (!_dict.TryGetValue(name, out var field)
+                || field is not System.Numerics.BigInteger number
+                || number < long.MinValue
+                || number > long.MaxValue)
+            {
+                return false;
+            }
+
+            value = (long)number;
+            return true;
+        }
+
         public int getInt(string name)
         {
             return (int)getBigInteger(name);
@@ -120,6 +134,21 @@ namespace TVHeadEnd.HTSP
                 return std;
             }
             return getInt(name);
+        }
+
+        public bool TryGetInt(string name, out int value)
+        {
+            value = default;
+            if (!_dict.TryGetValue(name, out var field)
+                || field is not System.Numerics.BigInteger number
+                || number < int.MinValue
+                || number > int.MaxValue)
+            {
+                return false;
+            }
+
+            value = (int)number;
+            return true;
         }
 
         public bool getBool(string name)
@@ -194,6 +223,18 @@ namespace TVHeadEnd.HTSP
                 return null;
             }
             return obj.ToString();
+        }
+
+        public bool TryGetString(string name, out string value)
+        {
+            value = null;
+            if (!_dict.TryGetValue(name, out var field) || field == null)
+            {
+                return false;
+            }
+
+            value = field.ToString();
+            return true;
         }
 
         public IList<long?> getLongList(string name)
@@ -544,14 +585,20 @@ namespace TVHeadEnd.HTSP
             HTSMessage msg = new HTSMessage();
             int cnt = 0;
 
-            ByteBuffer buf = new ByteBuffer(messageData);
-            while (buf.hasRemaining())
+            ReadOnlySpan<byte> buffer = messageData;
+            int offset = 0;
+            while (offset < buffer.Length)
             {
-                type = buf.get();
-                namelen = buf.get();
-                datalen = uIntToLong(buf.get(), buf.get(), buf.get(), buf.get());
+                if (buffer.Length - offset < 6)
+                {
+                    throw new IOException("[TVHclient] HTSMessage.deserializeBinary: incomplete field header");
+                }
 
-                if (buf.Length() < namelen + datalen)
+                type = buffer[offset++];
+                namelen = buffer[offset++];
+                datalen = uIntToLong(buffer[offset++], buffer[offset++], buffer[offset++], buffer[offset++]);
+
+                if (datalen > int.MaxValue || namelen + datalen > buffer.Length - offset)
                 {
                     throw new IOException("[TVHclient] HTSMessage.deserializeBinary: buffer limit exceeded");
                 }
@@ -564,15 +611,14 @@ namespace TVHeadEnd.HTSP
                 }
                 else
                 {
-                    byte[] bName = new byte[namelen];
-                    buf.get(bName);
-                    name = NewString(bName);
+                    name = Encoding.UTF8.GetString(buffer.Slice(offset, namelen));
+                    offset += namelen;
                 }
 
                 //Get the actual content
                 object obj = null;
-                byte[] bData = new byte[datalen];
-                buf.get(bData);
+                byte[] bData = buffer.Slice(offset, (int)datalen).ToArray();
+                offset += (int)datalen;
 
                 bool decoded = true;
                 switch (type)

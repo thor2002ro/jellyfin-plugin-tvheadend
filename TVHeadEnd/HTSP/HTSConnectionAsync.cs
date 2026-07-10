@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Helper;
@@ -325,7 +327,11 @@ namespace TVHeadEnd.HTSP
                     _logger.LogInformation("[TVHclient] HTSConnectionAsync.authenticate: hello didn't include required field 'challenge' - htsp incorrectly implemented by tvheadend");
                 }
 
-                byte[] digest = SHA1helper.GenerateSaltedSHA1(password, salt);
+                byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
+                byte[] authenticationData = new byte[passwordBytes.Length + salt.Length];
+                passwordBytes.CopyTo(authenticationData, 0);
+                salt.CopyTo(authenticationData, passwordBytes.Length);
+                byte[] digest = SHA1.HashData(authenticationData);
                 HTSMessage authMessage = new HTSMessage();
                 authMessage.Method = "authenticate";
                 authMessage.putField("username", username);

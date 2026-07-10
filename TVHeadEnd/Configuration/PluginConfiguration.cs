@@ -9,7 +9,10 @@ namespace TVHeadEnd.Configuration
     public class PluginConfiguration : BasePluginConfiguration
     {
         public string TVH_ServerName { get; set; }
+		public string TVH_TimeZoneId { get; set; }
+		public string RecordingStreamSecret { get; set; }
 		public int HTTP_Port { get; set; }
+		public bool UseHttps { get; set; }
 		public int HTSP_Port { get; set; }
         public string WebRoot { get; set; }
         public string Username { get; set; }
@@ -41,7 +44,10 @@ namespace TVHeadEnd.Configuration
         public PluginConfiguration()
         {
             TVH_ServerName = "localhost";
+            TVH_TimeZoneId = "";
+            RecordingStreamSecret = "";
             HTTP_Port = 9981;
+			UseHttps = false;
 			HTSP_Port = 9982;
             WebRoot = "/";
             Username = "";

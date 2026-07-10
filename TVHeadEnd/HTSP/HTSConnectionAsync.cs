@@ -13,7 +13,7 @@ using TVHeadEnd.HTSP_Responses;
 
 namespace TVHeadEnd.HTSP
 {
-    public class HTSConnectionAsync
+    public sealed class HTSConnectionAsync : IDisposable
     {
         private const long BytesPerGiga = 1024 * 1024 * 1024;
         private const int SocketIoTimeoutMilliseconds = 1000;
@@ -21,12 +21,15 @@ namespace TVHeadEnd.HTSP
         private const int MaxHtsMessageLength = 64 * 1024 * 1024;
 
         private static readonly TimeSpan QueuePollInterval = TimeSpan.FromMilliseconds(250);
+        private static readonly TimeSpan ConnectAttemptTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan DefaultResponseTimeout = TimeSpan.FromSeconds(10);
         private static readonly HTSResponseHandler NoOpResponseHandler = new NoOpHTSResponseHandler();
 
         private volatile Boolean _needsRestart = false;
         private volatile Boolean _connected;
         private volatile Boolean _expectedClose;
-        private int _seq = 0;
+        private int _disposed;
+        private static int _seq;
 
         private readonly object _lock;
         private readonly HTSConnectionListener _listener;
@@ -41,6 +44,7 @@ namespace TVHeadEnd.HTSP
         private string _serverversion;
         private string _serverWebRoot;
         private string _diskSpace;
+        private int _serverUtcOffsetMinutes;
         private readonly HashSet<string> _serverCapabilities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private readonly ByteList _buffer;
@@ -118,6 +122,21 @@ namespace TVHeadEnd.HTSP
             _needsRestart = true;
         }
 
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            stop();
+            _receiveHandlerThreadTokenSource.Dispose();
+            _messageBuilderThreadTokenSource.Dispose();
+            _sendingHandlerThreadTokenSource.Dispose();
+            _messageDistributorThreadTokenSource.Dispose();
+            GC.SuppressFinalize(this);
+        }
+
         public Boolean needsRestart()
         {
             return _needsRestart;
@@ -130,7 +149,7 @@ namespace TVHeadEnd.HTSP
 
         public void open(String hostname, int port)
         {
-            open(hostname, port, CancellationToken.None, 0);
+            open(hostname, port, CancellationToken.None, 3);
         }
 
         public void open(String hostname, int port, CancellationToken cancellationToken, int maxAttempts)
@@ -162,13 +181,15 @@ namespace TVHeadEnd.HTSP
                     try
                     {
                         // Establish the remote endpoint for the socket.
+                        using var attemptCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        attemptCancellation.CancelAfter(ConnectAttemptTimeout);
 
                         IPAddress ipAddress;
                         if (!IPAddress.TryParse(hostname, out ipAddress))
                         {
                             // no IP --> ask DNS
-                            IPHostEntry ipHostInfo = Dns.GetHostEntry(hostname);
-                            ipAddress = ipHostInfo.AddressList[0];
+                            IPAddress[] addresses = Dns.GetHostAddressesAsync(hostname, attemptCancellation.Token).GetAwaiter().GetResult();
+                            ipAddress = addresses[0];
                         }
 
                         IPEndPoint remoteEP = new IPEndPoint(ipAddress, port);
@@ -182,7 +203,7 @@ namespace TVHeadEnd.HTSP
                         _socket.SendTimeout = SocketIoTimeoutMilliseconds;
 
                         // connect to server
-                        _socket.Connect(remoteEP);
+                        _socket.ConnectAsync(remoteEP, attemptCancellation.Token).AsTask().GetAwaiter().GetResult();
 
                         _connected = true;
                         _logger.LogDebug("[TVHclient] HTSConnectionAsync.open: socket connected");
@@ -229,12 +250,12 @@ namespace TVHeadEnd.HTSP
 
         public Boolean authenticate(String username, String password)
         {
-            return authenticate(username, password, true);
+            return authenticate(username, password, true, CancellationToken.None, DefaultResponseTimeout);
         }
 
         public Boolean authenticate(String username, String password, bool enableAsyncMetadata)
         {
-            return authenticate(username, password, enableAsyncMetadata, CancellationToken.None, TimeSpan.Zero);
+            return authenticate(username, password, enableAsyncMetadata, CancellationToken.None, DefaultResponseTimeout);
         }
 
         public Boolean authenticate(String username, String password, bool enableAsyncMetadata, CancellationToken cancellationToken, TimeSpan responseTimeout)
@@ -248,9 +269,7 @@ namespace TVHeadEnd.HTSP
             helloMessage.putField("htspversion", HTSMessage.HTSP_VERSION);
             helloMessage.putField("username", username);
 
-            LoopBackResponseHandler loopBackResponseHandler = new LoopBackResponseHandler();
-            sendMessage(helloMessage, loopBackResponseHandler);
-            HTSMessage helloResponse = GetResponse(loopBackResponseHandler, cancellationToken, responseTimeout);
+            HTSMessage helloResponse = SendAndGetResponse(helloMessage, cancellationToken, responseTimeout);
             if (helloResponse != null)
             {
                 if (helloResponse.containsField("htspversion"))
@@ -336,8 +355,7 @@ namespace TVHeadEnd.HTSP
                 authMessage.Method = "authenticate";
                 authMessage.putField("username", username);
                 authMessage.putField("digest", digest);
-                sendMessage(authMessage, loopBackResponseHandler);
-                HTSMessage authResponse = GetResponse(loopBackResponseHandler, cancellationToken, responseTimeout);
+                HTSMessage authResponse = SendAndGetResponse(authMessage, cancellationToken, responseTimeout);
                 if (authResponse != null)
                 {
                     Boolean auth = authResponse.getInt("noaccess", 0) != 1;
@@ -345,8 +363,7 @@ namespace TVHeadEnd.HTSP
                     {
                         HTSMessage getDiskSpaceMessage = new HTSMessage();
                         getDiskSpaceMessage.Method = "getDiskSpace";
-                        sendMessage(getDiskSpaceMessage, loopBackResponseHandler);
-                        HTSMessage diskSpaceResponse = GetResponse(loopBackResponseHandler, cancellationToken, responseTimeout);
+                        HTSMessage diskSpaceResponse = SendAndGetResponse(getDiskSpaceMessage, cancellationToken, responseTimeout);
                         if (diskSpaceResponse != null)
                         {
                             long freeDiskSpace = -1;
@@ -371,6 +388,10 @@ namespace TVHeadEnd.HTSP
                             _diskSpace = freeDiskSpace  + "GB / "  + totalDiskSpace + "GB";
                         }
 
+                        var getSysTimeMessage = new HTSMessage { Method = "getSysTime" };
+                        HTSMessage sysTimeResponse = SendAndGetResponse(getSysTimeMessage, cancellationToken, responseTimeout);
+                        _serverUtcOffsetMinutes = sysTimeResponse?.getInt("gmtoffset", 0) ?? 0;
+
                         if (enableAsyncMetadata)
                         {
                             HTSMessage enableAsyncMetadataMessage = new HTSMessage();
@@ -387,11 +408,23 @@ namespace TVHeadEnd.HTSP
             return false;
         }
 
-        private static HTSMessage GetResponse(LoopBackResponseHandler responseHandler, CancellationToken cancellationToken, TimeSpan responseTimeout)
+        private HTSMessage SendAndGetResponse(HTSMessage message, CancellationToken cancellationToken, TimeSpan responseTimeout)
         {
-            return responseTimeout <= TimeSpan.Zero
-                ? responseHandler.getResponse()
-                : responseHandler.getResponse(cancellationToken, responseTimeout);
+            var responseHandler = new LoopBackResponseHandler();
+            int sequence = sendMessage(message, responseHandler);
+            try
+            {
+                var timeout = responseTimeout <= TimeSpan.Zero ? DefaultResponseTimeout : responseTimeout;
+                return responseHandler.GetResponseAsync(cancellationToken, timeout).GetAwaiter().GetResult();
+            }
+            catch (TimeoutException)
+            {
+                return null;
+            }
+            finally
+            {
+                RemoveResponseHandler(sequence);
+            }
         }
 
         public int getServerProtocolVersion()
@@ -419,6 +452,11 @@ namespace TVHeadEnd.HTSP
             return _serverWebRoot ?? string.Empty;
         }
 
+        public int getServerUtcOffsetMinutes()
+        {
+            return _serverUtcOffsetMinutes;
+        }
+
         public string getServername()
         {
             return _servername;
@@ -434,7 +472,7 @@ namespace TVHeadEnd.HTSP
             return _diskSpace;
         }
 
-        public void sendMessage(HTSMessage message, HTSResponseHandler responseHandler)
+        public int sendMessage(HTSMessage message, HTSResponseHandler responseHandler)
         {
             if (message == null)
             {
@@ -449,6 +487,12 @@ namespace TVHeadEnd.HTSP
             message.putField("seq", seq);
             _responseHandlers[seq] = handler;
             _messagesForSendQueue.Enqueue(message);
+            return seq;
+        }
+
+        public void RemoveResponseHandler(int sequence)
+        {
+            _responseHandlers.TryRemove(sequence, out _);
         }
 
         private void SendingHandler()

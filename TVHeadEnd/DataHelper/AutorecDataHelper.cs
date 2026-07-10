@@ -48,10 +48,9 @@ namespace TVHeadEnd.DataHelper
             string id = message.getString("id");
             lock (_data)
             {
-                HTSMessage oldMessage = _data[id];
-                if (oldMessage == null)
+                if (!_data.TryGetValue(id, out HTSMessage oldMessage) || oldMessage == null)
                 {
-                    _logger.LogDebug("[TVHclient] AutorecDataHelper.autorecEntryAdd: id not in database - skipping");
+                    _logger.LogDebug("[TVHclient] AutorecDataHelper.autorecEntryUpdate: id not in database - skipping");
                     return;
                 }
                 foreach (KeyValuePair<string, object> entry in message)
@@ -74,7 +73,15 @@ namespace TVHeadEnd.DataHelper
             }
         }
 
-        public Task<IEnumerable<SeriesTimerInfo>> buildAutorecInfos(CancellationToken cancellationToken)
+        public string GetTitle(string id)
+        {
+            lock (_data)
+            {
+                return _data.TryGetValue(id, out HTSMessage message) ? message.getString("title", null) : null;
+            }
+        }
+
+        public Task<IEnumerable<SeriesTimerInfo>> buildAutorecInfos(CancellationToken cancellationToken, int serverUtcOffsetMinutes = 0)
         {
             return Task.Factory.StartNew<IEnumerable<SeriesTimerInfo>>(() =>
             {
@@ -100,7 +107,7 @@ namespace TVHeadEnd.DataHelper
 
                         if (m.TryGetInt("broadcastType", out var broadcastType))
                         {
-                            sti.RecordNewOnly = broadcastType == 1 || broadcastType == 3;
+                            sti.RecordNewOnly = broadcastType is 1 or 3;
                         }
 
                         if (m.TryGetInt("daysOfWeek", out var daysOfWeek))
@@ -108,31 +115,33 @@ namespace TVHeadEnd.DataHelper
                             sti.Days = getDayOfWeekListFromInt(daysOfWeek);
                         }
 
-                        sti.StartDate = DateTime.Now.ToUniversalTime();
-
-                        if (m.TryGetInt("retention", out var retentionInDays))
+                        int start = m.getInt("start", -1);
+                        int startWindow = m.getInt("startWindow", -1);
+                        sti.RecordAnyTime = start < 0 || startWindow < 0;
+                        if (!sti.RecordAnyTime)
                         {
-                            try
+                            DateTime serverMidnight = DateTime.UtcNow.AddMinutes(serverUtcOffsetMinutes).Date;
+                            sti.StartDate = DateTime.SpecifyKind(serverMidnight.AddMinutes(start - serverUtcOffsetMinutes), DateTimeKind.Utc);
+                            sti.EndDate = DateTime.SpecifyKind(serverMidnight.AddMinutes(startWindow - serverUtcOffsetMinutes), DateTimeKind.Utc);
+                            if (sti.EndDate < sti.StartDate)
                             {
-                                if (DateTime.MaxValue.AddDays(-retentionInDays) < DateTime.Now)
-                                {
-                                    _logger.LogError("[TVHclient] AutorecDataHelper.buildAutorecInfos: change during 'EndDate' calculation: set retention value from '{days}' to '365' days", retentionInDays);
-                                    sti.EndDate = DateTime.Now.AddDays(365).ToUniversalTime();
-                                }
-                                else
-                                {
-                                    sti.EndDate = DateTime.Now.AddDays(retentionInDays).ToUniversalTime();
-                                }
+                                sti.EndDate = sti.EndDate.AddDays(1);
                             }
-                            catch (ArgumentOutOfRangeException e)
-                            {
-                                _logger.LogError(e, "[TVHclient] AutorecDataHelper.buildAutorecInfos: exception during 'EndDate' calculation. HTSMessage: {m}", m.ToString());
-                            }
+                        }
+                        else
+                        {
+                            sti.StartDate = DateTime.UtcNow;
+                            sti.EndDate = sti.StartDate;
                         }
 
                         if (m.TryGetLong("channel", out var channel))
                         {
                             sti.ChannelId = channel.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            sti.RecordAnyChannel = false;
+                        }
+                        else
+                        {
+                            sti.RecordAnyChannel = true;
                         }
 
                         if (m.TryGetLong("startExtra", out var startExtra))
@@ -147,11 +156,8 @@ namespace TVHeadEnd.DataHelper
                             sti.IsPostPaddingRequired = true;
                         }
 
-                        if (m.TryGetString("title", out var title))
-                        {
-                            sti.Name = title;
-                            sti.SeriesId = title;
-                        }
+                        m.TryGetString("title", out var title);
+                        sti.Name = m.getString("name", title);
 
                         if (m.TryGetString("description", out var description))
                         {
@@ -250,13 +256,10 @@ namespace TVHeadEnd.DataHelper
             return result;
         }
 
-        public static int getMinutesFromMidnight(DateTime time)
+        public static int getMinutesFromMidnight(DateTime time, int serverUtcOffsetMinutes = 0)
         {
-            DateTime utcTime = time.ToUniversalTime();
-            int hours = utcTime.Hour;
-            int minute = utcTime.Minute;
-            int minutes = (hours * 60) + minute;
-            return minutes;
+            DateTime serverTime = time.ToUniversalTime().AddMinutes(serverUtcOffsetMinutes);
+            return (serverTime.Hour * 60) + serverTime.Minute;
         }
     }
 }

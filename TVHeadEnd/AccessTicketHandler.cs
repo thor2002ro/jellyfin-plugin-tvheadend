@@ -30,11 +30,11 @@ public class AccessTicketHandler
         public string Id { get; init; }
         public string Path { get; init; }
         public string TicketParam { get; init; }
-        public string Url => $"{Path}?ticket={TicketParam}";
+        public string Url => $"{Path}{(Path.Contains('?', StringComparison.Ordinal) ? '&' : '?')}ticket={Uri.EscapeDataString(TicketParam)}";
         public DateTime Expires { get; init; }
     }
 
-    private readonly ConcurrentDictionary<string, Task<Ticket>> _ticketCache = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<Ticket>>> _ticketCache = new();
 
     internal AccessTicketHandler(
         ILoggerFactory loggerFactory, HTSConnectionHandler htsConnectionHandler,
@@ -57,52 +57,64 @@ public class AccessTicketHandler
 
     public async Task<Ticket> GetTicket(string itemId, CancellationToken cancellationToken)
     {
-        var now = DateTime.UtcNow;
-        Ticket ticket = null;
-
-        while (_ticketCache.TryGetValue(itemId, out var ticketTask))
+        Ticket currentTicket = null;
+        while (true)
         {
-            ticket = await ticketTask;
-            if (ticket.Expires > now)
+            var entry = _ticketCache.GetOrAdd(itemId, _ => new Lazy<Task<Ticket>>(
+                () => GetTicketRecord(itemId, currentTicket),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+
+            Ticket ticket;
+            try
+            {
+                ticket = await entry.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                _ticketCache.TryRemove(new KeyValuePair<string, Lazy<Task<Ticket>>>(itemId, entry));
+                throw;
+            }
+
+            if (ticket.Expires > DateTime.UtcNow)
             {
                 return ticket; // non-expired ticket from cache
             }
 
             _logger.LogDebug("[TVHclient] AccessTicketHandler.GetAccessTicket: Cache expired for {ItemType}={ItemId}. Revalidating ticket (#{TicketId})", _ticketItemType, itemId, ticket.Id);
-            _ticketCache.TryRemove(new KeyValuePair<string, Task<Ticket>>(itemId, ticketTask));
+            currentTicket = ticket;
+            _ticketCache.TryRemove(new KeyValuePair<string, Lazy<Task<Ticket>>>(itemId, entry));
+        }
+    }
+
+    private async Task<Ticket> GetTicketRecord(string itemId, Ticket currentRecord)
+    {
+        var response = await RequestTicket(itemId).ConfigureAwait(false);
+        var path = response.getString("path");
+        var ticket = response.getString("ticket");
+
+        var id = (currentRecord != null && path == currentRecord.Path && ticket == currentRecord.TicketParam)
+            ? currentRecord.Id
+            : $"{NextTicketId()}";
+
+        if (id != currentRecord?.Id)
+        {
+            _logger.LogInformation("[TVHclient] AccessTicketHandler.GetAccessTicket: New ticket (#{TicketId}) created for {ItemType}={ItemId}", id, _ticketItemType, itemId);
         }
 
-        return await _ticketCache.GetOrAdd(itemId, _ => GetTicketRecord(itemId, cancellationToken, ticket, now));
-    }
-
-    private Task<Ticket> GetTicketRecord(string itemId, CancellationToken cancellation, Ticket currentRecord, DateTime now)
-    {
-        return RequestTicket(itemId, cancellation).ContinueWith(ticketTask =>
+        return new Ticket
         {
-            var response = ticketTask.Result;
-            var path = response.getString("path");
-            var ticket = response.getString("ticket");
-
-            var id = (currentRecord != null && path == currentRecord.Path && ticket == currentRecord.TicketParam)
-                ? currentRecord.Id
-                : $"{NextTicketId()}";
-
-            if (id != currentRecord?.Id)
-            {
-                _logger.LogInformation("[TVHclient] AccessTicketHandler.GetAccessTicket: New ticket (#{TicketId}) created for {ItemType}={ItemId}", id, _ticketItemType, itemId);
-            }
-
-            return new Ticket()
-            {
-                Id = id,
-                Path = path,
-                TicketParam = ticket,
-                Expires = now + _ticketLifeSpan,
-            };
-        }, cancellation);
+            Id = id,
+            Path = path,
+            TicketParam = ticket,
+            Expires = DateTime.UtcNow + _ticketLifeSpan,
+        };
     }
 
-    private async Task<HTSMessage> RequestTicket(string itemId, CancellationToken cancellation)
+    private async Task<HTSMessage> RequestTicket(string itemId)
     {
         var request = new HTSMessage { Method = "getTicket" };
         var numericId = _ticketType == TicketType.Channel
@@ -110,18 +122,20 @@ public class AccessTicketHandler
             : _htsConnectionHandler.ResolveDvrId(itemId);
         request.putField(_ticketItemType, numericId);
 
-        for (int attempt = 1, lastAttempt = 1 + _requestRetries;
-             attempt <= lastAttempt && !cancellation.IsCancellationRequested;
-             attempt++)
+        for (int attempt = 1, lastAttempt = 1 + _requestRetries; attempt <= lastAttempt; attempt++)
         {
             try
             {
-                return await Task.Run(() =>
+                var response = new LoopBackResponseHandler();
+                int sequence = _htsConnectionHandler.SendMessage(request, response);
+                try
                 {
-                    var response = new LoopBackResponseHandler();
-                    _htsConnectionHandler.SendMessage(request, response);
-                    return response.getResponse();
-                }, cancellation).WaitAsync(_requestTimeout * attempt, cancellation);
+                    return await response.GetResponseAsync(CancellationToken.None, _requestTimeout * attempt).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _htsConnectionHandler.RemoveResponseHandler(sequence);
+                }
             }
             catch (TimeoutException)
             {

@@ -1,18 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.LiveTv;
 using Microsoft.Extensions.Logging;
-using Microsoft.Net.Http.Headers;
 using TVHeadEnd.Configuration;
 using TVHeadEnd.DataHelper;
 using TVHeadEnd.HTSP;
@@ -20,18 +14,16 @@ using TVHeadEnd.HTSP;
 
 namespace TVHeadEnd
 {
-    public class HTSConnectionHandler : HTSConnectionListener
+    public sealed class HTSConnectionHandler : HTSConnectionListener, IDisposable
     {
-        private static volatile HTSConnectionHandler _instance;
-        private static object _syncRoot = new Object();
-
         private readonly object _lock = new Object();
+        private static readonly TimeSpan InitialLoadTimeout = TimeSpan.FromMinutes(15);
+        private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromSeconds(10);
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<HTSConnectionHandler> _logger;
-        private readonly IHttpClientFactory _httpClientFactory;
 
-        private volatile Boolean _initialLoadFinished = false;
+        private TaskCompletionSource<bool> _initialLoad = CreateInitialLoadCompletion();
         private volatile Boolean _connected = false;
         private volatile Boolean _configured = false;
 
@@ -48,22 +40,19 @@ namespace TVHeadEnd
         private string _password;
         private string _streamingMethod;
         private bool _forceDeinterlace;
+        private TimeZoneInfo _tvhTimeZone;
 
         // Data helpers
         private readonly ChannelDataHelper _channelDataHelper;
         private readonly DvrDataHelper _dvrDataHelper;
         private readonly AutorecDataHelper _autorecDataHelper;
 
-        private LiveTvService _liveTvService;
-
         private Dictionary<string, string> _headers = new Dictionary<string, string>();
 
-        public HTSConnectionHandler(ILoggerFactory loggerFactory, IHttpClientFactory httpClientFactory)
+        public HTSConnectionHandler(ILoggerFactory loggerFactory)
         {
             _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger<HTSConnectionHandler>();
-            _httpClientFactory = httpClientFactory;
-            _liveTvService = null;
 
             //System.Diagnostics.StackTrace t = new System.Diagnostics.StackTrace();
             _logger.LogDebug("[TVHclient] HTSConnectionHandler");
@@ -75,46 +64,28 @@ namespace TVHeadEnd
             _channelDataHelper.SetChannelType4Other(_channelType);
         }
 
-        public static HTSConnectionHandler GetInstance(ILoggerFactory loggerFactory, IHttpClientFactory httpClientFactory)
+        private static TaskCompletionSource<bool> CreateInitialLoadCompletion()
         {
-            if (_instance == null)
+            return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        private void ResetInitialLoad()
+        {
+            var previous = Interlocked.Exchange(ref _initialLoad, CreateInitialLoadCompletion());
+            previous.TrySetResult(false);
+        }
+
+        public async Task<int> WaitForInitialLoadAsync(CancellationToken cancellationToken)
+        {
+            await Task.Run(() => ensureConnection(cancellationToken), cancellationToken).ConfigureAwait(false);
+            try
             {
-                lock (_syncRoot)
-                {
-                    if (_instance == null)
-                    {
-                        _instance = new HTSConnectionHandler(loggerFactory, httpClientFactory);
-                    }
-                }
+                return await Volatile.Read(ref _initialLoad).Task.WaitAsync(InitialLoadTimeout, cancellationToken).ConfigureAwait(false) ? 0 : -1;
             }
-            return _instance;
-        }
-
-        public void setLiveTvService(LiveTvService liveTvService)
-        {
-            _liveTvService = liveTvService;
-        }
-
-        public LiveTvService getLiveTvService()
-        {
-            return _liveTvService;
-        }
-
-        public int WaitForInitialLoad(CancellationToken cancellationToken)
-        {
-            ensureConnection();
-            DateTime start = DateTime.Now;
-            while (!_initialLoadFinished || cancellationToken.IsCancellationRequested)
+            catch (TimeoutException)
             {
-                Thread.Sleep(500);
-                TimeSpan duration = DateTime.Now - start;
-                long durationInSec = duration.Ticks / TimeSpan.TicksPerSecond;
-                if (durationInSec > 60 * 15) // 15 Min timeout, should be enough to load huge data count
-                {
-                    return -1;
-                }
+                return -1;
             }
-            return 0;
         }
 
         private void init()
@@ -155,11 +126,27 @@ namespace TVHeadEnd
             _channelType = config.ChannelType.Trim();
             _streamingMethod = StreamingMethods.GetEffective(config.StreamingMethod);
             _forceDeinterlace = config.ForceDeinterlace;
+            var timeZoneId = config.TVH_TimeZoneId?.Trim();
+            if (!string.IsNullOrEmpty(timeZoneId))
+            {
+                try
+                {
+                    _tvhTimeZone = TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
+                }
+                catch (TimeZoneNotFoundException)
+                {
+                    _logger.LogWarning("[TVHclient] Unknown TVHeadend timezone '{TimeZoneId}'; falling back to the current server UTC offset", timeZoneId);
+                }
+                catch (InvalidTimeZoneException)
+                {
+                    _logger.LogWarning("[TVHclient] Invalid TVHeadend timezone '{TimeZoneId}'; falling back to the current server UTC offset", timeZoneId);
+                }
+            }
 
-            if (_priority < 0 || _priority > 4)
+            if ((_priority < 0 || _priority > 4) && _priority != 6)
             {
                 _priority = 2;
-                _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: priority was out of range [0-4] - set to 2");
+                _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: invalid priority - set to 2");
             }
 
             _tvhServerName = config.TVH_ServerName.Trim();
@@ -173,18 +160,11 @@ namespace TVHeadEnd
             _userName = config.Username.Trim();
             _password = config.Password.Trim();
 
-            if (_streamingMethod == StreamingMethods.HttpBasic)
-            {
-                // Use HTTP basic auth instead of TVH ticketing system for authentication to allow the users to switch subs or audio tracks at any time
-                _httpBaseUrl = "http://" + _userName + ":" + _password + "@" + _tvhServerName + ":" + _httpPort + _webRoot;
-            }
-            else
-            {
-                _httpBaseUrl = "http://" + _tvhServerName + ":" + _httpPort + _webRoot;
-            }
+            var httpScheme = config.UseHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
+            _httpBaseUrl = new UriBuilder(httpScheme, _tvhServerName, _httpPort, _webRoot).Uri.AbsoluteUri.TrimEnd('/');
 
             string authInfo = _userName + ":" + _password;
-            authInfo = Convert.ToBase64String(Encoding.Default.GetBytes(authInfo));
+            authInfo = Convert.ToBase64String(Encoding.UTF8.GetBytes(authInfo));
             _headers["Authorization"] = "Basic " + authInfo;
             _configured = true;
         }
@@ -208,7 +188,7 @@ namespace TVHeadEnd
             }
             else
             {
-                return "http://" + _userName + ":" + _password + "@" +_tvhServerName + ":" + _httpPort + _webRoot + "/" + channelIcon;
+                return GetHttpBaseUrl() + "/" + channelIcon.TrimStart('/');
             }
         }
 
@@ -225,21 +205,25 @@ namespace TVHeadEnd
         //    return stream;
         //}
 
-        private void ensureConnection()
+        private void ensureConnection(CancellationToken cancellationToken = default)
         {
             init();
 
-            //_logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection");
-            if (_htsConnection == null || _htsConnection.needsRestart())
-            {
-                _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: create new HTS connection");
-                Version version = Assembly.GetEntryAssembly().GetName().Version;
-                _htsConnection = new HTSConnectionAsync(this, "TVHclient4Emby-" + version.ToString(), "" + HTSMessage.HTSP_VERSION, _loggerFactory);
-                _connected = false;
-            }
-
             lock (_lock)
             {
+                if (_htsConnection == null || _htsConnection.needsRestart())
+                {
+                    _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: create new HTS connection");
+                    _htsConnection?.Dispose();
+                    Version version = Assembly.GetEntryAssembly().GetName().Version;
+                    _htsConnection = new HTSConnectionAsync(this, "TVHclient4Emby-" + version.ToString(), "" + HTSMessage.HTSP_VERSION, _loggerFactory);
+                    _connected = false;
+                    ResetInitialLoad();
+                    _channelDataHelper.Clean();
+                    _dvrDataHelper.clean();
+                    _autorecDataHelper.clean();
+                }
+
                 if (!_connected)
                 {
                     _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: used connection parameters: " +
@@ -247,18 +231,28 @@ namespace TVHeadEnd
                         "User = '{user}'; Password set = '{passexists}'",
                         _tvhServerName, _httpPort, _htspPort, _webRoot, _userName, (_password.Length > 0));
 
-                    _htsConnection.open(_tvhServerName, _htspPort);
-                    _connected = _htsConnection.authenticate(_userName, _password);
+                    _htsConnection.open(_tvhServerName, _htspPort, cancellationToken, maxAttempts: 3);
+                    _connected = _htsConnection.authenticate(_userName, _password, true, cancellationToken, AuthenticationTimeout);
+                    if (!_connected)
+                    {
+                        _htsConnection.Dispose();
+                        throw new UnauthorizedAccessException("TVHeadend HTSP authentication failed.");
+                    }
 
                     _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: connection established {c}", _connected);
                 }
             }
         }
 
-        public void SendMessage(HTSMessage message, HTSResponseHandler responseHandler)
+        public int SendMessage(HTSMessage message, HTSResponseHandler responseHandler)
         {
             ensureConnection();
-            _htsConnection.sendMessage(message, responseHandler);
+            return _htsConnection.sendMessage(message, responseHandler);
+        }
+
+        public void RemoveResponseHandler(int sequence)
+        {
+            _htsConnection?.RemoveResponseHandler(sequence);
         }
 
         public String GetServername()
@@ -306,6 +300,34 @@ namespace TVHeadEnd
             return _priority;
         }
 
+        public int GetServerUtcOffsetMinutes()
+        {
+            ensureConnection();
+            return _htsConnection.getServerUtcOffsetMinutes();
+        }
+
+        public int GetServerUtcOffsetMinutes(DateTime utcInstant)
+        {
+            ensureConnection();
+            utcInstant = utcInstant.Kind == DateTimeKind.Utc ? utcInstant : utcInstant.ToUniversalTime();
+
+            if (_tvhTimeZone != null)
+            {
+                return checked((int)_tvhTimeZone.GetUtcOffset(utcInstant).TotalMinutes);
+            }
+
+            int serverOffset = _htsConnection.getServerUtcOffsetMinutes();
+            int localOffset = checked((int)TimeZoneInfo.Local.GetUtcOffset(DateTime.UtcNow).TotalMinutes);
+            return localOffset == serverOffset
+                ? checked((int)TimeZoneInfo.Local.GetUtcOffset(utcInstant).TotalMinutes)
+                : serverOffset;
+        }
+
+        public string GetAutorecTitle(string id)
+        {
+            return _autorecDataHelper.GetTitle(id);
+        }
+
         public String GetProfile()
         {
             init();
@@ -343,7 +365,7 @@ namespace TVHeadEnd
 
         public async Task<IEnumerable<SeriesTimerInfo>> BuildAutorecInfos(CancellationToken cancellationToken)
         {
-            var timers = await _autorecDataHelper.buildAutorecInfos(cancellationToken).ConfigureAwait(false);
+            var timers = await _autorecDataHelper.buildAutorecInfos(cancellationToken, GetServerUtcOffsetMinutes()).ConfigureAwait(false);
             foreach (var timer in timers)
             {
                 timer.ChannelId = GetExternalChannelId(timer.ChannelId);
@@ -371,11 +393,13 @@ namespace TVHeadEnd
         public void onError(Exception ex)
         {
             _logger.LogError(ex, "[TVHclient] HTSConnectionHandler: HTSP error");
-            _htsConnection.stop();
-            _htsConnection = null;
-            _connected = false;
-            //_liveTvService.sendDataSourceChanged();
-            ensureConnection();
+            lock (_lock)
+            {
+                _htsConnection?.Dispose();
+                _htsConnection = null;
+                _connected = false;
+                ResetInitialLoad();
+            }
         }
 
         public void onMessage(HTSMessage response)
@@ -447,7 +471,7 @@ namespace TVHeadEnd
                     //    break;
 
                     case "initialSyncCompleted":
-                        _initialLoadFinished = true;
+                        Volatile.Read(ref _initialLoad).TrySetResult(true);
                         break;
 
                     default:
@@ -455,6 +479,19 @@ namespace TVHeadEnd
                         break;
                 }
             }
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                _htsConnection?.Dispose();
+                _htsConnection = null;
+                _connected = false;
+                ResetInitialLoad();
+            }
+
+            GC.SuppressFinalize(this);
         }
     }
 }

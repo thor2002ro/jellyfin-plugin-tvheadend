@@ -16,7 +16,7 @@ using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Configuration;
-using TVHeadEnd.Helper;
+using TVHeadEnd.DataHelper;
 using TVHeadEnd.HTSP;
 using TVHeadEnd.HTSP_Responses;
 using static TVHeadEnd.AccessTicketHandler.TicketType;
@@ -34,6 +34,7 @@ namespace TVHeadEnd
         private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly HTSConnectionHandler _htsConnectionHandler;
         private readonly AccessTicketHandler _channelTicketHandler;
+        private readonly AccessTicketHandler _recordingTicketHandler;
 
         private readonly ILogger<LiveTvService> _logger;
         public DateTime _lastRecordingChange = DateTime.MinValue;
@@ -48,13 +49,13 @@ namespace TVHeadEnd
             _logger.LogDebug("LiveTvService()");
 
             _htsConnectionHandler = connectionHandler;
-            _htsConnectionHandler.setLiveTvService(this);
 
             {
                 var lifeSpan = TimeSpan.FromSeconds(15);       // Revalidate tickets every 15 seconds
                 var requestTimeout = TimeSpan.FromSeconds(10); // First request retry after 10 seconds
                 var retries = 2;                               // Number of times to retry getting tickets
                 _channelTicketHandler = new AccessTicketHandler(loggerFactory, _htsConnectionHandler, requestTimeout, retries, lifeSpan, Channel);
+                _recordingTicketHandler = new AccessTicketHandler(loggerFactory, _htsConnectionHandler, requestTimeout, retries, lifeSpan, Recording);
             }
 
             //Added for stream probing
@@ -67,7 +68,7 @@ namespace TVHeadEnd
 
         public async Task CancelSeriesTimerAsync(string timerId, CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.CancelSeriesTimerAsync: call cancelled or timed out");
@@ -81,13 +82,8 @@ namespace TVHeadEnd
             HTSMessage deleteAutorecResponse;
             try
             {
-                deleteAutorecResponse = await Task.Run(() =>
-                {
-                    LoopBackResponseHandler lbrh = new LoopBackResponseHandler();
-                    _htsConnectionHandler.SendMessage(deleteAutorecMessage, lbrh);
-                    _lastRecordingChange = DateTime.UtcNow;
-                    return lbrh.getResponse();
-                }, cancellationToken).WaitAsync(_timeout, cancellationToken);
+                deleteAutorecResponse = await SendMessageAsync(deleteAutorecMessage, cancellationToken).ConfigureAwait(false);
+                _lastRecordingChange = DateTime.UtcNow;
             }
             catch (TimeoutException)
             {
@@ -111,7 +107,7 @@ namespace TVHeadEnd
 
         public async Task CancelTimerAsync(string timerId, CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.CancelTimerAsync: call cancelled or timed out");
@@ -125,13 +121,8 @@ namespace TVHeadEnd
             HTSMessage cancelTimerResponse;
             try
             {
-                cancelTimerResponse = await Task.Run(() =>
-                {
-                    LoopBackResponseHandler lbrh = new LoopBackResponseHandler();
-                    _htsConnectionHandler.SendMessage(cancelTimerMessage, lbrh);
-                    _lastRecordingChange = DateTime.UtcNow;
-                    return lbrh.getResponse();
-                }, cancellationToken).WaitAsync(_timeout, cancellationToken);
+                cancelTimerResponse = await SendMessageAsync(cancelTimerMessage, cancellationToken).ConfigureAwait(false);
+                _lastRecordingChange = DateTime.UtcNow;
             }
             catch (TimeoutException)
             {
@@ -164,15 +155,12 @@ namespace TVHeadEnd
 
         public async Task CreateSeriesTimerAsync(SeriesTimerInfo info, CancellationToken cancellationToken)
         {
-            // Dummy method to avoid warnings
-            await Task.Factory.StartNew(() => 0, cancellationToken);
-
-            throw new NotImplementedException();
+            await SaveSeriesTimerAsync("addAutorecEntry", info, cancellationToken).ConfigureAwait(false);
         }
 
         public async Task CreateTimerAsync(TimerInfo info, CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.CreateTimerAsync: call cancelled or timed out");
@@ -182,8 +170,8 @@ namespace TVHeadEnd
             HTSMessage createTimerMessage = new HTSMessage();
             createTimerMessage.Method = "addDvrEntry";
             createTimerMessage.putField("channelId", _htsConnectionHandler.ResolveChannelId(info.ChannelId));
-            createTimerMessage.putField("start", DateTimeHelper.getUnixUTCTimeFromUtcDateTime(info.StartDate));
-            createTimerMessage.putField("stop", DateTimeHelper.getUnixUTCTimeFromUtcDateTime(info.EndDate));
+            createTimerMessage.putField("start", new DateTimeOffset(info.StartDate.ToUniversalTime()).ToUnixTimeSeconds());
+            createTimerMessage.putField("stop", new DateTimeOffset(info.EndDate.ToUniversalTime()).ToUnixTimeSeconds());
             createTimerMessage.putField("startExtra", (long)(info.PrePaddingSeconds / 60));
             createTimerMessage.putField("stopExtra", (long)(info.PostPaddingSeconds / 60));
             createTimerMessage.putField("priority", _htsConnectionHandler.GetPriority()); // info.Priority delivers always 0 - no GUI
@@ -195,12 +183,7 @@ namespace TVHeadEnd
             HTSMessage createTimerResponse;
             try
             {
-                createTimerResponse = await Task.Run(() =>
-                {
-                    LoopBackResponseHandler lbrh = new LoopBackResponseHandler();
-                    _htsConnectionHandler.SendMessage(createTimerMessage, lbrh);
-                    return lbrh.getResponse();
-                }, cancellationToken).WaitAsync(_timeout, cancellationToken);
+                createTimerResponse = await SendMessageAsync(createTimerMessage, cancellationToken).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
@@ -224,7 +207,7 @@ namespace TVHeadEnd
 
         public async Task DeleteRecordingAsync(string recordingId, CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogError("LiveTvService.DeleteRecordingAsync: call cancelled or timed out");
@@ -238,13 +221,8 @@ namespace TVHeadEnd
             HTSMessage deleteRecordingResponse;
             try
             {
-                deleteRecordingResponse = await Task.Run(() =>
-                {
-                    LoopBackResponseHandler lbrh = new LoopBackResponseHandler();
-                    _htsConnectionHandler.SendMessage(deleteRecordingMessage, lbrh);
-                    _lastRecordingChange = DateTime.UtcNow;
-                    return lbrh.getResponse();
-                }, cancellationToken).WaitAsync(_timeout, cancellationToken);
+                deleteRecordingResponse = await SendMessageAsync(deleteRecordingMessage, cancellationToken).ConfigureAwait(false);
+                _lastRecordingChange = DateTime.UtcNow;
             }
             catch (TimeoutException)
             {
@@ -268,7 +246,7 @@ namespace TVHeadEnd
 
         public async Task<IEnumerable<ChannelInfo>> GetChannelsAsync(CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogError("LiveTvService.GetChannelsAsync: call cancelled or timed out - returning empty list");
@@ -335,7 +313,7 @@ namespace TVHeadEnd
                 livetvasset.RequiredHttpHeaders = _htsConnectionHandler.GetHeaders();
             }
 
-            await ProbeStream(livetvasset, livetvasset.Path, "LiveTV", cancellationToken);
+            await ProbeStream(livetvasset, "LiveTV", cancellationToken);
 
             if (_htsConnectionHandler.GetForceDeinterlace() && livetvasset.MediaStreams != null)
             {
@@ -400,6 +378,31 @@ namespace TVHeadEnd
             }
         }
 
+        internal async Task<string> GetRecordingStreamUrl(string recordingId, CancellationToken cancellationToken)
+        {
+            var ticket = await _recordingTicketHandler.GetTicket(recordingId, cancellationToken).ConfigureAwait(false);
+            return _htsConnectionHandler.GetHttpBaseUrl() + ticket.Url;
+        }
+
+        internal string GetRecordingProxyUrl(string recordingId)
+        {
+            return _appHost.GetApiUrlForLocalAccess().TrimEnd('/') + "/TVHeadEnd/Recordings/" + Uri.EscapeDataString(recordingId)
+                + "/" + GetRecordingStreamToken(recordingId) + "/Stream";
+        }
+
+        internal bool IsRecordingStreamTokenValid(string recordingId, string token)
+        {
+            var expected = Encoding.ASCII.GetBytes(GetRecordingStreamToken(recordingId));
+            var actual = Encoding.ASCII.GetBytes(token ?? string.Empty);
+            return actual.Length == expected.Length && CryptographicOperations.FixedTimeEquals(actual, expected);
+        }
+
+        private static string GetRecordingStreamToken(string recordingId)
+        {
+            var secret = Encoding.UTF8.GetBytes(Plugin.Instance.Configuration.RecordingStreamSecret);
+            return Convert.ToHexString(HMACSHA256.HashData(secret, Encoding.UTF8.GetBytes(recordingId)));
+        }
+
         private static string GetStableHtspMediaSourceId(string channelId)
         {
             var normalizedChannelId = string.IsNullOrWhiteSpace(channelId) ? string.Empty : channelId.Trim();
@@ -460,10 +463,9 @@ namespace TVHeadEnd
             };
         }
 
-        private async Task ProbeStream(MediaSourceInfo mediaSourceInfo, string probeUrl, string source, CancellationToken cancellationToken)
+        private async Task ProbeStream(MediaSourceInfo mediaSourceInfo, string source, CancellationToken cancellationToken)
         {
             _logger.LogInformation("Probe stream for {source}", source);
-            _logger.LogInformation("Probe URL: {probeUrl}", probeUrl);
 
             MediaInfoRequest req = new MediaInfoRequest
             {
@@ -570,7 +572,6 @@ namespace TVHeadEnd
             _logger.LogDebug("{Prefix}CodecTag                {CodecTag}", prefix, ms.CodecTag); // Object
             _logger.LogDebug("{Prefix}Comment                 {Comment}", prefix, ms.Comment);
             _logger.LogDebug("{Prefix}DeliveryMethod          {DeliveryMethod}", prefix, ms.DeliveryMethod); // Object
-            _logger.LogDebug("{Prefix}DeliveryUrl             {DeliveryUrl}", prefix, ms.DeliveryUrl);
             //_logger.LogDebug("{Prefix}ExternalId              {ExternalId}", prefix, ms.ExternalId);
             _logger.LogDebug("{Prefix}Height                  {Height}", prefix, ms.Height);
             _logger.LogDebug("{Prefix}Index                   {Index}", prefix, ms.Index);
@@ -584,7 +585,6 @@ namespace TVHeadEnd
             _logger.LogDebug("{Prefix}Language                {Language}", prefix, ms.Language);
             _logger.LogDebug("{Prefix}Level                   {Level}", prefix, ms.Level);
             _logger.LogDebug("{Prefix}PacketLength            {PacketLength}", prefix, ms.PacketLength);
-            _logger.LogDebug("{Prefix}Path                    {Path}", prefix, ms.Path);
             _logger.LogDebug("{Prefix}PixelFormat             {PixelFormat}", prefix, ms.PixelFormat);
             _logger.LogDebug("{Prefix}Profile                 {Profile}", prefix, ms.Profile);
             _logger.LogDebug("{Prefix}RealFrameRate           {RealFrameRate}", prefix, ms.RealFrameRate);
@@ -603,49 +603,52 @@ namespace TVHeadEnd
             return [source];
         }
 
-        public async Task<SeriesTimerInfo> GetNewTimerDefaultsAsync(CancellationToken cancellationToken, ProgramInfo program = null)
+        public Task<SeriesTimerInfo> GetNewTimerDefaultsAsync(CancellationToken cancellationToken, ProgramInfo program = null)
         {
-            return await Task.Factory.StartNew(() =>
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(new SeriesTimerInfo
             {
-                return new SeriesTimerInfo
-                {
-                    PostPaddingSeconds = Plugin.Instance.Configuration.Pre_Padding,
-                    PrePaddingSeconds = Plugin.Instance.Configuration.Post_Padding,
-                    RecordAnyChannel = true,
-                    RecordAnyTime = true,
-                    RecordNewOnly = false
-                };
-            }, cancellationToken);
+                PostPaddingSeconds = Plugin.Instance.Configuration.Post_Padding,
+                PrePaddingSeconds = Plugin.Instance.Configuration.Pre_Padding,
+                Priority = _htsConnectionHandler.GetPriority(),
+                RecordAnyChannel = true,
+                RecordAnyTime = true,
+                RecordNewOnly = false
+            });
         }
 
         public async Task<IEnumerable<ProgramInfo>> GetProgramsAsync(string channelId, DateTime startDateUtc, DateTime endDateUtc, CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.GetProgramsAsync: call cancelled or timed out - returning empty list");
                 return new List<ProgramInfo>();
             }
 
-            GetEventsResponseHandler currGetEventsResponseHandler = new GetEventsResponseHandler(startDateUtc, endDateUtc, _logger, cancellationToken);
+            GetEventsResponseHandler currGetEventsResponseHandler = new GetEventsResponseHandler(startDateUtc, endDateUtc, _logger);
 
             HTSMessage queryEvents = new HTSMessage();
             queryEvents.Method = "getEvents";
             queryEvents.putField("channelId", _htsConnectionHandler.ResolveChannelId(channelId));
             queryEvents.putField("maxTime", ((DateTimeOffset)endDateUtc).ToUnixTimeSeconds());
-            _htsConnectionHandler.SendMessage(queryEvents, currGetEventsResponseHandler);
+            int sequence = _htsConnectionHandler.SendMessage(queryEvents, currGetEventsResponseHandler);
 
             _logger.LogDebug("LiveTvService.GetProgramsAsync: ask TVH for events of channel '{chanid}'", channelId);
 
             IEnumerable<ProgramInfo> programs;
             try
             {
-                programs = await currGetEventsResponseHandler.GetEvents(cancellationToken, channelId).WaitAsync(_timeout, cancellationToken);
+                programs = await currGetEventsResponseHandler.GetEvents(cancellationToken).WaitAsync(_timeout, cancellationToken);
             }
             catch (TimeoutException)
             {
                 _logger.LogDebug("LiveTvService.GetProgramsAsync: timeout reached while calling for events of channel '{chanid}'", channelId);
                 return [];
+            }
+            finally
+            {
+                _htsConnectionHandler.RemoveResponseHandler(sequence);
             }
 
             foreach (var program in programs)
@@ -658,7 +661,7 @@ namespace TVHeadEnd
 
         public async Task<IEnumerable<SeriesTimerInfo>> GetSeriesTimersAsync(CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.GetSeriesTimersAsync: call cancelled ot timed out - returning empty list");
@@ -679,7 +682,7 @@ namespace TVHeadEnd
         {
             //  retrieve the 'Pending' recordings");
 
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.GetTimersAsync: call cancelled or timed out - returning empty list");
@@ -702,15 +705,12 @@ namespace TVHeadEnd
 
         public async Task UpdateSeriesTimerAsync(SeriesTimerInfo info, CancellationToken cancellationToken)
         {
-            await CancelSeriesTimerAsync(info.Id, cancellationToken);
-            _lastRecordingChange = DateTime.UtcNow;
-            // TODO add if method is implemented
-            // await CreateSeriesTimerAsync(info, cancellationToken);
+            await SaveSeriesTimerAsync("updateAutorecEntry", info, cancellationToken).ConfigureAwait(false);
         }
 
         public async Task UpdateTimerAsync(TimerInfo info, CancellationToken cancellationToken)
         {
-            int timeOut = await WaitForInitialLoadTask(cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
             {
                 _logger.LogDebug("LiveTvService.UpdateTimerAsync: call cancelled or timed out");
@@ -726,13 +726,8 @@ namespace TVHeadEnd
             HTSMessage updateTimerResponse;
             try
             {
-                updateTimerResponse = await Task.Run(() =>
-                {
-                    LoopBackResponseHandler lbrh = new LoopBackResponseHandler();
-                    _htsConnectionHandler.SendMessage(updateTimerMessage, lbrh);
-                    _lastRecordingChange = DateTime.UtcNow;
-                    return lbrh.getResponse();
-                }, cancellationToken).WaitAsync(_timeout, cancellationToken);
+                updateTimerResponse = await SendMessageAsync(updateTimerMessage, cancellationToken).ConfigureAwait(false);
+                _lastRecordingChange = DateTime.UtcNow;
             }
             catch (TimeoutException)
             {
@@ -758,24 +753,100 @@ namespace TVHeadEnd
         /* Helpers */
         /***********/
 
-        private Task<int> WaitForInitialLoadTask(CancellationToken cancellationToken)
+        private async Task SaveSeriesTimerAsync(string method, SeriesTimerInfo info, CancellationToken cancellationToken)
         {
-            return Task.Factory.StartNew(() => _htsConnectionHandler.WaitForInitialLoad(cancellationToken), cancellationToken);
+            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
+            if (timeOut == -1)
+            {
+                _logger.LogDebug("LiveTvService.{Method}: call timed out", method);
+                return;
+            }
+
+            HTSMessage response;
+            try
+            {
+                response = await SendMessageAsync(BuildAutorecMessage(method, info), cancellationToken).ConfigureAwait(false);
+                _lastRecordingChange = DateTime.UtcNow;
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogError("LiveTvService.{Method}: TVHeadend did not respond before the timeout", method);
+                return;
+            }
+
+            if (response.containsField("error"))
+            {
+                _logger.LogError("LiveTvService.{Method}: TVHeadend rejected the series timer: '{Why}'", method, response.getString("error"));
+            }
+            else if (response.containsField("noaccess"))
+            {
+                _logger.LogError("LiveTvService.{Method}: TVHeadend denied access", method);
+            }
+            else if (method == "addAutorecEntry" && response.getInt("success", 0) != 1)
+            {
+                _logger.LogError("LiveTvService.{Method}: TVHeadend did not create the series timer", method);
+            }
         }
 
-        private static string Dump(List<DayOfWeek> days)
+        private HTSMessage BuildAutorecMessage(string method, SeriesTimerInfo info)
         {
-            StringBuilder sb = new StringBuilder();
-            foreach (DayOfWeek dow in days)
+            ArgumentNullException.ThrowIfNull(info);
+
+            var message = new HTSMessage { Method = method };
+            if (method == "updateAutorecEntry")
             {
-                sb.Append(dow + ", ");
+                if (string.IsNullOrWhiteSpace(info.Id))
+                {
+                    throw new ArgumentException("A TVHeadend autorecording ID is required for updates.", nameof(info));
+                }
+
+                message.putField("id", info.Id);
             }
-            string tmpResult = sb.ToString();
-            if (tmpResult.EndsWith(','))
+
+            if (!string.IsNullOrWhiteSpace(info.Name))
             {
-                tmpResult = tmpResult[..^2];
+                string title = method == "updateAutorecEntry" ? _htsConnectionHandler.GetAutorecTitle(info.Id) : null;
+                message.putField("title", string.IsNullOrWhiteSpace(title) ? info.Name : title);
+                message.putField("name", info.Name);
             }
-            return tmpResult;
+
+            message.putField("enabled", 1);
+            message.putField("channelId", info.RecordAnyChannel || string.IsNullOrWhiteSpace(info.ChannelId) ? -1L : _htsConnectionHandler.ResolveChannelId(info.ChannelId));
+            message.putField("daysOfWeek", info.Days == null ? 0 : AutorecDataHelper.getDaysOfWeekFromList(info.Days));
+            message.putField("priority", info.Priority is >= 0 and <= 4 or 6 ? info.Priority : _htsConnectionHandler.GetPriority());
+            message.putField("startExtra", (long)(info.PrePaddingSeconds / 60));
+            message.putField("stopExtra", (long)(info.PostPaddingSeconds / 60));
+            message.putField("broadcastType", info.RecordNewOnly ? 1 : 0);
+            message.putField("configName", _htsConnectionHandler.GetProfile());
+
+            if (info.RecordAnyTime)
+            {
+                message.putField("start", -1);
+                message.putField("startWindow", -1);
+            }
+            else
+            {
+                int startUtcOffsetMinutes = _htsConnectionHandler.GetServerUtcOffsetMinutes(info.StartDate);
+                int endUtcOffsetMinutes = _htsConnectionHandler.GetServerUtcOffsetMinutes(info.EndDate);
+                message.putField("start", AutorecDataHelper.getMinutesFromMidnight(info.StartDate, startUtcOffsetMinutes));
+                message.putField("startWindow", AutorecDataHelper.getMinutesFromMidnight(info.EndDate, endUtcOffsetMinutes));
+            }
+
+            return message;
+        }
+
+        private async Task<HTSMessage> SendMessageAsync(HTSMessage message, CancellationToken cancellationToken)
+        {
+            var responseHandler = new LoopBackResponseHandler();
+            int sequence = _htsConnectionHandler.SendMessage(message, responseHandler);
+            try
+            {
+                return await responseHandler.GetResponseAsync(cancellationToken, _timeout).ConfigureAwait(false);
+            }
+            finally
+            {
+                _htsConnectionHandler.RemoveResponseHandler(sequence);
+            }
         }
     }
 

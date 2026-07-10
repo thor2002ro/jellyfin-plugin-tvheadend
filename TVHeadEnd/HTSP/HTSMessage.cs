@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using System;
+using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -568,13 +569,14 @@ namespace TVHeadEnd.HTSP
 
         private static System.Numerics.BigInteger toBigInteger(byte[] b)
         {
-            byte[] b1 = new byte[8];
-            for (int ii = 0; ii < b.Length; ii++)
+            if (b.Length > sizeof(long))
             {
-                b1[ii] = b[ii];
+                throw new IOException("[TVHclient] HTSMessage.toBigInteger: S64 field exceeds 8 bytes");
             }
-            long lValue = BitConverter.ToInt64(b1, 0);
-            return new System.Numerics.BigInteger(lValue);
+
+            Span<byte> bytes = stackalloc byte[sizeof(long)];
+            b.AsSpan().CopyTo(bytes);
+            return new System.Numerics.BigInteger(BinaryPrimitives.ReadInt64LittleEndian(bytes));
         }
 
         private static HTSMessage deserializeBinary(byte[] messageData)

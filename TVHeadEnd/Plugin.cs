@@ -6,6 +6,7 @@ using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 using TVHeadEnd.Configuration;
 using System.IO;
+using System.Security.Cryptography;
 using MediaBrowser.Model.Drawing;
 
 namespace TVHeadEnd
@@ -19,6 +20,11 @@ namespace TVHeadEnd
             : base(applicationPaths, xmlSerializer)
         {
             Instance = this;
+            if (string.IsNullOrWhiteSpace(Configuration.RecordingStreamSecret))
+            {
+                Configuration.RecordingStreamSecret = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+                SaveConfiguration(Configuration);
+            }
         }
 
         public IEnumerable<PluginPageInfo> GetPages()

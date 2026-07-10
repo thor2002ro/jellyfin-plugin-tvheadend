@@ -16,6 +16,10 @@ export default function (view, params) {
         return Math.max(min, Math.min(max, value));
     }
 
+    function priorityValue(value) {
+        return [0, 1, 2, 3, 4, 6].includes(Number(value)) ? Number(value) : 2;
+    }
+
     function loadProfiles(page, selectedProfile) {
         const select = page.querySelector('#txtProfile');
         const status = page.querySelector('#profileStatus');
@@ -242,12 +246,14 @@ export default function (view, params) {
         const page = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
             page.querySelector('#txtTVH_ServerName').value = config.TVH_ServerName || '';
+            page.querySelector('#txtTVH_TimeZoneId').value = config.TVH_TimeZoneId || '';
             page.querySelector('#txtHTTP_Port').value = config.HTTP_Port || 9981;
+            page.querySelector('#chkUseHttps').checked = config.UseHttps === true;
             page.querySelector('#txtHTSP_Port').value = config.HTSP_Port || 9982;
             page.querySelector('#txtWebRoot').value = config.WebRoot || '/';
             page.querySelector('#txtUserName').value = config.Username || '';
             page.querySelector('#txtPassword').value = config.Password || '';
-            page.querySelector('#txtPriority').value = Number.isInteger(config.Priority) && config.Priority >= 0 && config.Priority <= 4 ? config.Priority : 2;
+            page.querySelector('#txtPriority').value = priorityValue(config.Priority);
             loadProfiles(page, config.Profile || '');
             page.querySelector('#txtPrePadding').value = Number.isFinite(config.Pre_Padding) ? config.Pre_Padding : 0;
             page.querySelector('#txtPostPadding').value = Number.isFinite(config.Post_Padding) ? config.Post_Padding : 0;
@@ -287,12 +293,14 @@ export default function (view, params) {
         const form = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
             config.TVH_ServerName = form.querySelector('#txtTVH_ServerName').value.trim();
+            config.TVH_TimeZoneId = form.querySelector('#txtTVH_TimeZoneId').value.trim();
             config.HTTP_Port = intValue(form.querySelector('#txtHTTP_Port'), 9981, 1, 65535);
+            config.UseHttps = form.querySelector('#chkUseHttps').checked;
             config.HTSP_Port = intValue(form.querySelector('#txtHTSP_Port'), 9982, 1, 65535);
             config.WebRoot = form.querySelector('#txtWebRoot').value.trim() || '/';
             config.Username = form.querySelector('#txtUserName').value;
             config.Password = form.querySelector('#txtPassword').value;
-            config.Priority = intValue(form.querySelector('#txtPriority'), 2, 0, 4);
+            config.Priority = priorityValue(form.querySelector('#txtPriority').value);
             config.Profile = form.querySelector('#txtProfile').value.trim();
             config.Pre_Padding = intValue(form.querySelector('#txtPrePadding'), 0, 0, 86400);
             config.Post_Padding = intValue(form.querySelector('#txtPostPadding'), 0, 0, 86400);

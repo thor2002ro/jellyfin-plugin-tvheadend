@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -31,6 +32,14 @@ namespace TVHeadEnd.HTSP
         private readonly string _clientVersion;
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<HTSConnectionAsync> _logger;
+
+        private int _serverProtocolVersion;
+        private int _negotiatedProtocolVersion;
+        private string _servername;
+        private string _serverversion;
+        private string _serverWebRoot;
+        private string _diskSpace;
+        private readonly HashSet<string> _serverCapabilities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private readonly ByteList _buffer;
         private readonly SizeQueue<HTSMessage> _receivedMessagesQueue;
@@ -300,8 +309,34 @@ namespace TVHeadEnd.HTSP
                     _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: hello didn't include required field 'serverversion' - htsp incorrectly implemented by tvheadend");
                 }
 
-                byte[] salt;
-                if (helloResponse.ContainsField("challenge"))
+                _negotiatedProtocolVersion = Math.Min(_serverProtocolVersion, (int)HTSMessage.HTSP_CLIENT_VERSION);
+                _serverCapabilities.Clear();
+                if (helloResponse.containsField("servercapability"))
+                {
+                    try
+                    {
+                        foreach (object capability in helloResponse.getList("servercapability"))
+                        {
+                            var value = capability?.ToString();
+                            if (!string.IsNullOrWhiteSpace(value))
+                            {
+                                _serverCapabilities.Add(value.Trim());
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Capabilities are optional diagnostics. A malformed field
+                        // must not prevent an otherwise compatible server from
+                        // authenticating and streaming.
+                        _logger.LogDebug(ex, "[TVHclient] HTSConnectionAsync.authenticate: could not parse servercapability list");
+                    }
+                }
+
+                _serverWebRoot = helloResponse.getString("webroot", string.Empty);
+
+                byte[] salt = null;
+                if (helloResponse.containsField("challenge"))
                 {
                     salt = helloResponse.GetByteArray("challenge");
                 }
@@ -380,20 +415,27 @@ namespace TVHeadEnd.HTSP
             return _serverProtocolVersion;
         }
 
-        /// <summary>
-        /// Gets the HTSP version actually in effect for this connection.
-        /// </summary>
-        /// <remarks>
-        /// TVHeadend applies <c>min(server version, requested version)</c> internally and does not
-        /// report the result, so the same minimum is computed here.
-        /// </remarks>
-        /// <returns>The negotiated HTSP version.</returns>
-        public int GetNegotiatedProtocolVersion()
+        public int getNegotiatedProtocolVersion()
         {
-            return Math.Min(_serverProtocolVersion, (int)HTSMessage.HtspVersion);
+            return _negotiatedProtocolVersion;
         }
 
-        public string? GetServername()
+        public IReadOnlyCollection<string> getServerCapabilities()
+        {
+            return new List<string>(_serverCapabilities).AsReadOnly();
+        }
+
+        public bool hasServerCapability(string capability)
+        {
+            return !string.IsNullOrWhiteSpace(capability) && _serverCapabilities.Contains(capability);
+        }
+
+        public string getServerWebRoot()
+        {
+            return _serverWebRoot ?? string.Empty;
+        }
+
+        public string getServername()
         {
             return _servername;
         }

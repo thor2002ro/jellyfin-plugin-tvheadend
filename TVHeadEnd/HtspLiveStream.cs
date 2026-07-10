@@ -44,7 +44,10 @@ namespace TVHeadEnd
         private const int MaxOpenAttempts = 3;
         private const int MaxLiveReconnectAttempts = 5;
         private const int MuxPacketStatsIntervalSeconds = 30;
-        private const long StartupCacheMaxBytes = 8L * 1024L * 1024L;
+        private const long StartupCacheMaxBytes = 32L * 1024L * 1024L;
+        private const int MinStallWatchdogSeconds = 5;
+        private const int MaxStallWatchdogSeconds = 120;
+        private const int MaxHtspQueueDepth = 20000000;
 
         private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
 
@@ -68,6 +71,7 @@ namespace TVHeadEnd
         private readonly Dictionary<int, HtspTransportStreamMuxer.StreamInfo> _muxedStreamsByIndex = new Dictionary<int, HtspTransportStreamMuxer.StreamInfo>();
         private readonly Dictionary<int, long> _muxPacketCounts = new Dictionary<int, long>();
         private readonly Dictionary<int, long> _muxPacketBytes = new Dictionary<int, long>();
+        private readonly Dictionary<int, long> _muxKeyFrameCounts = new Dictionary<int, long>();
         private readonly object _muxPacketStatsLock = new object();
         private readonly object _connectionStateLock = new object();
         private readonly object _clientAbortSync = new object();
@@ -81,6 +85,8 @@ namespace TVHeadEnd
         private CancellationTokenRegistration _clientAbortRegistration;
         private CancellationTokenSource _readerIdleDisconnectCancellationTokenSource;
         private CancellationTokenSource _sharedHubIdleCloseCancellationTokenSource;
+        private CancellationTokenSource _stallWatchdogCancellationTokenSource;
+        private Task _stallWatchdogTask;
         private HTSConnectionAsync _connection;
         private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
         private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
@@ -90,6 +96,9 @@ namespace TVHeadEnd
         private int _closeStarted;
         private int _playbackCloseStarted;
         private int _activeStreamReaders;
+        private int _lastMetadataSubscriptionId;
+        private int _lastFilteredSubscriptionId;
+        private int _stallWatchdogTriggered;
         private bool _closing;
         private bool _started;
         private bool _recovering;
@@ -98,7 +107,20 @@ namespace TVHeadEnd
         private Task _producerOpenTask;
         private DateTime _lastMuxPacketStatsLogUtc = DateTime.MinValue;
         private long _startupCacheBytes;
+        private long _lastPlayableMuxPacketUtcTicks;
+        private long _lastQueueIdrops;
+        private long _lastQueuePdrops;
+        private long _lastQueueBdrops;
+        private int? _primaryVideoStreamIndex;
+        private bool _startupCacheKeyframeAligned;
+        private bool _startupCacheOverflowLogged;
+        private byte[] _cachedH264Sps;
+        private byte[] _cachedH264Pps;
+        private byte[] _cachedHevcVps;
+        private byte[] _cachedHevcSps;
+        private byte[] _cachedHevcPps;
         private readonly Queue<byte[]> _startupCache = new Queue<byte[]>();
+        private readonly HashSet<BlockingByteStream> _pendingBootstrapQueues = new HashSet<BlockingByteStream>();
         private readonly Dictionary<string, List<BlockingByteStream>> _consumerQueuesByOwner = new Dictionary<string, List<BlockingByteStream>>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CancellationTokenSource> _ownerIdleDisconnects = new Dictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _sharedPlaybackReferences = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -186,6 +208,7 @@ namespace TVHeadEnd
                         waitForMuxPacket: true).ConfigureAwait(false);
 
                     ConfigureOpenedMediaSource();
+                    EnsureStallWatchdogStarted();
                     return;
                 }
                 catch (OperationCanceledException) when (openCancellationToken.IsCancellationRequested || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
@@ -396,6 +419,9 @@ namespace TVHeadEnd
 
                 CloseCurrentConnection(unsubscribe: false);
                 ResetConnectionAttemptSignals();
+                ResetStallWatchdogClock();
+                ResetQueueDiagnostics();
+                ResetStartupCacheForNewSubscription(clearParameterSets: false);
 
                 _subscriptionId = Interlocked.Increment(ref _nextSubscriptionId);
                 var connection = new HTSConnectionAsync(this, "TVHclient4Jellyfin-HTSP", "" + HTSMessage.HTSP_VERSION, _loggerFactory);
@@ -409,6 +435,8 @@ namespace TVHeadEnd
                 {
                     throw new InvalidOperationException("TVHeadend HTSP authentication failed.");
                 }
+
+                LogServerCapabilities(connection);
 
                 var subscribe = BuildSubscribeMessage(profile);
                 var response = new TaskResponseHandler();
@@ -468,12 +496,62 @@ namespace TVHeadEnd
             subscribe.putField("90khz", 1);
             subscribe.putField("normts", 1);
 
+            var queueDepth = GetConfiguredQueueDepth();
+            if (queueDepth > 0)
+            {
+                subscribe.putField("queueDepth", queueDepth);
+            }
+
             if (!string.IsNullOrWhiteSpace(profile))
             {
                 subscribe.putField("profile", profile.Trim());
             }
 
             return subscribe;
+        }
+
+        private static int GetConfiguredQueueDepth()
+        {
+            var configured = Plugin.Instance?.Configuration?.HTSPQueueDepth ?? 0;
+            return Math.Max(0, Math.Min(MaxHtspQueueDepth, configured));
+        }
+
+        private static int GetConfiguredStallTimeoutSeconds()
+        {
+            var configured = Plugin.Instance?.Configuration?.HTSPStallTimeoutSeconds ?? 0;
+            if (configured <= 0)
+            {
+                return 0;
+            }
+
+            return Math.Max(MinStallWatchdogSeconds, Math.Min(MaxStallWatchdogSeconds, configured));
+        }
+
+        private void LogServerCapabilities(HTSConnectionAsync connection)
+        {
+            if (connection == null)
+            {
+                return;
+            }
+
+            var capabilities = connection.getServerCapabilities();
+            _logger.LogInformation(
+                "HTSP server hello: name={ServerName}, version={ServerVersion}, protocol server/client/negotiated={ServerProtocol}/{ClientProtocol}/{NegotiatedProtocol}, capabilities={Capabilities}, webroot={WebRoot}",
+                connection.getServername(),
+                connection.getServerversion(),
+                connection.getServerProtocolVersion(),
+                HTSMessage.HTSP_CLIENT_VERSION,
+                connection.getNegotiatedProtocolVersion(),
+                capabilities.Count > 0 ? string.Join(",", capabilities.OrderBy(i => i, StringComparer.OrdinalIgnoreCase)) : "<none>",
+                string.IsNullOrWhiteSpace(connection.getServerWebRoot()) ? "/" : connection.getServerWebRoot());
+
+            if ((Plugin.Instance?.Configuration?.HTSPFilterControlStreams ?? false)
+                && connection.getNegotiatedProtocolVersion() < 12)
+            {
+                _logger.LogWarning(
+                    "HTSP control-stream filtering is enabled, but negotiated protocol {ProtocolVersion} is below v12; subscriptionFilterStream will be skipped",
+                    connection.getNegotiatedProtocolVersion());
+            }
         }
 
         private string GetClientApiBaseUrl()
@@ -538,6 +616,7 @@ namespace TVHeadEnd
             CancelReaderIdleDisconnect();
             CancelSharedHubIdleClose();
             CancelAllOwnerIdleDisconnects();
+            CancelStallWatchdog();
             DisposeClientAbortRegistration();
             CompleteAllConsumerQueues();
             _stream.Complete();
@@ -590,9 +669,20 @@ namespace TVHeadEnd
                     }
 
                     queues.Add(queue);
-                    foreach (var cachedChunk in _startupCache)
+                    if (_primaryVideoStreamIndex.HasValue && !_startupCacheKeyframeAligned)
                     {
-                        queue.WriteChunk(cachedChunk);
+                        _pendingBootstrapQueues.Add(queue);
+                        _logger.LogDebug(
+                            "HTSP shared reader {ReaderId} for channel {ChannelId} is waiting for a keyframe-aligned startup cache",
+                            readerId,
+                            _channelId);
+                    }
+                    else
+                    {
+                        foreach (var cachedChunk in _startupCache)
+                        {
+                            queue.WriteChunk(cachedChunk);
+                        }
                     }
                 }
             }
@@ -680,6 +770,7 @@ namespace TVHeadEnd
                 if (_consumerQueuesByOwner.TryGetValue(playbackId, out var queues))
                 {
                     removed = queues.Remove(queue);
+                    _pendingBootstrapQueues.Remove(queue);
                     if (queues.Count == 0)
                     {
                         _consumerQueuesByOwner.Remove(playbackId);
@@ -712,6 +803,10 @@ namespace TVHeadEnd
                 {
                     _consumerQueuesByOwner.Remove(playbackId);
                     queues = queues.ToList();
+                    foreach (var queue in queues)
+                    {
+                        _pendingBootstrapQueues.Remove(queue);
+                    }
                 }
             }
 
@@ -733,6 +828,7 @@ namespace TVHeadEnd
             {
                 queues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
                 _consumerQueuesByOwner.Clear();
+                _pendingBootstrapQueues.Clear();
             }
 
             foreach (var queue in queues)
@@ -741,34 +837,155 @@ namespace TVHeadEnd
             }
         }
 
-        private void BroadcastOutput(byte[] chunk)
+        private bool BroadcastOutput(byte[] chunk, bool randomAccess, bool forceBootstrapReady)
         {
-            List<BlockingByteStream> queues;
+            List<BlockingByteStream> liveQueues;
+            List<BlockingByteStream> bootstrapQueues = null;
+            List<byte[]> bootstrapSnapshot = null;
+            bool cacheReady;
+            bool cacheOverflowed;
+            bool cacheBecameReady;
+            long cacheBytes;
+
             lock (_broadcastLock)
             {
-                AddStartupCacheChunkLocked(chunk);
-                queues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
+                var cacheWasReady = _startupCacheKeyframeAligned;
+                cacheReady = AddStartupCacheChunkLocked(chunk, randomAccess, forceBootstrapReady, out cacheOverflowed);
+                cacheBecameReady = !cacheWasReady && cacheReady;
+                cacheBytes = _startupCacheBytes;
+                var allQueues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
+
+                if (cacheReady && _pendingBootstrapQueues.Count > 0)
+                {
+                    bootstrapQueues = _pendingBootstrapQueues.Where(allQueues.Contains).ToList();
+                    bootstrapSnapshot = _startupCache.ToList();
+                    foreach (var queue in bootstrapQueues)
+                    {
+                        _pendingBootstrapQueues.Remove(queue);
+                    }
+                }
+
+                liveQueues = allQueues.Where(i => !_pendingBootstrapQueues.Contains(i)
+                    && (bootstrapQueues == null || !bootstrapQueues.Contains(i))).ToList();
             }
 
-            foreach (var queue in queues)
+            if (cacheBecameReady)
+            {
+                _logger.LogInformation(
+                    "HTSP startup cache aligned for channel {ChannelId}: randomAccess={RandomAccess}, cacheBytes={CacheBytes}, releasedReaders={ReleasedReaderCount}",
+                    _channelId,
+                    randomAccess,
+                    cacheBytes,
+                    bootstrapQueues?.Count ?? 0);
+            }
+
+            if (cacheOverflowed && !_startupCacheOverflowLogged)
+            {
+                _startupCacheOverflowLogged = true;
+                _logger.LogWarning(
+                    "HTSP keyframe startup cache exceeded {MaxBytes} bytes for channel {ChannelId}; new readers will wait for the next random-access frame",
+                    StartupCacheMaxBytes,
+                    _channelId);
+            }
+
+            if (bootstrapQueues != null && bootstrapSnapshot != null)
+            {
+                foreach (var queue in bootstrapQueues)
+                {
+                    foreach (var cachedChunk in bootstrapSnapshot)
+                    {
+                        queue.WriteChunk(cachedChunk);
+                    }
+                }
+            }
+
+            foreach (var queue in liveQueues)
             {
                 queue.WriteChunk(chunk);
             }
+
+            return cacheReady;
         }
 
-        private void AddStartupCacheChunkLocked(byte[] chunk)
+        private bool AddStartupCacheChunkLocked(
+            byte[] chunk,
+            bool randomAccess,
+            bool forceBootstrapReady,
+            out bool cacheOverflowed)
         {
+            cacheOverflowed = false;
             if (chunk == null || chunk.Length == 0 || !LooksLikeTransportStream(chunk))
             {
-                return;
+                return _startupCacheKeyframeAligned;
+            }
+
+            if (!_primaryVideoStreamIndex.HasValue || forceBootstrapReady)
+            {
+                _startupCache.Enqueue(chunk);
+                _startupCacheBytes += chunk.Length;
+                while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
+                {
+                    var removed = _startupCache.Dequeue();
+                    _startupCacheBytes -= removed.Length;
+                }
+
+                _startupCacheKeyframeAligned = true;
+                return true;
+            }
+
+            if (randomAccess)
+            {
+                _startupCache.Clear();
+                _startupCacheBytes = 0;
+                _startupCacheKeyframeAligned = true;
+                _startupCacheOverflowLogged = false;
+            }
+
+            if (!_startupCacheKeyframeAligned)
+            {
+                return false;
+            }
+
+            if (_startupCacheBytes + chunk.Length > StartupCacheMaxBytes)
+            {
+                _startupCache.Clear();
+                _startupCacheBytes = 0;
+                _startupCacheKeyframeAligned = false;
+                cacheOverflowed = true;
+                return false;
             }
 
             _startupCache.Enqueue(chunk);
             _startupCacheBytes += chunk.Length;
-            while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
+            return true;
+        }
+
+        private void ResetStartupCacheForNewSubscription(bool clearParameterSets)
+        {
+            lock (_broadcastLock)
             {
-                var removed = _startupCache.Dequeue();
-                _startupCacheBytes -= removed.Length;
+                _startupCache.Clear();
+                _startupCacheBytes = 0;
+                _startupCacheKeyframeAligned = false;
+                _startupCacheOverflowLogged = false;
+
+                _pendingBootstrapQueues.Clear();
+                if (_primaryVideoStreamIndex.HasValue)
+                {
+                    foreach (var queue in _consumerQueuesByOwner.Values.SelectMany(i => i))
+                    {
+                        _pendingBootstrapQueues.Add(queue);
+                    }
+                }
+            }
+
+            if (clearParameterSets)
+            {
+                _cachedH264Sps = null;
+                _cachedH264Pps = null;
+                _cachedHevcVps = null;
+                _cachedHevcSps = null;
+                _cachedHevcPps = null;
             }
         }
 
@@ -776,8 +993,13 @@ namespace TVHeadEnd
         {
             lock (_sharedReferenceLock)
             {
+                var wasEmpty = _sharedPlaybackReferences.Count == 0;
                 _sharedPlaybackReferences.Add(playbackId);
                 CancelSharedHubIdleCloseLocked();
+                if (wasEmpty)
+                {
+                    MarkPlayableMuxPacketReceived();
+                }
             }
         }
 
@@ -1104,6 +1326,120 @@ namespace TVHeadEnd
             _readerIdleDisconnectCancellationTokenSource = null;
         }
 
+        private void EnsureStallWatchdogStarted()
+        {
+            var timeoutSeconds = GetConfiguredStallTimeoutSeconds();
+            if (timeoutSeconds <= 0 || IsSharedProxy)
+            {
+                return;
+            }
+
+            lock (_connectionStateLock)
+            {
+                if (_stallWatchdogTask != null && !_stallWatchdogTask.IsCompleted)
+                {
+                    return;
+                }
+
+                _stallWatchdogCancellationTokenSource?.Dispose();
+                _stallWatchdogCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellationTokenSource.Token);
+                var token = _stallWatchdogCancellationTokenSource.Token;
+                _stallWatchdogTask = Task.Run(() => MonitorStallAsync(token), token);
+            }
+
+            _logger.LogInformation(
+                "HTSP silent-stream watchdog enabled for channel {ChannelId}: timeout={TimeoutSeconds}s",
+                _channelId,
+                timeoutSeconds);
+        }
+
+        private async Task MonitorStallAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                if (_closing || _recovering || GetSharedPlaybackReferenceCount() <= 0)
+                {
+                    continue;
+                }
+
+                var timeoutSeconds = GetConfiguredStallTimeoutSeconds();
+                if (timeoutSeconds <= 0)
+                {
+                    continue;
+                }
+
+                var lastTicks = Interlocked.Read(ref _lastPlayableMuxPacketUtcTicks);
+                if (lastTicks <= 0)
+                {
+                    continue;
+                }
+
+                var idle = DateTime.UtcNow - new DateTime(lastTicks, DateTimeKind.Utc);
+                if (idle.TotalSeconds < timeoutSeconds)
+                {
+                    continue;
+                }
+
+                if (Interlocked.CompareExchange(ref _stallWatchdogTriggered, 1, 0) != 0)
+                {
+                    continue;
+                }
+
+                var error = new IOException(
+                    $"No playable HTSP mux packet was received for {idle.TotalSeconds:F1} seconds.");
+                _logger.LogWarning(
+                    error,
+                    "HTSP shared producer stalled for channel {ChannelId}; subscription {SubscriptionId} will reconnect",
+                    _channelId,
+                    _subscriptionId);
+                onError(error);
+            }
+        }
+
+        private void MarkPlayableMuxPacketReceived()
+        {
+            Interlocked.Exchange(ref _lastPlayableMuxPacketUtcTicks, DateTime.UtcNow.Ticks);
+            Interlocked.Exchange(ref _stallWatchdogTriggered, 0);
+            GetConnectionFirstPacketTaskSource().TrySetResult(true);
+        }
+
+        private void ResetStallWatchdogClock()
+        {
+            Interlocked.Exchange(ref _lastPlayableMuxPacketUtcTicks, 0);
+            Interlocked.Exchange(ref _stallWatchdogTriggered, 0);
+        }
+
+        private void CancelStallWatchdog()
+        {
+            CancellationTokenSource cts;
+            lock (_connectionStateLock)
+            {
+                cts = _stallWatchdogCancellationTokenSource;
+                _stallWatchdogCancellationTokenSource = null;
+            }
+
+            try
+            {
+                cts?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            finally
+            {
+                cts?.Dispose();
+            }
+        }
+
         private void RegisterClientAbortCallback()
         {
             try
@@ -1333,12 +1669,14 @@ namespace TVHeadEnd
             var timeshiftPeriod = GetInt(response, "timeshiftPeriod", 0);
             _muxer.SetTimestampsAre90Khz(timestampsAre90Khz);
 
+            var requestedQueueDepth = GetConfiguredQueueDepth();
             _logger.LogInformation(
-                "HTSP subscription {SubscriptionId} accepted: timestamps={TimestampMode}, normts={Normts}, timeshiftPeriod={TimeshiftPeriod}s",
+                "HTSP subscription {SubscriptionId} accepted: timestamps={TimestampMode}, normts={Normts}, timeshiftPeriod={TimeshiftPeriod}s, requestedQueueDepth={QueueDepth}",
                 _subscriptionId,
                 timestampsAre90Khz ? "90kHz" : "1MHz",
                 normts,
-                timeshiftPeriod);
+                timeshiftPeriod,
+                requestedQueueDepth > 0 ? requestedQueueDepth.ToString(System.Globalization.CultureInfo.InvariantCulture) : "server-default");
         }
 
         private void ProcessMuxPacket(HTSMessage response)
@@ -1351,7 +1689,8 @@ namespace TVHeadEnd
             var payload = response.getByteArray("payload");
             if (LooksLikeTransportStream(payload))
             {
-                WriteOutput(payload);
+                MarkPlayableMuxPacketReceived();
+                WriteOutput(payload, randomAccess: false, forceBootstrapReady: true);
                 return;
             }
 
@@ -1380,23 +1719,266 @@ namespace TVHeadEnd
                 return;
             }
 
+            MarkPlayableMuxPacketReceived();
+
             var pts = response.containsField("pts") ? response.getLong("pts") : (long?)null;
             var dts = response.containsField("dts") ? response.getLong("dts") : (long?)null;
-            RecordMuxPacket(streamIndex, payload, pts, dts);
+            var duration = response.containsField("duration") ? response.getLong("duration") : (long?)null;
+            var frameType = GetFrameType(response);
+            var streamInfo = _muxer.GetStreamInfo(streamIndex);
+            var preparedPayload = PrepareVideoPayloadForBootstrap(streamInfo, payload, frameType, out var randomAccess);
+
+            RecordMuxPacket(streamIndex, payload, pts, dts, duration, frameType, randomAccess);
 
             var chunk = _muxer.WritePacket(
                 streamIndex,
-                payload,
+                preparedPayload,
                 pts,
-                dts);
+                dts,
+                forceProgramTables: randomAccess,
+                randomAccess: randomAccess);
 
             if (chunk.Length > 0)
             {
-                WriteOutput(chunk);
+                WriteOutput(chunk, randomAccess);
             }
         }
 
-        private void RecordMuxPacket(int streamIndex, byte[] payload, long? pts, long? dts)
+        private static char GetFrameType(HTSMessage response)
+        {
+            if (response == null || !response.containsField("frametype"))
+            {
+                return '\0';
+            }
+
+            var value = response.getInt("frametype", 0);
+            return value > 0 && value <= char.MaxValue ? char.ToUpperInvariant((char)value) : '\0';
+        }
+
+        private byte[] PrepareVideoPayloadForBootstrap(
+            HtspTransportStreamMuxer.StreamInfo stream,
+            byte[] payload,
+            char frameType,
+            out bool randomAccess)
+        {
+            randomAccess = stream != null
+                && stream.Kind == HtspTransportStreamMuxer.ElementaryStreamKind.Video
+                && frameType == 'I';
+
+            if (stream == null
+                || stream.Kind != HtspTransportStreamMuxer.ElementaryStreamKind.Video
+                || payload == null
+                || payload.Length == 0)
+            {
+                return payload;
+            }
+
+            switch (NormalizeCodec(stream.Codec))
+            {
+                case "H264":
+                case "AVC":
+                    return PrepareH264RandomAccessPayload(payload, ref randomAccess);
+                case "HEVC":
+                case "H265":
+                    return PrepareHevcRandomAccessPayload(payload, ref randomAccess);
+                default:
+                    return payload;
+            }
+        }
+
+        private byte[] PrepareH264RandomAccessPayload(byte[] payload, ref bool randomAccess)
+        {
+            var units = ParseAnnexBNalUnits(payload, hevc: false);
+            var hasIdr = units.Any(i => i.Type == 5);
+            var hasSps = units.Any(i => i.Type == 7);
+            var hasPps = units.Any(i => i.Type == 8);
+
+            var sps = units.FirstOrDefault(i => i.Type == 7);
+            var pps = units.FirstOrDefault(i => i.Type == 8);
+            if (sps != null)
+            {
+                _cachedH264Sps = CopyNalUnit(payload, sps);
+            }
+
+            if (pps != null)
+            {
+                _cachedH264Pps = CopyNalUnit(payload, pps);
+            }
+
+            // TVHeadend's I-frame hint also covers usable recovery-point frames
+            // on open-GOP broadcasts, so NAL inspection may promote but not
+            // reject it.
+            if (units.Count > 0)
+            {
+                randomAccess = randomAccess
+                    || (hasIdr
+                        && (hasSps || _cachedH264Sps != null)
+                        && (hasPps || _cachedH264Pps != null));
+            }
+
+            if (!randomAccess || (hasSps && hasPps) || _cachedH264Sps == null || _cachedH264Pps == null)
+            {
+                return payload;
+            }
+
+            return PrependParameterSets(payload, _cachedH264Sps, _cachedH264Pps);
+        }
+
+        private byte[] PrepareHevcRandomAccessPayload(byte[] payload, ref bool randomAccess)
+        {
+            var units = ParseAnnexBNalUnits(payload, hevc: true);
+            var hasRandomAccess = units.Any(i => i.Type >= 16 && i.Type <= 21);
+            var hasVps = units.Any(i => i.Type == 32);
+            var hasSps = units.Any(i => i.Type == 33);
+            var hasPps = units.Any(i => i.Type == 34);
+
+            var vps = units.FirstOrDefault(i => i.Type == 32);
+            var sps = units.FirstOrDefault(i => i.Type == 33);
+            var pps = units.FirstOrDefault(i => i.Type == 34);
+            if (vps != null)
+            {
+                _cachedHevcVps = CopyNalUnit(payload, vps);
+            }
+
+            if (sps != null)
+            {
+                _cachedHevcSps = CopyNalUnit(payload, sps);
+            }
+
+            if (pps != null)
+            {
+                _cachedHevcPps = CopyNalUnit(payload, pps);
+            }
+
+            if (units.Count > 0)
+            {
+                randomAccess = randomAccess
+                    || (hasRandomAccess
+                        && (hasVps || _cachedHevcVps != null)
+                        && (hasSps || _cachedHevcSps != null)
+                        && (hasPps || _cachedHevcPps != null));
+            }
+
+            if (!randomAccess
+                || (hasVps && hasSps && hasPps)
+                || _cachedHevcVps == null
+                || _cachedHevcSps == null
+                || _cachedHevcPps == null)
+            {
+                return payload;
+            }
+
+            return PrependParameterSets(payload, _cachedHevcVps, _cachedHevcSps, _cachedHevcPps);
+        }
+
+        private static List<AnnexBNalUnit> ParseAnnexBNalUnits(byte[] payload, bool hevc)
+        {
+            var units = new List<AnnexBNalUnit>();
+            if (payload == null || payload.Length < 4)
+            {
+                return units;
+            }
+
+            var searchOffset = 0;
+            while (TryFindAnnexBStartCode(payload, searchOffset, out var startOffset, out var startCodeLength))
+            {
+                var headerOffset = startOffset + startCodeLength;
+                if (headerOffset >= payload.Length)
+                {
+                    break;
+                }
+
+                var nextSearchOffset = headerOffset + 1;
+                var hasNext = TryFindAnnexBStartCode(payload, nextSearchOffset, out var nextOffset, out _);
+                var endOffset = hasNext ? nextOffset : payload.Length;
+                var type = hevc ? (payload[headerOffset] >> 1) & 0x3F : payload[headerOffset] & 0x1F;
+                units.Add(new AnnexBNalUnit(startOffset, endOffset - startOffset, type));
+
+                if (!hasNext)
+                {
+                    break;
+                }
+
+                searchOffset = nextOffset;
+            }
+
+            return units;
+        }
+
+        private static bool TryFindAnnexBStartCode(byte[] payload, int start, out int offset, out int length)
+        {
+            offset = -1;
+            length = 0;
+            if (payload == null)
+            {
+                return false;
+            }
+
+            for (var i = Math.Max(0, start); i + 3 < payload.Length; i++)
+            {
+                if (payload[i] != 0x00 || payload[i + 1] != 0x00)
+                {
+                    continue;
+                }
+
+                if (payload[i + 2] == 0x01)
+                {
+                    offset = i;
+                    length = 3;
+                    return true;
+                }
+
+                if (i + 3 < payload.Length && payload[i + 2] == 0x00 && payload[i + 3] == 0x01)
+                {
+                    offset = i;
+                    length = 4;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static byte[] CopyNalUnit(byte[] payload, AnnexBNalUnit unit)
+        {
+            var result = new byte[unit.Length];
+            Buffer.BlockCopy(payload, unit.Offset, result, 0, unit.Length);
+            return result;
+        }
+
+        private static byte[] PrependParameterSets(byte[] payload, params byte[][] parameterSets)
+        {
+            var prefixLength = parameterSets.Where(i => i != null && i.Length > 0).Sum(i => i.Length);
+            if (prefixLength == 0)
+            {
+                return payload;
+            }
+
+            var result = new byte[prefixLength + payload.Length];
+            var offset = 0;
+            foreach (var parameterSet in parameterSets)
+            {
+                if (parameterSet == null || parameterSet.Length == 0)
+                {
+                    continue;
+                }
+
+                Buffer.BlockCopy(parameterSet, 0, result, offset, parameterSet.Length);
+                offset += parameterSet.Length;
+            }
+
+            Buffer.BlockCopy(payload, 0, result, offset, payload.Length);
+            return result;
+        }
+
+        private void RecordMuxPacket(
+            int streamIndex,
+            byte[] payload,
+            long? pts,
+            long? dts,
+            long? duration,
+            char frameType,
+            bool randomAccess)
         {
             if (payload == null)
             {
@@ -1421,6 +2003,11 @@ namespace TVHeadEnd
                 isFirstPacket = previousCount == 0;
                 _muxPacketCounts[streamIndex] = packetCount;
                 _muxPacketBytes[streamIndex] = byteCount;
+                if (randomAccess)
+                {
+                    _muxKeyFrameCounts.TryGetValue(streamIndex, out var previousKeyFrames);
+                    _muxKeyFrameCounts[streamIndex] = previousKeyFrames + 1;
+                }
 
                 if ((now - _lastMuxPacketStatsLogUtc).TotalSeconds >= MuxPacketStatsIntervalSeconds)
                 {
@@ -1432,11 +2019,14 @@ namespace TVHeadEnd
             if (isFirstPacket)
             {
                 _logger.LogInformation(
-                    "HTSP first mux packet for stream {Stream}: payload={PayloadBytes} bytes, pts={Pts}, dts={Dts}, firstBytes={FirstBytes}",
+                    "HTSP first mux packet for stream {Stream}: payload={PayloadBytes} bytes, pts={Pts}, dts={Dts}, duration={Duration}, frametype={FrameType}, randomAccess={RandomAccess}, firstBytes={FirstBytes}",
                     DescribeMuxPacketStream(streamIndex, streamInfo),
                     payload.Length,
                     pts.HasValue ? pts.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
                     dts.HasValue ? dts.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
+                    duration.HasValue ? duration.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null",
+                    frameType == '\0' ? "_" : frameType.ToString(),
+                    randomAccess,
                     FormatFirstBytes(payload, 16));
 
                 LogAacTransport(streamIndex, streamInfo, payload);
@@ -1545,10 +2135,12 @@ namespace TVHeadEnd
                 _muxedStreamsByIndex.TryGetValue(i, out var streamInfo);
                 _muxPacketCounts.TryGetValue(i, out var packetCount);
                 _muxPacketBytes.TryGetValue(i, out var byteCount);
+                _muxKeyFrameCounts.TryGetValue(i, out var keyFrameCount);
                 var timestampFixes = streamInfo?.TimestampCorrectionCount ?? 0;
                 return DescribeMuxPacketStream(i, streamInfo)
                     + ": packets=" + packetCount
                     + ", bytes=" + byteCount
+                    + (keyFrameCount > 0 ? ", randomAccess=" + keyFrameCount : string.Empty)
                     + (timestampFixes > 0 ? ", timestampFixes=" + timestampFixes : string.Empty);
             }));
         }
@@ -1651,16 +2243,37 @@ namespace TVHeadEnd
                 .Where(i => !ShouldMuxHtspTransportStream(i))
                 .ToList();
 
+            var previousMetadataSubscriptionId = Interlocked.Exchange(ref _lastMetadataSubscriptionId, _subscriptionId);
+            var sourceDiscontinuity = previousMetadataSubscriptionId != 0
+                && previousMetadataSubscriptionId != _subscriptionId;
             _ignoredMuxStreams.Clear();
             ResetMuxPacketStats(muxStreams);
-            _muxer.SetStreams(muxStreams);
+            var layoutChanged = _muxer.SetStreams(muxStreams, sourceDiscontinuity);
+            // SetStreams classifies the shared StreamInfo objects and assigns their
+            // MPEG-TS kind/PID. Resolve the primary video only after that step;
+            // before configuration every StreamInfo.Kind is still its default.
+            _primaryVideoStreamIndex = muxStreams
+                .FirstOrDefault(i => i.Kind == HtspTransportStreamMuxer.ElementaryStreamKind.Video)
+                ?.Index;
+            if (sourceDiscontinuity || layoutChanged)
+            {
+                // Never inject parameter sets cached from a previous upstream
+                // subscription after reconnect. Tvheadend normts should provide a
+                // fresh decoder bootstrap; waiting for it is safer than mixing SPS/
+                // PPS/VPS from a previous encoder state into the new timeline.
+                ResetStartupCacheForNewSubscription(clearParameterSets: true);
+            }
+
             UpdateMediaSourceStreamMetadata(muxStreams);
             LogDvbSubtitlePageIds(muxStreams);
             LogSourceInfo(response);
             _logger.LogInformation(
-                "HTSP stream metadata received: {TotalCount} stream(s), muxing {MuxedCount} player-selectable/non-CA stream(s): {StreamSummary}",
+                "HTSP stream metadata received: {TotalCount} stream(s), muxing {MuxedCount} player-selectable/non-CA stream(s), PMT version {PmtVersion}, layoutChanged={LayoutChanged}, sourceDiscontinuity={SourceDiscontinuity}: {StreamSummary}",
                 orderedStreams.Count,
                 _muxer.SupportedStreamCount,
+                _muxer.PmtVersion,
+                layoutChanged,
+                sourceDiscontinuity,
                 _muxer.StreamSummary);
 
             if (droppedStreams.Count > 0)
@@ -1671,12 +2284,86 @@ namespace TVHeadEnd
                     string.Join(", ", droppedStreams.Select(DescribeHtspStream)));
             }
 
+            RequestControlStreamFilter(droppedStreams);
+
             if (muxStreams.Count > 0 && _muxer.SupportedStreamCount != muxStreams.Count)
             {
                 _logger.LogWarning(
                     "HTSP stream metadata selected {MuxCandidateCount} stream(s) for MPEG-TS, but only {MuxedCount} could be routed into MPEG-TS.",
                     muxStreams.Count,
                     _muxer.SupportedStreamCount);
+            }
+        }
+
+        private void RequestControlStreamFilter(IReadOnlyCollection<HtspTransportStreamMuxer.StreamInfo> droppedStreams)
+        {
+            if (!(Plugin.Instance?.Configuration?.HTSPFilterControlStreams ?? false)
+                || droppedStreams == null
+                || droppedStreams.Count == 0
+                || Volatile.Read(ref _lastFilteredSubscriptionId) == _subscriptionId)
+            {
+                return;
+            }
+
+            var indexes = droppedStreams
+                .Where(IsPrivateOrControlHtspStream)
+                .Select(i => i.Index)
+                .Distinct()
+                .OrderBy(i => i)
+                .ToList();
+            if (indexes.Count == 0)
+            {
+                return;
+            }
+
+            HTSConnectionAsync connection;
+            lock (_connectionStateLock)
+            {
+                connection = _connection;
+            }
+
+            if (connection == null || connection.getNegotiatedProtocolVersion() < 12)
+            {
+                return;
+            }
+
+            var request = new HTSMessage { Method = "subscriptionFilterStream" };
+            request.putField("subscriptionId", _subscriptionId);
+            request.putField("disable", indexes.Select(i => (int?)i).ToList());
+            var filteredSubscriptionId = _subscriptionId;
+            Interlocked.Exchange(ref _lastFilteredSubscriptionId, filteredSubscriptionId);
+
+            try
+            {
+                connection.sendMessage(
+                    request,
+                    new CallbackResponseHandler(response =>
+                    {
+                        try
+                        {
+                            ThrowIfResponseError(response, "subscriptionFilterStream");
+                            _logger.LogInformation(
+                                "HTSP subscription {SubscriptionId} disabled upstream CA/control/data stream indexes: {Indexes}",
+                                filteredSubscriptionId,
+                                string.Join(",", indexes));
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.CompareExchange(ref _lastFilteredSubscriptionId, 0, filteredSubscriptionId);
+                            _logger.LogWarning(
+                                ex,
+                                "HTSP subscriptionFilterStream failed for subscription {SubscriptionId}; local MPEG-TS filtering remains active",
+                                filteredSubscriptionId);
+                        }
+                    }));
+            }
+            catch (Exception ex)
+            {
+                Interlocked.CompareExchange(ref _lastFilteredSubscriptionId, 0, filteredSubscriptionId);
+                _logger.LogWarning(
+                    ex,
+                    "Could not send HTSP subscriptionFilterStream for subscription {SubscriptionId}; local MPEG-TS filtering remains active",
+                    filteredSubscriptionId);
             }
         }
 
@@ -1748,6 +2435,7 @@ namespace TVHeadEnd
                 _muxedStreamsByIndex.Clear();
                 _muxPacketCounts.Clear();
                 _muxPacketBytes.Clear();
+                _muxKeyFrameCounts.Clear();
                 _lastMuxPacketStatsLogUtc = DateTime.UtcNow;
 
                 foreach (var stream in streams ?? Array.Empty<HtspTransportStreamMuxer.StreamInfo>())
@@ -2229,23 +2917,57 @@ namespace TVHeadEnd
             return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
         }
 
+        private void ResetQueueDiagnostics()
+        {
+            Interlocked.Exchange(ref _lastQueueIdrops, 0);
+            Interlocked.Exchange(ref _lastQueuePdrops, 0);
+            Interlocked.Exchange(ref _lastQueueBdrops, 0);
+        }
+
         private void LogQueueStatus(HTSMessage response)
         {
-            var idrops = GetInt(response, "Idrops", 0);
-            var pdrops = GetInt(response, "Pdrops", 0);
-            var bdrops = GetInt(response, "Bdrops", 0);
-            var logLevel = idrops > 0 || pdrops > 0 || bdrops > 0 ? LogLevel.Warning : LogLevel.Trace;
+            var idrops = GetLong(response, "Idrops", 0);
+            var pdrops = GetLong(response, "Pdrops", 0);
+            var bdrops = GetLong(response, "Bdrops", 0);
+            var previousIdrops = Interlocked.Exchange(ref _lastQueueIdrops, idrops);
+            var previousPdrops = Interlocked.Exchange(ref _lastQueuePdrops, pdrops);
+            var previousBdrops = Interlocked.Exchange(ref _lastQueueBdrops, bdrops);
+            var deltaIdrops = idrops >= previousIdrops ? idrops - previousIdrops : idrops;
+            var deltaPdrops = pdrops >= previousPdrops ? pdrops - previousPdrops : pdrops;
+            var deltaBdrops = bdrops >= previousBdrops ? bdrops - previousBdrops : bdrops;
+            var packets = GetLong(response, "packets", 0);
+            var bytes = GetLong(response, "bytes", 0);
+            var delay = GetLong(response, "delay", 0);
+            var queueDepth = GetConfiguredQueueDepth();
 
-            _logger.Log(
-                logLevel,
-                "HTSP queue {SubscriptionId}: packets={Packets}, bytes={Bytes}, delay={Delay}us, drops I/P/B={Idrops}/{Pdrops}/{Bdrops}",
+            if (deltaIdrops > 0 || deltaPdrops > 0 || deltaBdrops > 0)
+            {
+                _logger.LogWarning(
+                    "HTSP queue {SubscriptionId} dropped new frames I/P/B={DeltaIdrops}/{DeltaPdrops}/{DeltaBdrops}; totals={Idrops}/{Pdrops}/{Bdrops}, packets={Packets}, bytes={Bytes}, delay={Delay}us, requestedQueueDepth={QueueDepth}",
+                    _subscriptionId,
+                    deltaIdrops,
+                    deltaPdrops,
+                    deltaBdrops,
+                    idrops,
+                    pdrops,
+                    bdrops,
+                    packets,
+                    bytes,
+                    delay,
+                    queueDepth);
+                return;
+            }
+
+            _logger.LogTrace(
+                "HTSP queue {SubscriptionId}: packets={Packets}, bytes={Bytes}, delay={Delay}us, drops I/P/B={Idrops}/{Pdrops}/{Bdrops}, requestedQueueDepth={QueueDepth}",
                 _subscriptionId,
-                GetInt(response, "packets", 0),
-                GetInt(response, "bytes", 0),
-                GetLong(response, "delay", 0),
+                packets,
+                bytes,
+                delay,
                 idrops,
                 pdrops,
-                bdrops);
+                bdrops,
+                queueDepth);
         }
 
         private void LogSignalStatus(HTSMessage response)
@@ -2323,7 +3045,7 @@ namespace TVHeadEnd
             }
         }
 
-        private void WriteOutput(byte[] chunk)
+        private void WriteOutput(byte[] chunk, bool randomAccess = false, bool forceBootstrapReady = false)
         {
             if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
             {
@@ -2331,9 +3053,11 @@ namespace TVHeadEnd
             }
 
             _started = true;
-            BroadcastOutput(chunk);
-            _firstPacket.TrySetResult(true);
-            GetConnectionFirstPacketTaskSource().TrySetResult(true);
+            var bootstrapReady = BroadcastOutput(chunk, randomAccess, forceBootstrapReady);
+            if (forceBootstrapReady || !_primaryVideoStreamIndex.HasValue || bootstrapReady)
+            {
+                _firstPacket.TrySetResult(true);
+            }
         }
 
         private void CompleteWithError(Exception ex)
@@ -2345,6 +3069,7 @@ namespace TVHeadEnd
 
             _closing = true;
             _lifetimeCancellationTokenSource.Cancel();
+            CancelStallWatchdog();
             CompleteAllConsumerQueues();
             _stream.Complete(ex);
             CloseCurrentConnection(unsubscribe: true);
@@ -2555,6 +3280,37 @@ namespace TVHeadEnd
             }
 
             return true;
+        }
+
+        private sealed class AnnexBNalUnit
+        {
+            public AnnexBNalUnit(int offset, int length, int type)
+            {
+                Offset = offset;
+                Length = length;
+                Type = type;
+            }
+
+            public int Offset { get; }
+
+            public int Length { get; }
+
+            public int Type { get; }
+        }
+
+        private sealed class CallbackResponseHandler : HTSResponseHandler
+        {
+            private readonly Action<HTSMessage> _callback;
+
+            public CallbackResponseHandler(Action<HTSMessage> callback)
+            {
+                _callback = callback;
+            }
+
+            public void handleResponse(HTSMessage response)
+            {
+                _callback?.Invoke(response);
+            }
         }
 
         private sealed class TaskResponseHandler : HTSResponseHandler

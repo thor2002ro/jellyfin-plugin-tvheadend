@@ -1,33 +1,225 @@
 ﻿<div id="TVHclientConfigurationPage" data-role="page" class="page type-interior pluginConfigurationPage" data-controller="__plugin/tvheadendjs">
     <style>
+        #TVHclientConfigurationPage {
+            --tvh-radius: .7em;
+            --tvh-radius-small: .48em;
+            --tvh-surface: rgba(128,128,128,.08);
+            --tvh-surface-strong: rgba(128,128,128,.13);
+            --tvh-border: rgba(128,128,128,.28);
+            --tvh-divider: rgba(128,128,128,.22);
+            --tvh-focus: currentColor;
+        }
+        @supports (background: color-mix(in srgb, currentColor 10%, transparent)) {
+            #TVHclientConfigurationPage {
+                --tvh-surface: color-mix(in srgb, currentColor 6%, transparent);
+                --tvh-surface-strong: color-mix(in srgb, currentColor 10%, transparent);
+                --tvh-border: color-mix(in srgb, currentColor 24%, transparent);
+                --tvh-divider: color-mix(in srgb, currentColor 18%, transparent);
+            }
+        }
+        #TVHclientConfigurationPage *,
+        #TVHclientConfigurationPage *::before,
+        #TVHclientConfigurationPage *::after { box-sizing: border-box; }
+        #TVHclientConfigurationPage .content-primary,
+        #TVHclientConfigurationPage .TVHclientConfigurationForm { min-width: 0; }
         #TVHclientConfigurationPage .tvhPageHeader { margin-bottom: 1.4em; }
         #TVHclientConfigurationPage .tvhPageHeader h2 { margin-bottom: .25em; }
         #TVHclientConfigurationPage .tvhMuted { opacity: .72; }
-        #TVHclientConfigurationPage .tvhGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 1em; }
-        #TVHclientConfigurationPage .tvhCard { padding: 1.1em; border-radius: .45em; background: rgba(255,255,255,.055); }
+        #TVHclientConfigurationPage .tvhGrid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr));
+            gap: 1em;
+            min-width: 0;
+        }
+        #TVHclientConfigurationPage .tvhGrid > *,
+        #TVHclientConfigurationPage .tvhStatusSummary > * { min-width: 0; }
+        #TVHclientConfigurationPage .tvhCard,
+        #TVHclientConfigurationPage .tvhMetric,
+        #TVHclientConfigurationPage .tvhProducer,
+        #TVHclientConfigurationPage .tvhEmpty {
+            background: var(--tvh-surface);
+            border: 1px solid var(--tvh-border);
+            box-shadow: 0 .08em .22em rgba(0,0,0,.08);
+        }
+        #TVHclientConfigurationPage .tvhCard { padding: 1.1em; border-radius: var(--tvh-radius); }
         #TVHclientConfigurationPage .tvhCard h3 { margin: 0 0 .9em; }
-        #TVHclientConfigurationPage .tvhSection { margin: 0 0 1em; border-radius: .45em; background: rgba(255,255,255,.045); }
-        #TVHclientConfigurationPage .tvhSection > summary { cursor: pointer; padding: 1em 1.1em; font-size: 1.08em; font-weight: 600; }
-        #TVHclientConfigurationPage .tvhSectionBody { padding: 0 1.1em 1.1em; }
-        #TVHclientConfigurationPage .tvhStatusHeader { display:flex; align-items:center; justify-content:space-between; gap:1em; margin: 2em 0 .8em; }
-        #TVHclientConfigurationPage .tvhStatusHeader h2 { margin:0; }
-        #TVHclientConfigurationPage .tvhStatusSummary { display:grid; grid-template-columns: repeat(auto-fit,minmax(145px,1fr)); gap:.7em; margin-bottom:1em; }
-        #TVHclientConfigurationPage .tvhMetric { padding:.8em; border-radius:.4em; background:rgba(255,255,255,.055); }
-        #TVHclientConfigurationPage .tvhMetricLabel { display:block; opacity:.7; font-size:.86em; }
-        #TVHclientConfigurationPage .tvhMetricValue { display:block; margin-top:.2em; font-size:1.15em; font-weight:600; overflow-wrap:anywhere; }
-        #TVHclientConfigurationPage .tvhProducer { padding:1em; border-radius:.45em; background:rgba(255,255,255,.055); margin-bottom:1em; }
-        #TVHclientConfigurationPage .tvhProducerTitle { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:.6em; margin-bottom:.8em; }
-        #TVHclientConfigurationPage .tvhProducerTitle h3 { margin:0; }
-        #TVHclientConfigurationPage .tvhBadge { display:inline-block; padding:.2em .55em; border-radius:1em; background:rgba(255,255,255,.11); font-size:.82em; }
-        #TVHclientConfigurationPage .tvhBadgeGood { background:rgba(60,180,90,.24); }
-        #TVHclientConfigurationPage .tvhBadgeWarn { background:rgba(230,150,40,.25); }
-        #TVHclientConfigurationPage .tvhBadgeBad { background:rgba(220,65,65,.25); }
-        #TVHclientConfigurationPage .tvhTableWrap { overflow-x:auto; margin-top:.8em; }
-        #TVHclientConfigurationPage .tvhTable { width:100%; border-collapse:collapse; font-size:.92em; }
-        #TVHclientConfigurationPage .tvhTable th, #TVHclientConfigurationPage .tvhTable td { text-align:left; padding:.48em .55em; border-bottom:1px solid rgba(255,255,255,.09); white-space:nowrap; }
-        #TVHclientConfigurationPage .tvhEmpty { padding:1.2em; border-radius:.45em; background:rgba(255,255,255,.04); text-align:center; }
-        #TVHclientConfigurationPage .tvhInlineButtons { display:flex; flex-wrap:wrap; gap:.6em; }
-        #TVHclientConfigurationPage .tvhDependentDisabled { opacity:.48; }
+        #TVHclientConfigurationPage .tvhSection {
+            margin: 0 0 1em;
+            border: 1px solid var(--tvh-border);
+            border-radius: var(--tvh-radius);
+            background: var(--tvh-surface);
+            overflow: clip;
+        }
+        #TVHclientConfigurationPage .tvhSection > summary,
+        #TVHclientConfigurationPage .tvhProducer details > summary {
+            cursor: pointer;
+            overflow-wrap: anywhere;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+        }
+        #TVHclientConfigurationPage .tvhSection > summary {
+            padding: 1em 1.1em;
+            font-size: 1.08em;
+            font-weight: 600;
+            background: var(--tvh-surface-strong);
+        }
+        #TVHclientConfigurationPage .tvhSection > summary:hover,
+        #TVHclientConfigurationPage .tvhProducer details > summary:hover { filter: brightness(1.08); }
+        #TVHclientConfigurationPage .tvhSection > summary:focus-visible,
+        #TVHclientConfigurationPage .tvhProducer details > summary:focus-visible,
+        #TVHclientConfigurationPage #btnRefreshStatus:focus-visible,
+        #TVHclientConfigurationPage .tvhTableWrap:focus-visible {
+            outline: 2px solid var(--tvh-focus);
+            outline-offset: 2px;
+        }
+        #TVHclientConfigurationPage .tvhSectionBody { padding: 1em 1.1em 1.1em; }
+        #TVHclientConfigurationPage .tvhStatusHeader {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: .8em 1em;
+            margin: 2em 0 .8em;
+            min-width: 0;
+        }
+        #TVHclientConfigurationPage .tvhStatusHeader > * { min-width: 0; }
+        #TVHclientConfigurationPage .tvhStatusHeader h2 { margin: 0; }
+        #TVHclientConfigurationPage .tvhStatusSummary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 145px), 1fr));
+            gap: .7em;
+            margin-bottom: 1em;
+            min-width: 0;
+        }
+        #TVHclientConfigurationPage .tvhMetric {
+            padding: .82em;
+            border-radius: var(--tvh-radius-small);
+            overflow: hidden;
+        }
+        #TVHclientConfigurationPage .tvhMetricLabel { display: block; opacity: .72; font-size: .86em; }
+        #TVHclientConfigurationPage .tvhMetricValue {
+            display: block;
+            margin-top: .2em;
+            font-size: 1.08em;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        #TVHclientConfigurationPage .tvhMeter {
+            height: .42em;
+            margin-top: .55em;
+            border-radius: 999px;
+            overflow: hidden;
+            background: var(--tvh-divider);
+        }
+        #TVHclientConfigurationPage .tvhMeterFill {
+            display: block;
+            height: 100%;
+            border-radius: inherit;
+            background: currentColor;
+            opacity: .72;
+            transition: width .25s ease;
+        }
+        #TVHclientConfigurationPage .tvhProducer {
+            padding: 1em;
+            border-radius: var(--tvh-radius);
+            margin-bottom: 1em;
+            min-width: 0;
+        }
+        #TVHclientConfigurationPage .tvhProducerTitle {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: .6em;
+            margin-bottom: .8em;
+            min-width: 0;
+        }
+        #TVHclientConfigurationPage .tvhProducerTitle h3 {
+            margin: 0;
+            min-width: 0;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+        }
+        #TVHclientConfigurationPage .tvhBadgeGroup { display: flex; flex-wrap: wrap; gap: .35em; justify-content: flex-end; }
+        #TVHclientConfigurationPage .tvhBadge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 1.8em;
+            padding: .18em .58em;
+            border: 1px solid var(--tvh-border);
+            border-radius: 999px;
+            background: var(--tvh-surface-strong);
+            font-size: .82em;
+            line-height: 1.2;
+        }
+        #TVHclientConfigurationPage .tvhBadgeGood { background: rgba(46,160,75,.18); border-color: rgba(46,160,75,.48); }
+        #TVHclientConfigurationPage .tvhBadgeWarn { background: rgba(215,135,28,.19); border-color: rgba(215,135,28,.52); }
+        #TVHclientConfigurationPage .tvhBadgeBad { background: rgba(205,55,55,.18); border-color: rgba(205,55,55,.5); }
+        #TVHclientConfigurationPage .tvhTableWrap {
+            max-width: 100%;
+            overflow-x: auto;
+            overscroll-behavior-inline: contain;
+            -webkit-overflow-scrolling: touch;
+            margin-top: .8em;
+            border: 1px solid var(--tvh-border);
+            border-radius: var(--tvh-radius-small);
+        }
+        #TVHclientConfigurationPage .tvhTable { width: 100%; min-width: 650px; border-collapse: collapse; font-size: .92em; }
+        #TVHclientConfigurationPage .tvhTable th,
+        #TVHclientConfigurationPage .tvhTable td {
+            text-align: left;
+            padding: .55em .62em;
+            border-bottom: 1px solid var(--tvh-divider);
+            white-space: nowrap;
+        }
+        #TVHclientConfigurationPage .tvhTable th { background: var(--tvh-surface-strong); font-weight: 600; }
+        #TVHclientConfigurationPage .tvhTable tbody tr:last-child td { border-bottom: 0; }
+        #TVHclientConfigurationPage .tvhTable td:nth-child(5) {
+            max-width: 18em;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        #TVHclientConfigurationPage .tvhEmpty { padding: 1.2em; border-radius: var(--tvh-radius); text-align: center; overflow-wrap: anywhere; }
+        #TVHclientConfigurationPage .tvhInlineButtons { display: flex; flex-wrap: wrap; gap: .6em; }
+        #TVHclientConfigurationPage .tvhDependentDisabled { opacity: .48; }
+        #TVHclientConfigurationPage .tvhExperimental {
+            padding: .8em;
+            border-inline-start: .25em solid rgba(215,135,28,.75);
+            border-radius: var(--tvh-radius-small);
+            background: rgba(215,135,28,.08);
+        }
+        #TVHclientConfigurationPage .tvhSrOnly {
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            padding: 0 !important;
+            margin: -1px !important;
+            overflow: hidden !important;
+            clip: rect(0,0,0,0) !important;
+            white-space: nowrap !important;
+            border: 0 !important;
+        }
+        #TVHclientConfigurationPage [aria-busy="true"] { cursor: progress; }
+        @media (max-width: 600px) {
+            #TVHclientConfigurationPage .tvhSectionBody { padding: .82em; }
+            #TVHclientConfigurationPage .tvhSection > summary { padding: .9em .82em; }
+            #TVHclientConfigurationPage .tvhProducer { padding: .82em; }
+            #TVHclientConfigurationPage .tvhStatusHeader { align-items: stretch; }
+            #TVHclientConfigurationPage .tvhStatusHeader > div:first-child { flex: 1 1 100%; }
+            #TVHclientConfigurationPage .tvhInlineButtons,
+            #TVHclientConfigurationPage #btnRefreshStatus { width: 100%; }
+            #TVHclientConfigurationPage .tvhProducerTitle { display: block; }
+            #TVHclientConfigurationPage .tvhBadgeGroup { justify-content: flex-start; margin-top: .55em; }
+            #TVHclientConfigurationPage .tvhStatusSummary { grid-template-columns: 1fr 1fr; }
+        }
+        @media (max-width: 380px) {
+            #TVHclientConfigurationPage .tvhStatusSummary { grid-template-columns: 1fr; }
+            #TVHclientConfigurationPage .tvhMetricValue { font-size: 1em; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            #TVHclientConfigurationPage .tvhMeterFill { transition: none; }
+        }
     </style>
 
     <div data-role="content">
@@ -97,7 +289,7 @@
                         <div class="inputContainer"><input is="emby-input" type="number" min="0" id="txtPostPadding" label="Post-recording padding (seconds)" /></div>
                         <div class="selectContainer"><select is="emby-select" id="selChannelType" label="Channels tagged Other"><option>TV</option><option>Radio</option><option>Ignore</option></select></div>
                         <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="chkHideRecordingsChannel" /><span>Hide TVHeadend Recordings channel</span></label></div>
-                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkForceDeinterlace" /><span>Force deinterlacing for all channels and recordings</span></label><div class="fieldDescription checkboxFieldDescription">Experimental. Requires a Jellyfin server restart.</div></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription tvhExperimental"><label><input is="emby-checkbox" type="checkbox" id="chkForceDeinterlace" /><span>Force deinterlacing for all channels and recordings</span></label><div class="fieldDescription checkboxFieldDescription">Experimental. Requires a Jellyfin server restart.</div></div>
                     </div>
                 </details>
 
@@ -105,11 +297,11 @@
             </form>
 
             <div class="tvhStatusHeader">
-                <div><h2>Plugin status</h2><div id="statusUpdated" class="tvhMuted">Loading runtime information…</div></div>
-                <div class="tvhInlineButtons"><button is="emby-button" type="button" id="btnRefreshStatus" class="raised"><span>Refresh</span></button></div>
+                <div><h2>Plugin status</h2><div id="statusUpdated" class="tvhMuted">Loading runtime information…</div><div id="statusAnnouncer" class="tvhSrOnly" role="status" aria-live="polite" aria-atomic="true"></div></div>
+                <div class="tvhInlineButtons"><button is="emby-button" type="button" id="btnRefreshStatus" class="raised" aria-controls="statusSummary activeTuners"><span>Refresh</span></button></div>
             </div>
-            <div id="statusSummary" class="tvhStatusSummary"></div>
-            <div id="activeTuners"><div class="tvhEmpty">Loading active tuners…</div></div>
+            <div id="statusSummary" class="tvhStatusSummary" aria-label="Plugin runtime summary"></div>
+            <div id="activeTuners" aria-busy="true"><div class="tvhEmpty">Loading active tuners…</div></div>
         </div>
     </div>
 </div>

@@ -4,6 +4,7 @@
 
 export default function (view, params) {
     let statusTimer = null;
+    let statusRequestInFlight = null;
 
     function getStreamingMethod(config) {
         if (config.StreamingMethod) return config.StreamingMethod;
@@ -50,6 +51,24 @@ export default function (view, params) {
         return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span></div>`;
     }
 
+    function signalMetric(label, percent, raw) {
+        const numericPercent = percent == null ? null : Math.max(0, Math.min(100, Number(percent)));
+        const meter = numericPercent == null ? '' : `<div class="tvhMeter" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${numericPercent.toFixed(1)}"><span class="tvhMeterFill" style="width:${numericPercent.toFixed(1)}%"></span></div>`;
+        return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(formatPercent(percent, raw))}</span>${meter}</div>`;
+    }
+
+    function setRefreshState(page, busy) {
+        const button = page.querySelector('#btnRefreshStatus');
+        const label = button ? button.querySelector('span') : null;
+        const tuners = page.querySelector('#activeTuners');
+        if (button) {
+            button.disabled = busy;
+            button.setAttribute('aria-busy', busy ? 'true' : 'false');
+        }
+        if (label) label.textContent = busy ? 'Refreshing…' : 'Refresh';
+        if (tuners) tuners.setAttribute('aria-busy', busy ? 'true' : 'false');
+    }
+
     function updateDependentState(page) {
         const recoveryEnabled = page.querySelector('#chkHTSPSignalRecoveryEnabled').checked;
         const recovery = page.querySelector('#signalRecoverySettings');
@@ -74,9 +93,11 @@ export default function (view, params) {
         const container = page.querySelector('#activeTuners');
         if (!producers.length) {
             container.innerHTML = '<div class="tvhEmpty">No active HTSP tuner subscriptions. Start a live channel to populate runtime signal and stream statistics.</div>';
+            container.setAttribute('aria-busy', 'false');
             return;
         }
 
+        container.setAttribute('aria-busy', 'false');
         container.innerHTML = producers.map(producer => {
             const drops = Number(producer.QueueIDrops || 0) + Number(producer.QueuePDrops || 0) + Number(producer.QueueBDrops || 0);
             const lockClass = producer.HasLock ? 'tvhBadgeGood' : 'tvhBadgeBad';
@@ -90,13 +111,13 @@ export default function (view, params) {
 
             return `<section class="tvhProducer">
                 <div class="tvhProducerTitle"><h3>${escapeHtml(producer.Service || `Channel ${producer.ChannelId}`)}</h3>
-                    <div><span class="tvhBadge ${stateClass}">${escapeHtml(producer.State || 'unknown')}</span> <span class="tvhBadge ${lockClass}">${producer.HasLock ? 'LOCK' : 'NO LOCK'}</span>${producer.AwaitingCleanVideo ? ' <span class="tvhBadge tvhBadgeWarn">waiting for clean video</span>' : ''}</div>
+                    <div class="tvhBadgeGroup"><span class="tvhBadge ${stateClass}">${escapeHtml(producer.State || 'unknown')}</span><span class="tvhBadge ${lockClass}">${producer.HasLock ? 'LOCK' : 'NO LOCK'}</span>${producer.AwaitingCleanVideo ? '<span class="tvhBadge tvhBadgeWarn">waiting for clean video</span>' : ''}</div>
                 </div>
                 <div class="tvhStatusSummary">
                     ${metric('Adapter', producer.Adapter || '—')}
                     ${metric('Network / mux', [producer.Network, producer.Mux].filter(Boolean).join(' · ') || '—')}
-                    ${metric('Signal', formatPercent(producer.SignalPercent, producer.SignalRaw))}
-                    ${metric('SNR', formatPercent(producer.SnrPercent, producer.SnrRaw))}
+                    ${signalMetric('Signal', producer.SignalPercent, producer.SignalRaw)}
+                    ${signalMetric('SNR', producer.SnrPercent, producer.SnrRaw)}
                     ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`)}
                     ${metric('Queue drops I/P/B', `${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)}`)}
                     ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`)}
@@ -107,22 +128,36 @@ export default function (view, params) {
                     ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${escapeHtml(producer.ChannelId || '')}`)}
                 </div>
                 <details><summary>Stream statistics (${(producer.Streams || []).length})</summary>
-                    <div class="tvhTableWrap"><table class="tvhTable"><thead><tr><th>Index</th><th>PID</th><th>Codec</th><th>Language</th><th>Title</th><th>Packets</th><th>Bytes</th><th>Keyframes</th></tr></thead><tbody>${streamRows}</tbody></table></div>
+                    <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(producer.Service || `channel ${producer.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet and keyframe statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th></tr></thead><tbody>${streamRows}</tbody></table></div>
                 </details>
             </section>`;
         }).join('');
     }
 
     function loadStatus(page, showLoading) {
-        if (showLoading) page.querySelector('#statusUpdated').textContent = 'Refreshing runtime information…';
-        return ApiClient.ajax({
+        if (statusRequestInFlight) return statusRequestInFlight;
+        const announcer = page.querySelector('#statusAnnouncer');
+        if (showLoading) {
+            page.querySelector('#statusUpdated').textContent = 'Refreshing runtime information…';
+            if (announcer) announcer.textContent = 'Refreshing TVHeadend runtime information.';
+        }
+        setRefreshState(page, true);
+        statusRequestInFlight = ApiClient.ajax({
             type: 'GET',
             url: ApiClient.getUrl('TVHeadEnd/Status'),
             dataType: 'json'
-        }).then(status => renderStatus(page, status)).catch(error => {
+        }).then(status => {
+            renderStatus(page, status);
+            if (showLoading && announcer) announcer.textContent = 'TVHeadend runtime information refreshed.';
+        }).catch(error => {
             page.querySelector('#statusUpdated').textContent = 'Unable to load runtime status';
-            page.querySelector('#activeTuners').innerHTML = `<div class="tvhEmpty">Status endpoint failed: ${escapeHtml(error && error.message ? error.message : 'unknown error')}</div>`;
+            if (announcer) announcer.textContent = 'Unable to load TVHeadend runtime status.';
+            page.querySelector('#activeTuners').innerHTML = `<div class="tvhEmpty" role="alert">Status endpoint failed: ${escapeHtml(error && error.message ? error.message : 'unknown error')}</div>`;
+        }).finally(() => {
+            statusRequestInFlight = null;
+            setRefreshState(page, false);
         });
+        return statusRequestInFlight;
     }
 
     function startStatusPolling(page) {

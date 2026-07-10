@@ -12,6 +12,7 @@ namespace TVHeadEnd
         private const int PmtPid = 0x100;
         private const int FirstElementaryPid = 0x101;
         private const int RepeatTablesEveryPesPackets = 4;
+        private const long MaxAudioTimestampRegression90Khz = 9000; // 100 ms
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
@@ -55,6 +56,10 @@ namespace TVHeadEnd
                 .Where(i => i != null)
                 .OrderBy(i => i.Index))
             {
+                stream.LastPts90Khz = null;
+                stream.LastDts90Khz = null;
+                stream.TimestampCorrectionCount = 0;
+
                 if (!TryConfigureStream(stream))
                 {
                     continue;
@@ -99,11 +104,6 @@ namespace TVHeadEnd
 
             var tsDts = ToTsTimestamp(dts);
             var tsPts = ToTsTimestamp(pts);
-            var effectiveClock = tsDts ?? tsPts;
-            if (effectiveClock.HasValue)
-            {
-                _lastMuxClock = effectiveClock.Value;
-            }
 
             if (IsDvbSubtitleCodec(stream.Codec) && !tsPts.HasValue && _lastMuxClock.HasValue)
             {
@@ -114,6 +114,14 @@ namespace TVHeadEnd
                 tsPts = _lastMuxClock.Value;
             }
 
+            NormalizeAudioTimestamps(stream, ref tsPts, ref tsDts);
+
+            var effectiveClock = tsDts ?? tsPts;
+            if (effectiveClock.HasValue)
+            {
+                _lastMuxClock = effectiveClock.Value;
+            }
+
             var pesPayload = PreparePayloadForPes(stream, payload);
             var dataAligned = stream.Kind == ElementaryStreamKind.Video || IsDvbSubtitleCodec(stream.Codec);
             var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned);
@@ -121,6 +129,48 @@ namespace TVHeadEnd
             WriteTsPackets(output, stream.Pid, true, pes, pcr);
             _packetsSinceTables++;
             return output.ToArray();
+        }
+
+        private static void NormalizeAudioTimestamps(StreamInfo stream, ref long? pts, ref long? dts)
+        {
+            if (stream == null || stream.Kind != ElementaryStreamKind.Audio)
+            {
+                return;
+            }
+
+            var corrected = false;
+            pts = ClampSmallTimestampRegression(pts, ref stream.LastPts90Khz, ref corrected);
+            dts = ClampSmallTimestampRegression(dts, ref stream.LastDts90Khz, ref corrected);
+
+            if (corrected)
+            {
+                stream.TimestampCorrectionCount++;
+            }
+        }
+
+        private static long? ClampSmallTimestampRegression(long? timestamp, ref long? previousTimestamp, ref bool corrected)
+        {
+            if (!timestamp.HasValue)
+            {
+                return null;
+            }
+
+            var value = timestamp.Value;
+            if (previousTimestamp.HasValue && value <= previousTimestamp.Value)
+            {
+                var regression = previousTimestamp.Value - value;
+                if (regression <= MaxAudioTimestampRegression90Khz)
+                {
+                    // FFmpeg performs the same minimal repair at the output muxer.
+                    // Do it at the HTSP->TS boundary so the decoded/transcoded audio
+                    // timeline is already monotonic and avoids libfdk_aac warnings.
+                    value = previousTimestamp.Value + 1;
+                    corrected = true;
+                }
+            }
+
+            previousTimestamp = value;
+            return value;
         }
 
         private bool TryConfigureStream(StreamInfo stream)
@@ -773,6 +823,8 @@ namespace TVHeadEnd
 
             public string Language { get; set; }
 
+            public string DisplayName { get; set; }
+
             public byte[] Meta { get; set; }
 
             public int Width { get; set; }
@@ -804,6 +856,12 @@ namespace TVHeadEnd
             internal bool IsFallbackPrivateData { get; set; }
 
             internal string StreamTypeDescription { get; set; }
+
+            internal long? LastPts90Khz;
+
+            internal long? LastDts90Khz;
+
+            internal long TimestampCorrectionCount;
         }
     }
 }

@@ -1,111 +1,115 @@
 ﻿<div id="TVHclientConfigurationPage" data-role="page" class="page type-interior pluginConfigurationPage" data-controller="__plugin/tvheadendjs">
+    <style>
+        #TVHclientConfigurationPage .tvhPageHeader { margin-bottom: 1.4em; }
+        #TVHclientConfigurationPage .tvhPageHeader h2 { margin-bottom: .25em; }
+        #TVHclientConfigurationPage .tvhMuted { opacity: .72; }
+        #TVHclientConfigurationPage .tvhGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 1em; }
+        #TVHclientConfigurationPage .tvhCard { padding: 1.1em; border-radius: .45em; background: rgba(255,255,255,.055); }
+        #TVHclientConfigurationPage .tvhCard h3 { margin: 0 0 .9em; }
+        #TVHclientConfigurationPage .tvhSection { margin: 0 0 1em; border-radius: .45em; background: rgba(255,255,255,.045); }
+        #TVHclientConfigurationPage .tvhSection > summary { cursor: pointer; padding: 1em 1.1em; font-size: 1.08em; font-weight: 600; }
+        #TVHclientConfigurationPage .tvhSectionBody { padding: 0 1.1em 1.1em; }
+        #TVHclientConfigurationPage .tvhStatusHeader { display:flex; align-items:center; justify-content:space-between; gap:1em; margin: 2em 0 .8em; }
+        #TVHclientConfigurationPage .tvhStatusHeader h2 { margin:0; }
+        #TVHclientConfigurationPage .tvhStatusSummary { display:grid; grid-template-columns: repeat(auto-fit,minmax(145px,1fr)); gap:.7em; margin-bottom:1em; }
+        #TVHclientConfigurationPage .tvhMetric { padding:.8em; border-radius:.4em; background:rgba(255,255,255,.055); }
+        #TVHclientConfigurationPage .tvhMetricLabel { display:block; opacity:.7; font-size:.86em; }
+        #TVHclientConfigurationPage .tvhMetricValue { display:block; margin-top:.2em; font-size:1.15em; font-weight:600; overflow-wrap:anywhere; }
+        #TVHclientConfigurationPage .tvhProducer { padding:1em; border-radius:.45em; background:rgba(255,255,255,.055); margin-bottom:1em; }
+        #TVHclientConfigurationPage .tvhProducerTitle { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:.6em; margin-bottom:.8em; }
+        #TVHclientConfigurationPage .tvhProducerTitle h3 { margin:0; }
+        #TVHclientConfigurationPage .tvhBadge { display:inline-block; padding:.2em .55em; border-radius:1em; background:rgba(255,255,255,.11); font-size:.82em; }
+        #TVHclientConfigurationPage .tvhBadgeGood { background:rgba(60,180,90,.24); }
+        #TVHclientConfigurationPage .tvhBadgeWarn { background:rgba(230,150,40,.25); }
+        #TVHclientConfigurationPage .tvhBadgeBad { background:rgba(220,65,65,.25); }
+        #TVHclientConfigurationPage .tvhTableWrap { overflow-x:auto; margin-top:.8em; }
+        #TVHclientConfigurationPage .tvhTable { width:100%; border-collapse:collapse; font-size:.92em; }
+        #TVHclientConfigurationPage .tvhTable th, #TVHclientConfigurationPage .tvhTable td { text-align:left; padding:.48em .55em; border-bottom:1px solid rgba(255,255,255,.09); white-space:nowrap; }
+        #TVHclientConfigurationPage .tvhEmpty { padding:1.2em; border-radius:.45em; background:rgba(255,255,255,.04); text-align:center; }
+        #TVHclientConfigurationPage .tvhInlineButtons { display:flex; flex-wrap:wrap; gap:.6em; }
+        #TVHclientConfigurationPage .tvhDependentDisabled { opacity:.48; }
+    </style>
 
     <div data-role="content">
         <div class="content-primary">
+            <div class="tvhPageHeader">
+                <h2>TVHeadend</h2>
+                <div class="tvhMuted">Live TV connection, HTSP reliability, signal recovery, and active tuner diagnostics.</div>
+            </div>
+
             <form class="TVHclientConfigurationForm">
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtTVH_ServerName" label="TVHeadend Hostname or IP Address" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtHTTP_Port" label="HTTP Port" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtHTSP_Port" label="HTSP Port" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtWebRoot" label="Web Root" />
-                    <div class="fieldDescription">This path will be added to HOSTNAME:PORT on the end of the URL. It should be '/' if you don't have a custom setup.</div>
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtUserName" label="Username" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtPassword" label="Password" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtPriority" label="Priority of Recordings" />
-                    <div class="fieldDescription">0 = Important, 1 = High, 2 = Normal, 3 = Low, 4 = Unimportant</div>
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtProfile" label="Profile for Recordings" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtPrePadding" label="Pre-recording Padding in seconds" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="text" id="txtPostPadding" label="Post-recording Padding in seconds" />
-                </div>
-                <div class="selectContainer">
-                    <select is="emby-select" id="selChannelType" label="Use this channel type for channels tagged with Other">
-                        <option>TV</option>
-                        <option>Radio</option>
-                        <option>Ignore</option>
-                    </select>
-                </div>
-                <div class="checkboxContainer">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkHideRecordingsChannel" />
-                        <span>Hide TVHeadEnd Recordings channel</span>
-                    </label>
-                </div>
-                <div class="selectContainer">
-                    <select is="emby-select" id="selStreamingMethod" label="Streaming Method">
-                        <option value="HttpTicket">HTTP ticket</option>
-                        <option value="HttpBasic">HTTP basic auth</option>
-                        <option value="Htsp">HTSP</option>
-                    </select>
-                    <div class="fieldDescription">HTTP ticket and HTTP basic use TVHeadend HTTP streaming. HTSP uses TVHeadend's native subscription protocol; when HTSP is selected, TVHeadend HTTP fallback is disabled and playback failures are reported as HTSP errors.</div>
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="0" max="20000000" step="100000" id="txtHTSPQueueDepth" label="HTSP queue depth (bytes)" />
-                    <div class="fieldDescription">Tvheadend defaults to 500000 bytes. A conservative 2000000-byte queue reduces I/P/B frame drops without the large per-subscription memory cost of Kodi's 10000000-byte setting. Set 0 to use the Tvheadend default.</div>
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="0" max="120" step="1" id="txtHTSPStallTimeoutSeconds" label="HTSP silent-stream watchdog (seconds)" />
-                    <div class="fieldDescription">Reconnect an active shared HTSP producer if no playable mux packet arrives for this many seconds. Recommended: 15. Set 0 to disable.</div>
-                </div>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkHTSPFilterControlStreams" />
-                        <span>Filter CA/control/data streams upstream over HTSP</span>
-                    </label>
-                    <div class="fieldDescription checkboxFieldDescription">Optional and disabled by default. Uses subscriptionFilterStream on HTSP v12+ and disables only CA/ECM/EMM/PAT/PMT/PCR/private data indexes. Audio, video and subtitle streams remain enabled for player-side selection.</div>
-                </div>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkHTSPSignalRecoveryEnabled" />
-                        <span>Recover automatically from severe tuner signal errors</span>
-                    </label>
-                    <div class="fieldDescription checkboxFieldDescription">Keeps audio/subtitles flowing, drops damaged inter-frame video until a verified IDR/IRAP, and performs bounded HTSP reconnects after sustained lock loss or rapid uncorrected-block growth.</div>
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="1" max="30" step="1" id="txtHTSPSignalLockLossSeconds" label="Signal lock-loss threshold (seconds)" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="1" max="1000" step="1" id="txtHTSPSignalUncBurstThreshold" label="UNC burst threshold (within 5 seconds)" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="1" max="15" step="1" id="txtHTSPSignalIdrWaitSeconds" label="Wait for clean IDR before reconnect (seconds)" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="0" max="10" step="1" id="txtHTSPSignalRecoveryMaxReconnects" label="Maximum signal reconnects per 60 seconds" />
-                </div>
-                <div class="inputContainer">
-                    <input is="emby-input" type="number" min="1" max="300" step="1" id="txtHTSPSignalRecoveryCooldownSeconds" label="Signal reconnect cooldown (seconds)" />
-                </div>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="chkForceDeinterlace" />
-                        <span>Force video deinterlacing for all channels and recordings. (Experimental)</span>
-                    </label>
-                    <div class="fieldDescription checkboxFieldDescription">Note: Changing this requires a server restart.</div>
-                </div>
-                <div>
-                    <button is="emby-button" type="submit" class="raised button-submit block">
-                        <span>Save</span>
-                    </button>
-                </div>
+                <details class="tvhSection" open>
+                    <summary>Connection and authentication</summary>
+                    <div class="tvhSectionBody tvhGrid">
+                        <div class="inputContainer"><input is="emby-input" type="text" id="txtTVH_ServerName" label="TVHeadend hostname or IP address" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="number" min="1" max="65535" id="txtHTTP_Port" label="HTTP port" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="number" min="1" max="65535" id="txtHTSP_Port" label="HTSP port" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="text" id="txtWebRoot" label="Web root" /><div class="fieldDescription">Usually <code>/</code>. Used for TVHeadend HTTP requests.</div></div>
+                        <div class="inputContainer"><input is="emby-input" type="text" id="txtUserName" autocomplete="username" label="Username" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="password" id="txtPassword" autocomplete="current-password" label="Password" /></div>
+                        <div class="selectContainer"><select is="emby-select" id="selStreamingMethod" label="Streaming method"><option value="HttpTicket">HTTP ticket</option><option value="HttpBasic">HTTP basic authentication</option><option value="Htsp">HTSP</option></select><div class="fieldDescription">HTSP uses the native subscription protocol. HTTP fallback remains disabled when HTSP is selected.</div></div>
+                    </div>
+                </details>
+
+                <details class="tvhSection" open>
+                    <summary>HTSP streaming and sharing</summary>
+                    <div class="tvhSectionBody">
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPEnableStreamSharing" /><span>Share one upstream subscription between viewers of the same channel</span></label><div class="fieldDescription checkboxFieldDescription">Reduces tuner use and TVHeadend bandwidth. Each Jellyfin reader still receives an independent buffered stream.</div></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPKeyframeStartupEnabled" /><span>Start new readers at a verified video keyframe</span></label><div class="fieldDescription checkboxFieldDescription">Recommended. Prevents late readers from starting on P/B frames without SPS/PPS/VPS.</div></div>
+                        <div class="tvhGrid">
+                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="20000000" step="100000" id="txtHTSPQueueDepth" label="TVHeadend queue depth (bytes)" /><div class="fieldDescription">Default: 2,000,000. Set 0 to use TVHeadend's default.</div></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="120" step="1" id="txtHTSPStallTimeoutSeconds" label="Silent-stream watchdog (seconds)" /><div class="fieldDescription">Reconnect when the producer receives no playable packets. Set 0 to disable.</div></div>
+                        </div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPFilterControlStreams" /><span>Filter CA/control/data streams upstream</span></label><div class="fieldDescription checkboxFieldDescription">Optional HTSP v12+ optimization. Video, audio, and subtitles are never filtered.</div></div>
+                    </div>
+                </details>
+
+                <details class="tvhSection" open>
+                    <summary>Signal monitoring and automatic recovery</summary>
+                    <div class="tvhSectionBody">
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPSignalHealthLoggingEnabled" /><span>Log meaningful tuner signal changes</span></label><div class="fieldDescription checkboxFieldDescription">Reports lock changes, strength/SNR shifts, BER, and uncorrected-block increases without logging every one-second update.</div></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPSignalRecoveryEnabled" /><span>Recover automatically from severe tuner signal errors</span></label><div class="fieldDescription checkboxFieldDescription">Keeps audio/subtitles flowing, withholds damaged inter-frame video, and resumes at a verified IDR/IRAP.</div></div>
+                        <div id="signalRecoverySettings" class="tvhGrid">
+                            <div class="inputContainer"><input is="emby-input" type="number" min="1" max="30" step="1" id="txtHTSPSignalLockLossSeconds" label="Lock-loss threshold (seconds)" /></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="1" max="1000" step="1" id="txtHTSPSignalUncBurstThreshold" label="UNC burst threshold (5-second window)" /></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="1" max="15" step="1" id="txtHTSPSignalIdrWaitSeconds" label="Clean-keyframe wait before reconnect (seconds)" /></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="10" step="1" id="txtHTSPSignalRecoveryMaxReconnects" label="Maximum signal reconnects per minute" /></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="1" max="300" step="1" id="txtHTSPSignalRecoveryCooldownSeconds" label="Signal reconnect cooldown (seconds)" /></div>
+                        </div>
+                    </div>
+                </details>
+
+                <details class="tvhSection">
+                    <summary>Diagnostics and logging</summary>
+                    <div class="tvhSectionBody">
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPHealthLoggingEnabled" /><span>Write periodic combined HTSP health summaries</span></label><div class="fieldDescription checkboxFieldDescription">Includes signal, queue, reconnect, reader, and per-stream packet statistics.</div></div>
+                        <div class="inputContainer" id="healthIntervalContainer"><input is="emby-input" type="number" min="5" max="600" step="5" id="txtHTSPHealthLogIntervalSeconds" label="Health summary interval (seconds)" /></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPDetailedDiagnostics" /><span>Enable detailed packet and transport diagnostics</span></label><div class="fieldDescription checkboxFieldDescription">Adds first-packet framing, frame-type, AAC transport, and low-level signal diagnostics. Enable only while troubleshooting.</div></div>
+                    </div>
+                </details>
+
+                <details class="tvhSection">
+                    <summary>Recordings and channel presentation</summary>
+                    <div class="tvhSectionBody tvhGrid">
+                        <div class="inputContainer"><input is="emby-input" type="number" min="0" max="5" id="txtPriority" label="Recording priority" /><div class="fieldDescription">0 Important, 1 High, 2 Normal, 3 Low, 4 Unimportant.</div></div>
+                        <div class="inputContainer"><input is="emby-input" type="text" id="txtProfile" label="TVHeadend profile" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="number" min="0" id="txtPrePadding" label="Pre-recording padding (seconds)" /></div>
+                        <div class="inputContainer"><input is="emby-input" type="number" min="0" id="txtPostPadding" label="Post-recording padding (seconds)" /></div>
+                        <div class="selectContainer"><select is="emby-select" id="selChannelType" label="Channels tagged Other"><option>TV</option><option>Radio</option><option>Ignore</option></select></div>
+                        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="chkHideRecordingsChannel" /><span>Hide TVHeadend Recordings channel</span></label></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkForceDeinterlace" /><span>Force deinterlacing for all channels and recordings</span></label><div class="fieldDescription checkboxFieldDescription">Experimental. Requires a Jellyfin server restart.</div></div>
+                    </div>
+                </details>
+
+                <button is="emby-button" type="submit" class="raised button-submit block"><span>Save settings</span></button>
             </form>
+
+            <div class="tvhStatusHeader">
+                <div><h2>Plugin status</h2><div id="statusUpdated" class="tvhMuted">Loading runtime information…</div></div>
+                <div class="tvhInlineButtons"><button is="emby-button" type="button" id="btnRefreshStatus" class="raised"><span>Refresh</span></button></div>
+            </div>
+            <div id="statusSummary" class="tvhStatusSummary"></div>
+            <div id="activeTuners"><div class="tvhEmpty">Loading active tuners…</div></div>
         </div>
     </div>
 </div>

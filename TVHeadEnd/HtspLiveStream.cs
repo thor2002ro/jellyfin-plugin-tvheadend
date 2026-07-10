@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -43,7 +43,6 @@ namespace TVHeadEnd
     {
         private const int MaxOpenAttempts = 3;
         private const int MaxLiveReconnectAttempts = 5;
-        private const int MuxPacketStatsIntervalSeconds = 30;
         private const long StartupCacheMaxBytes = 32L * 1024L * 1024L;
         private const int MinStallWatchdogSeconds = 5;
         private const int MaxStallWatchdogSeconds = 120;
@@ -52,6 +51,7 @@ namespace TVHeadEnd
         private const int SignalRecoveryAttemptWindowSeconds = 60;
 
         private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
+        private static readonly ConcurrentDictionary<string, HtspLiveStream> ActiveProducersByUniqueId = new ConcurrentDictionary<string, HtspLiveStream>();
 
         private static readonly TimeSpan SubscribeResponseTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
@@ -113,6 +113,7 @@ namespace TVHeadEnd
         private HtspLiveStream _sharedProducer;
         private Task _producerOpenTask;
         private DateTime _lastMuxPacketStatsLogUtc = DateTime.MinValue;
+        private DateTime _producerOpenedUtc = DateTime.MinValue;
         private long _startupCacheBytes;
         private long _lastPlayableMuxPacketUtcTicks;
         private long _lastQueueIdrops;
@@ -130,6 +131,9 @@ namespace TVHeadEnd
         private SignalSnapshot _signalSnapshot = new SignalSnapshot();
         private string _sourceAdapter;
         private string _sourceService;
+        private string _sourceNetwork;
+        private string _sourceMux;
+        private string _sourceProvider;
         private int? _primaryVideoStreamIndex;
         private bool _startupCacheKeyframeAligned;
         private bool _startupCacheOverflowLogged;
@@ -217,7 +221,30 @@ namespace TVHeadEnd
 
         public async Task Open(CancellationToken openCancellationToken)
         {
-            await OpenThroughSharedHubAsync(openCancellationToken).ConfigureAwait(false);
+            if (GetConfiguredStreamSharingEnabled())
+            {
+                await OpenThroughSharedHubAsync(openCancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            _sharedProducer = this;
+            AddSharedPlaybackReference(UniqueId);
+            try
+            {
+                await EnsureProducerOpenAsync(openCancellationToken).ConfigureAwait(false);
+                ConfigureOpenedMediaSourceFromHub(this);
+                _logger.LogInformation(
+                    "HTSP standalone producer opened for channel {ChannelId}; upstream subscription {SubscriptionId}; playback {PlaybackId}",
+                    _channelId,
+                    _subscriptionId,
+                    UniqueId);
+            }
+            catch
+            {
+                ReleaseSharedPlaybackReference(UniqueId, "failed to open standalone producer");
+                await CloseProducerNow("failed to open standalone producer").ConfigureAwait(false);
+                throw;
+            }
         }
 
         private async Task OpenProducerAsync(CancellationToken openCancellationToken)
@@ -247,6 +274,8 @@ namespace TVHeadEnd
                         waitForMuxPacket: true).ConfigureAwait(false);
 
                     ConfigureOpenedMediaSource();
+                    _producerOpenedUtc = DateTime.UtcNow;
+                    ActiveProducersByUniqueId[UniqueId] = this;
                     EnsureStallWatchdogStarted();
                     return;
                 }
@@ -660,6 +689,7 @@ namespace TVHeadEnd
             CompleteAllConsumerQueues();
             _stream.Complete();
             CloseCurrentConnection(unsubscribe: true);
+            ActiveProducersByUniqueId.TryRemove(UniqueId, out _);
 
             if (_registeredAsSharedHub)
             {
@@ -708,7 +738,7 @@ namespace TVHeadEnd
                     }
 
                     queues.Add(queue);
-                    if (_primaryVideoStreamIndex.HasValue && !_startupCacheKeyframeAligned)
+                    if (GetConfiguredKeyframeStartupEnabled() && _primaryVideoStreamIndex.HasValue && !_startupCacheKeyframeAligned)
                     {
                         _pendingBootstrapQueues.Add(queue);
                         _logger.LogDebug(
@@ -956,6 +986,20 @@ namespace TVHeadEnd
             if (chunk == null || chunk.Length == 0 || !LooksLikeTransportStream(chunk))
             {
                 return _startupCacheKeyframeAligned;
+            }
+
+            if (!GetConfiguredKeyframeStartupEnabled())
+            {
+                _startupCache.Enqueue(chunk);
+                _startupCacheBytes += chunk.Length;
+                while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
+                {
+                    var removed = _startupCache.Dequeue();
+                    _startupCacheBytes -= removed.Length;
+                }
+
+                _startupCacheKeyframeAligned = true;
+                return true;
             }
 
             if (!_primaryVideoStreamIndex.HasValue || forceBootstrapReady)
@@ -2167,14 +2211,17 @@ namespace TVHeadEnd
                     _muxKeyFrameCounts[streamIndex] = previousKeyFrames + 1;
                 }
 
-                if ((now - _lastMuxPacketStatsLogUtc).TotalSeconds >= MuxPacketStatsIntervalSeconds)
+                var healthIntervalSeconds = GetConfiguredHealthLogIntervalSeconds();
+                if (GetConfiguredHealthLoggingEnabled()
+                    && healthIntervalSeconds > 0
+                    && (now - _lastMuxPacketStatsLogUtc).TotalSeconds >= healthIntervalSeconds)
                 {
                     periodicSummary = BuildMuxPacketSummaryLocked();
                     _lastMuxPacketStatsLogUtc = now;
                 }
             }
 
-            if (isFirstPacket)
+            if (isFirstPacket && GetConfiguredDetailedDiagnostics())
             {
                 _logger.LogInformation(
                     "HTSP first mux packet for stream {Stream}: payload={PayloadBytes} bytes, pts={Pts}, dts={Dts}, duration={Duration}, frametype={FrameType}, randomAccess={RandomAccess}, firstBytes={FirstBytes}",
@@ -3192,7 +3239,7 @@ namespace TVHeadEnd
                     Interlocked.Read(ref _lastQueuePdrops),
                     Interlocked.Read(ref _lastQueueBdrops));
             }
-            else if (firstValidStatus || lockChanged || signalChanged || snrChanged)
+            else if (GetConfiguredSignalHealthLoggingEnabled() && (firstValidStatus || lockChanged || signalChanged || snrChanged))
             {
                 _logger.LogInformation(
                     "HTSP signal channel {ChannelId}: adapter={Adapter}, service={Service}, {SignalSummary}",
@@ -3201,7 +3248,7 @@ namespace TVHeadEnd
                     _sourceService ?? string.Empty,
                     summary);
             }
-            else
+            else if (GetConfiguredSignalHealthLoggingEnabled() && GetConfiguredDetailedDiagnostics())
             {
                 _logger.LogTrace("HTSP signal {SubscriptionId}: {SignalSummary}", _subscriptionId, summary);
             }
@@ -3421,12 +3468,15 @@ namespace TVHeadEnd
 
                 _sourceAdapter = source.getString("adapter", string.Empty);
                 _sourceService = source.getString("service", string.Empty);
+                _sourceNetwork = source.getString("network", string.Empty);
+                _sourceMux = source.getString("mux", string.Empty);
+                _sourceProvider = source.getString("provider", string.Empty);
                 _logger.LogInformation(
                     "HTSP source: adapter={Adapter}, network={Network}, mux={Mux}, provider={Provider}, service={Service}, satpos={SatPos}",
                     _sourceAdapter,
-                    source.getString("network", string.Empty),
-                    source.getString("mux", string.Empty),
-                    source.getString("provider", string.Empty),
+                    _sourceNetwork,
+                    _sourceMux,
+                    _sourceProvider,
                     _sourceService,
                     source.getString("satpos", string.Empty));
             }
@@ -3464,11 +3514,118 @@ namespace TVHeadEnd
             CompleteAllConsumerQueues();
             _stream.Complete(ex);
             CloseCurrentConnection(unsubscribe: true);
+            ActiveProducersByUniqueId.TryRemove(UniqueId, out _);
             if (_registeredAsSharedHub)
             {
                 SharedHubsByChannelId.TryRemove(_channelId, out _);
                 _registeredAsSharedHub = false;
             }
+        }
+
+        private static bool GetConfiguredStreamSharingEnabled()
+        {
+            return Plugin.Instance?.Configuration?.HTSPEnableStreamSharing ?? true;
+        }
+
+        private static bool GetConfiguredKeyframeStartupEnabled()
+        {
+            return Plugin.Instance?.Configuration?.HTSPKeyframeStartupEnabled ?? true;
+        }
+
+        private static bool GetConfiguredHealthLoggingEnabled()
+        {
+            return Plugin.Instance?.Configuration?.HTSPHealthLoggingEnabled ?? true;
+        }
+
+        private static int GetConfiguredHealthLogIntervalSeconds()
+        {
+            return Math.Max(0, Math.Min(600, Plugin.Instance?.Configuration?.HTSPHealthLogIntervalSeconds ?? 30));
+        }
+
+        private static bool GetConfiguredSignalHealthLoggingEnabled()
+        {
+            return Plugin.Instance?.Configuration?.HTSPSignalHealthLoggingEnabled ?? true;
+        }
+
+        private static bool GetConfiguredDetailedDiagnostics()
+        {
+            return Plugin.Instance?.Configuration?.HTSPDetailedDiagnostics ?? false;
+        }
+
+        public static IReadOnlyList<HtspProducerStatus> GetActiveProducerStatuses()
+        {
+            return ActiveProducersByUniqueId.Values
+                .Distinct()
+                .Select(producer => producer.CreateProducerStatus())
+                .OrderBy(status => status.Service ?? status.ChannelId, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private HtspProducerStatus CreateProducerStatus()
+        {
+            SignalSnapshot signal;
+            lock (_signalStateLock)
+            {
+                signal = _signalSnapshot?.Clone();
+            }
+
+            List<HtspStreamStatus> streams;
+            lock (_muxPacketStatsLock)
+            {
+                streams = _muxedStreamsByIndex
+                    .OrderBy(item => item.Key)
+                    .Select(item => new HtspStreamStatus
+                    {
+                        Index = item.Key,
+                        Codec = item.Value?.Codec,
+                        Language = item.Value?.Language,
+                        Title = item.Value?.DisplayName,
+                        Pid = item.Value?.Pid ?? 0,
+                        Packets = _muxPacketCounts.TryGetValue(item.Key, out var packetCount) ? packetCount : 0,
+                        Bytes = _muxPacketBytes.TryGetValue(item.Key, out var byteCount) ? byteCount : 0,
+                        RandomAccessFrames = _muxKeyFrameCounts.TryGetValue(item.Key, out var keyFrames) ? keyFrames : 0
+                    })
+                    .ToList();
+            }
+
+            var lastPacketTicks = Interlocked.Read(ref _lastPlayableMuxPacketUtcTicks);
+            return new HtspProducerStatus
+            {
+                ChannelId = _channelId,
+                PlaybackId = UniqueId,
+                SubscriptionId = _subscriptionId,
+                State = _closing ? "closing" : _recovering ? "recovering" : _started ? "streaming" : "opening",
+                OpenedUtc = _producerOpenedUtc == DateTime.MinValue ? null : _producerOpenedUtc,
+                Adapter = _sourceAdapter,
+                Service = _sourceService,
+                Network = _sourceNetwork,
+                Mux = _sourceMux,
+                Provider = _sourceProvider,
+                SharedPlaybackCount = GetSharedPlaybackReferenceCount(),
+                ActiveReaderCount = Interlocked.CompareExchange(ref _activeStreamReaders, 0, 0),
+                SignalStatus = signal?.Status,
+                HasLock = HasFrontendLock(signal?.Status),
+                SignalRaw = signal?.SignalRaw,
+                SignalPercent = NormalizeFrontendValue(signal?.SignalRaw),
+                SnrRaw = signal?.SnrRaw,
+                SnrPercent = NormalizeFrontendValue(signal?.SnrRaw),
+                Ber = signal?.Ber,
+                Unc = signal?.Unc,
+                SignalAgeMs = signal == null || signal.UpdatedUtc == default ? null : Math.Max(0, (long)(DateTime.UtcNow - signal.UpdatedUtc).TotalMilliseconds),
+                QueuePackets = Interlocked.Read(ref _lastQueuePackets),
+                QueueBytes = Interlocked.Read(ref _lastQueueBytes),
+                QueueDelayUs = Interlocked.Read(ref _lastQueueDelayUs),
+                QueueIDrops = Interlocked.Read(ref _lastQueueIdrops),
+                QueuePDrops = Interlocked.Read(ref _lastQueuePdrops),
+                QueueBDrops = Interlocked.Read(ref _lastQueueBdrops),
+                LastMuxPacketAgeMs = lastPacketTicks <= 0 ? null : Math.Max(0, (long)(DateTime.UtcNow - new DateTime(lastPacketTicks, DateTimeKind.Utc)).TotalMilliseconds),
+                ReconnectAttempts = Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0),
+                SignalRecoveryAttempts = Interlocked.CompareExchange(ref _signalRecoveryAttempts, 0, 0),
+                AwaitingCleanVideo = Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) != 0,
+                KeyframeStartupReady = _startupCacheKeyframeAligned,
+                StartupCacheBytes = Interlocked.Read(ref _startupCacheBytes),
+                Streams = streams
+            };
         }
 
         private static bool GetConfiguredSignalRecoveryEnabled()

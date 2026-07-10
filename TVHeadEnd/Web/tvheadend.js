@@ -3,31 +3,156 @@
 };
 
 export default function (view, params) {
+    let statusTimer = null;
+
     function getStreamingMethod(config) {
-        if (config.StreamingMethod) {
-            return config.StreamingMethod;
-        }
+        if (config.StreamingMethod) return config.StreamingMethod;
         return config.EnableSubsMaudios ? 'HttpBasic' : 'HttpTicket';
+    }
+
+    function intValue(element, fallback, min, max) {
+        const parsed = parseInt(element.value, 10);
+        const value = Number.isFinite(parsed) ? parsed : fallback;
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function escapeHtml(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+    }
+
+    function formatNumber(value) {
+        return value == null ? '—' : Number(value).toLocaleString();
+    }
+
+    function formatBytes(value) {
+        if (value == null) return '—';
+        const units = ['B', 'KiB', 'MiB', 'GiB'];
+        let number = Number(value);
+        let unit = 0;
+        while (number >= 1024 && unit < units.length - 1) { number /= 1024; unit++; }
+        return `${number.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function formatPercent(value, raw) {
+        if (value != null) return `${Number(value).toFixed(1)}%${raw == null ? '' : ` (${raw})`}`;
+        return raw == null ? '—' : `raw ${raw}`;
+    }
+
+    function formatAge(ms) {
+        if (ms == null || ms < 0) return '—';
+        if (ms < 1000) return `${ms} ms`;
+        return `${(ms / 1000).toFixed(1)} s`;
+    }
+
+    function metric(label, value) {
+        return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span></div>`;
+    }
+
+    function updateDependentState(page) {
+        const recoveryEnabled = page.querySelector('#chkHTSPSignalRecoveryEnabled').checked;
+        const recovery = page.querySelector('#signalRecoverySettings');
+        recovery.classList.toggle('tvhDependentDisabled', !recoveryEnabled);
+        recovery.querySelectorAll('input').forEach(input => { input.disabled = !recoveryEnabled; });
+
+        const healthEnabled = page.querySelector('#chkHTSPHealthLoggingEnabled').checked;
+        const health = page.querySelector('#healthIntervalContainer');
+        health.classList.toggle('tvhDependentDisabled', !healthEnabled);
+        health.querySelector('input').disabled = !healthEnabled;
+    }
+
+    function renderStatus(page, status) {
+        const producers = Array.isArray(status.Producers) ? status.Producers : [];
+        page.querySelector('#statusUpdated').textContent = `Updated ${new Date(status.GeneratedUtc).toLocaleTimeString()}`;
+        page.querySelector('#statusSummary').innerHTML =
+            metric('Plugin version', status.PluginVersion || 'unknown') +
+            metric('TVHeadend server', status.Server || 'not configured') +
+            metric('Streaming method', status.StreamingMethod || 'legacy/default') +
+            metric('Active producers', String(status.ActiveProducerCount || 0));
+
+        const container = page.querySelector('#activeTuners');
+        if (!producers.length) {
+            container.innerHTML = '<div class="tvhEmpty">No active HTSP tuner subscriptions. Start a live channel to populate runtime signal and stream statistics.</div>';
+            return;
+        }
+
+        container.innerHTML = producers.map(producer => {
+            const drops = Number(producer.QueueIDrops || 0) + Number(producer.QueuePDrops || 0) + Number(producer.QueueBDrops || 0);
+            const lockClass = producer.HasLock ? 'tvhBadgeGood' : 'tvhBadgeBad';
+            const stateClass = producer.State === 'streaming' ? 'tvhBadgeGood' : producer.State === 'recovering' ? 'tvhBadgeWarn' : '';
+            const streamRows = (producer.Streams || []).map(stream => `<tr>
+                <td>${stream.Index}</td><td>0x${Number(stream.Pid || 0).toString(16).toUpperCase()}</td>
+                <td>${escapeHtml(stream.Codec || 'unknown')}</td><td>${escapeHtml(stream.Language || '—')}</td>
+                <td>${escapeHtml(stream.Title || '—')}</td><td>${formatNumber(stream.Packets)}</td>
+                <td>${formatBytes(stream.Bytes)}</td><td>${formatNumber(stream.RandomAccessFrames)}</td>
+            </tr>`).join('');
+
+            return `<section class="tvhProducer">
+                <div class="tvhProducerTitle"><h3>${escapeHtml(producer.Service || `Channel ${producer.ChannelId}`)}</h3>
+                    <div><span class="tvhBadge ${stateClass}">${escapeHtml(producer.State || 'unknown')}</span> <span class="tvhBadge ${lockClass}">${producer.HasLock ? 'LOCK' : 'NO LOCK'}</span>${producer.AwaitingCleanVideo ? ' <span class="tvhBadge tvhBadgeWarn">waiting for clean video</span>' : ''}</div>
+                </div>
+                <div class="tvhStatusSummary">
+                    ${metric('Adapter', producer.Adapter || '—')}
+                    ${metric('Network / mux', [producer.Network, producer.Mux].filter(Boolean).join(' · ') || '—')}
+                    ${metric('Signal', formatPercent(producer.SignalPercent, producer.SignalRaw))}
+                    ${metric('SNR', formatPercent(producer.SnrPercent, producer.SnrRaw))}
+                    ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`)}
+                    ${metric('Queue drops I/P/B', `${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)}`)}
+                    ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`)}
+                    ${metric('Last mux packet', formatAge(producer.LastMuxPacketAgeMs))}
+                    ${metric('Viewers / readers', `${producer.SharedPlaybackCount || 0} / ${producer.ActiveReaderCount || 0}`)}
+                    ${metric('Reconnects', `${producer.ReconnectAttempts || 0} normal · ${producer.SignalRecoveryAttempts || 0} signal`)}
+                    ${metric('Startup cache', `${producer.KeyframeStartupReady ? 'ready' : 'waiting'} · ${formatBytes(producer.StartupCacheBytes)}`)}
+                    ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${escapeHtml(producer.ChannelId || '')}`)}
+                </div>
+                <details><summary>Stream statistics (${(producer.Streams || []).length})</summary>
+                    <div class="tvhTableWrap"><table class="tvhTable"><thead><tr><th>Index</th><th>PID</th><th>Codec</th><th>Language</th><th>Title</th><th>Packets</th><th>Bytes</th><th>Keyframes</th></tr></thead><tbody>${streamRows}</tbody></table></div>
+                </details>
+            </section>`;
+        }).join('');
+    }
+
+    function loadStatus(page, showLoading) {
+        if (showLoading) page.querySelector('#statusUpdated').textContent = 'Refreshing runtime information…';
+        return ApiClient.ajax({
+            type: 'GET',
+            url: ApiClient.getUrl('TVHeadEnd/Status'),
+            dataType: 'json'
+        }).then(status => renderStatus(page, status)).catch(error => {
+            page.querySelector('#statusUpdated').textContent = 'Unable to load runtime status';
+            page.querySelector('#activeTuners').innerHTML = `<div class="tvhEmpty">Status endpoint failed: ${escapeHtml(error && error.message ? error.message : 'unknown error')}</div>`;
+        });
+    }
+
+    function startStatusPolling(page) {
+        stopStatusPolling();
+        loadStatus(page, true);
+        statusTimer = setInterval(() => loadStatus(page, false), 5000);
+    }
+
+    function stopStatusPolling() {
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
     }
 
     view.addEventListener('viewshow', function () {
         Dashboard.showLoadingMsg();
         const page = this;
-        ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(function(config) {
+        ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
             page.querySelector('#txtTVH_ServerName').value = config.TVH_ServerName || '';
-            page.querySelector('#txtHTTP_Port').value = config.HTTP_Port || '9981';
-            page.querySelector('#txtHTSP_Port').value = config.HTSP_Port || '9982';
+            page.querySelector('#txtHTTP_Port').value = config.HTTP_Port || 9981;
+            page.querySelector('#txtHTSP_Port').value = config.HTSP_Port || 9982;
             page.querySelector('#txtWebRoot').value = config.WebRoot || '/';
             page.querySelector('#txtUserName').value = config.Username || '';
             page.querySelector('#txtPassword').value = config.Password || '';
-            page.querySelector('#txtPriority').value = config.Priority || '5';
+            page.querySelector('#txtPriority').value = Number.isFinite(config.Priority) ? config.Priority : 5;
             page.querySelector('#txtProfile').value = config.Profile || '';
-            page.querySelector('#txtPrePadding').value = config.Pre_Padding || '0';
-            page.querySelector('#txtPostPadding').value = config.Post_Padding || '0';
+            page.querySelector('#txtPrePadding').value = Number.isFinite(config.Pre_Padding) ? config.Pre_Padding : 0;
+            page.querySelector('#txtPostPadding').value = Number.isFinite(config.Post_Padding) ? config.Post_Padding : 0;
             page.querySelector('#selChannelType').value = config.ChannelType || 'Ignore';
-            page.querySelector('#chkHideRecordingsChannel').checked = config.HideRecordingsChannel || false;
+            page.querySelector('#chkHideRecordingsChannel').checked = config.HideRecordingsChannel === true;
             page.querySelector('#selStreamingMethod').value = getStreamingMethod(config);
-            page.querySelector('#chkForceDeinterlace').checked = config.ForceDeinterlace || false;
+            page.querySelector('#chkForceDeinterlace').checked = config.ForceDeinterlace === true;
             page.querySelector('#txtHTSPQueueDepth').value = Number.isFinite(config.HTSPQueueDepth) ? config.HTSPQueueDepth : 2000000;
             page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(config.HTSPStallTimeoutSeconds) ? config.HTSPStallTimeoutSeconds : 15;
             page.querySelector('#chkHTSPFilterControlStreams').checked = config.HTSPFilterControlStreams === true;
@@ -37,39 +162,62 @@ export default function (view, params) {
             page.querySelector('#txtHTSPSignalIdrWaitSeconds').value = Number.isFinite(config.HTSPSignalIdrWaitSeconds) ? config.HTSPSignalIdrWaitSeconds : 3;
             page.querySelector('#txtHTSPSignalRecoveryMaxReconnects').value = Number.isFinite(config.HTSPSignalRecoveryMaxReconnects) ? config.HTSPSignalRecoveryMaxReconnects : 2;
             page.querySelector('#txtHTSPSignalRecoveryCooldownSeconds').value = Number.isFinite(config.HTSPSignalRecoveryCooldownSeconds) ? config.HTSPSignalRecoveryCooldownSeconds : 15;
+            page.querySelector('#chkHTSPEnableStreamSharing').checked = config.HTSPEnableStreamSharing !== false;
+            page.querySelector('#chkHTSPKeyframeStartupEnabled').checked = config.HTSPKeyframeStartupEnabled !== false;
+            page.querySelector('#chkHTSPHealthLoggingEnabled').checked = config.HTSPHealthLoggingEnabled !== false;
+            page.querySelector('#txtHTSPHealthLogIntervalSeconds').value = Number.isFinite(config.HTSPHealthLogIntervalSeconds) ? config.HTSPHealthLogIntervalSeconds : 30;
+            page.querySelector('#chkHTSPSignalHealthLoggingEnabled').checked = config.HTSPSignalHealthLoggingEnabled !== false;
+            page.querySelector('#chkHTSPDetailedDiagnostics').checked = config.HTSPDetailedDiagnostics === true;
+            updateDependentState(page);
             Dashboard.hideLoadingMsg();
+            startStatusPolling(page);
         });
     });
+
+    view.addEventListener('viewhide', stopStatusPolling);
+    view.querySelector('#btnRefreshStatus').addEventListener('click', () => loadStatus(view, true));
+    view.querySelector('#chkHTSPSignalRecoveryEnabled').addEventListener('change', () => updateDependentState(view));
+    view.querySelector('#chkHTSPHealthLoggingEnabled').addEventListener('change', () => updateDependentState(view));
+
     view.querySelector('.TVHclientConfigurationForm').addEventListener('submit', function (e) {
         e.preventDefault();
         Dashboard.showLoadingMsg();
         const form = this;
-        ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(function(config) {
-            config.TVH_ServerName = form.querySelector('#txtTVH_ServerName').value;
-            config.HTTP_Port = form.querySelector('#txtHTTP_Port').value;
-            config.HTSP_Port = form.querySelector('#txtHTSP_Port').value;
-            config.WebRoot = form.querySelector('#txtWebRoot').value;
+        ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
+            config.TVH_ServerName = form.querySelector('#txtTVH_ServerName').value.trim();
+            config.HTTP_Port = intValue(form.querySelector('#txtHTTP_Port'), 9981, 1, 65535);
+            config.HTSP_Port = intValue(form.querySelector('#txtHTSP_Port'), 9982, 1, 65535);
+            config.WebRoot = form.querySelector('#txtWebRoot').value.trim() || '/';
             config.Username = form.querySelector('#txtUserName').value;
             config.Password = form.querySelector('#txtPassword').value;
-            config.Priority = form.querySelector('#txtPriority').value;
-            config.Profile = form.querySelector('#txtProfile').value;
-            config.Pre_Padding = form.querySelector('#txtPrePadding').value;
-            config.Post_Padding = form.querySelector('#txtPostPadding').value;
+            config.Priority = intValue(form.querySelector('#txtPriority'), 5, 0, 5);
+            config.Profile = form.querySelector('#txtProfile').value.trim();
+            config.Pre_Padding = intValue(form.querySelector('#txtPrePadding'), 0, 0, 86400);
+            config.Post_Padding = intValue(form.querySelector('#txtPostPadding'), 0, 0, 86400);
             config.ChannelType = form.querySelector('#selChannelType').value;
             config.HideRecordingsChannel = form.querySelector('#chkHideRecordingsChannel').checked;
             config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
             config.EnableSubsMaudios = config.StreamingMethod === 'HttpBasic';
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
-            config.HTSPQueueDepth = Math.max(0, Math.min(20000000, parseInt(form.querySelector('#txtHTSPQueueDepth').value, 10) || 0));
-            config.HTSPStallTimeoutSeconds = Math.max(0, Math.min(120, parseInt(form.querySelector('#txtHTSPStallTimeoutSeconds').value, 10) || 0));
+            config.HTSPQueueDepth = intValue(form.querySelector('#txtHTSPQueueDepth'), 2000000, 0, 20000000);
+            config.HTSPStallTimeoutSeconds = intValue(form.querySelector('#txtHTSPStallTimeoutSeconds'), 15, 0, 120);
             config.HTSPFilterControlStreams = form.querySelector('#chkHTSPFilterControlStreams').checked;
             config.HTSPSignalRecoveryEnabled = form.querySelector('#chkHTSPSignalRecoveryEnabled').checked;
-            config.HTSPSignalLockLossSeconds = Math.max(1, Math.min(30, parseInt(form.querySelector('#txtHTSPSignalLockLossSeconds').value, 10) || 3));
-            config.HTSPSignalUncBurstThreshold = Math.max(1, Math.min(1000, parseInt(form.querySelector('#txtHTSPSignalUncBurstThreshold').value, 10) || 5));
-            config.HTSPSignalIdrWaitSeconds = Math.max(1, Math.min(15, parseInt(form.querySelector('#txtHTSPSignalIdrWaitSeconds').value, 10) || 3));
-            config.HTSPSignalRecoveryMaxReconnects = Math.max(0, Math.min(10, parseInt(form.querySelector('#txtHTSPSignalRecoveryMaxReconnects').value, 10) || 0));
-            config.HTSPSignalRecoveryCooldownSeconds = Math.max(1, Math.min(300, parseInt(form.querySelector('#txtHTSPSignalRecoveryCooldownSeconds').value, 10) || 15));
-            ApiClient.updatePluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId, config).then(Dashboard.processPluginConfigurationUpdateResult);
+            config.HTSPSignalLockLossSeconds = intValue(form.querySelector('#txtHTSPSignalLockLossSeconds'), 3, 1, 30);
+            config.HTSPSignalUncBurstThreshold = intValue(form.querySelector('#txtHTSPSignalUncBurstThreshold'), 5, 1, 1000);
+            config.HTSPSignalIdrWaitSeconds = intValue(form.querySelector('#txtHTSPSignalIdrWaitSeconds'), 3, 1, 15);
+            config.HTSPSignalRecoveryMaxReconnects = intValue(form.querySelector('#txtHTSPSignalRecoveryMaxReconnects'), 2, 0, 10);
+            config.HTSPSignalRecoveryCooldownSeconds = intValue(form.querySelector('#txtHTSPSignalRecoveryCooldownSeconds'), 15, 1, 300);
+            config.HTSPEnableStreamSharing = form.querySelector('#chkHTSPEnableStreamSharing').checked;
+            config.HTSPKeyframeStartupEnabled = form.querySelector('#chkHTSPKeyframeStartupEnabled').checked;
+            config.HTSPHealthLoggingEnabled = form.querySelector('#chkHTSPHealthLoggingEnabled').checked;
+            config.HTSPHealthLogIntervalSeconds = intValue(form.querySelector('#txtHTSPHealthLogIntervalSeconds'), 30, 5, 600);
+            config.HTSPSignalHealthLoggingEnabled = form.querySelector('#chkHTSPSignalHealthLoggingEnabled').checked;
+            config.HTSPDetailedDiagnostics = form.querySelector('#chkHTSPDetailedDiagnostics').checked;
+            return ApiClient.updatePluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId, config);
+        }).then(result => {
+            Dashboard.processPluginConfigurationUpdateResult(result);
+            loadStatus(view, false);
         });
         return false;
     });

@@ -11,7 +11,6 @@ namespace TVHeadEnd.HTSP
 {
     public class HTSMessage
     {
-        // Align the advertised client protocol with Kodi pvr.hts.
         // Tvheadend master currently supports newer server-side protocol versions,
         // but advertising the server maximum would enable features this client does
         // not implement. Keep this at the client feature level.

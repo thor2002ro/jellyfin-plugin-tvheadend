@@ -47,7 +47,7 @@ namespace TVHeadEnd.Configuration
             WebRoot = "/";
             Username = "";
             Password = "";
-            Priority = 5;
+            Priority = 2;
             Profile = "";
             Pre_Padding = 0;
             Post_Padding = 0;

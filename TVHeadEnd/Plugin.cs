@@ -29,6 +29,7 @@ namespace TVHeadEnd
                 {
                     Name = "tvheadend",
                     EmbeddedResourcePath = GetType().Namespace + ".Web.tvheadend.html",
+                    EnableInMainMenu = true
                 },
                 new PluginPageInfo
                 {

@@ -127,6 +127,7 @@ export default function (view, params) {
             metric('Active producers', String(status.ActiveProducerCount || 0));
 
         const container = page.querySelector('#activeTuners');
+        const expandedSubscriptions = new Set(Array.from(container.querySelectorAll('details[open][data-subscription-id]'), details => details.dataset.subscriptionId));
         if (!producers.length) {
             container.innerHTML = '<div class="tvhEmpty">No active HTSP tuner subscriptions. Start a live channel to populate runtime signal and stream statistics.</div>';
             container.setAttribute('aria-busy', 'false');
@@ -163,11 +164,12 @@ export default function (view, params) {
                     ${metric('Startup cache', `${producer.KeyframeStartupReady ? 'ready' : 'waiting'} · ${formatBytes(producer.StartupCacheBytes)}`)}
                     ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${escapeHtml(producer.ChannelId || '')}`)}
                 </div>
-                <details><summary>Stream statistics (${(producer.Streams || []).length})</summary>
+                <details data-subscription-id="${Number(producer.SubscriptionId || 0)}"><summary>Stream statistics (${(producer.Streams || []).length})</summary>
                     <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(producer.Service || `channel ${producer.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet and keyframe statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th></tr></thead><tbody>${streamRows}</tbody></table></div>
                 </details>
             </section>`;
         }).join('');
+        container.querySelectorAll('details[data-subscription-id]').forEach(details => { details.open = expandedSubscriptions.has(details.dataset.subscriptionId); });
     }
 
     function loadStatus(page, showLoading) {

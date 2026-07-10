@@ -79,7 +79,7 @@
             align-items: center;
             justify-content: space-between;
             gap: .8em 1em;
-            margin: 2em 0 .8em;
+            margin: 1.25em 0 .8em;
             min-width: 0;
         }
         #TVHclientConfigurationPage .tvhStatusHeader > * { min-width: 0; }
@@ -182,6 +182,17 @@
         }
         #TVHclientConfigurationPage .tvhEmpty { padding: 1.2em; border-radius: var(--tvh-radius); text-align: center; overflow-wrap: anywhere; }
         #TVHclientConfigurationPage .tvhInlineButtons { display: flex; flex-wrap: wrap; gap: .6em; }
+        #TVHclientConfigurationPage .checkboxContainer label[title]::after {
+            content: "ⓘ";
+            display: inline-block;
+            margin-inline-start: .38em;
+            font-size: .82em;
+            line-height: 1;
+            opacity: .58;
+            vertical-align: .08em;
+        }
+        #TVHclientConfigurationPage .checkboxContainer label[title]:hover::after,
+        #TVHclientConfigurationPage .checkboxContainer label[title]:focus-within::after { opacity: .9; }
         #TVHclientConfigurationPage .tvhDependentDisabled { opacity: .48; }
         #TVHclientConfigurationPage .tvhExperimental {
             padding: .8em;
@@ -229,6 +240,13 @@
                 <div class="tvhMuted">Live TV connection, HTSP reliability, signal recovery, and active tuner diagnostics.</div>
             </div>
 
+            <div class="tvhStatusHeader">
+                <div><h2>Plugin status</h2><div id="statusUpdated" class="tvhMuted">Loading runtime information…</div><div id="statusAnnouncer" class="tvhSrOnly" role="status" aria-live="polite" aria-atomic="true"></div></div>
+                <div class="tvhInlineButtons"><button is="emby-button" type="button" id="btnRefreshStatus" class="raised" aria-controls="statusSummary activeTuners" title="Refresh live plugin and tuner status now. Status also refreshes automatically every five seconds."><span>Refresh</span></button></div>
+            </div>
+            <div id="statusSummary" class="tvhStatusSummary" aria-label="Plugin runtime summary"></div>
+            <div id="activeTuners" aria-busy="true"><div class="tvhEmpty">Loading active tuners…</div></div>
+
             <form class="TVHclientConfigurationForm">
                 <details class="tvhSection" open>
                     <summary>Connection and authentication</summary>
@@ -252,7 +270,7 @@
                             <div class="inputContainer"><input is="emby-input" type="number" min="0" max="20000000" step="100000" id="txtHTSPQueueDepth" label="TVHeadend queue depth (bytes)" /><div class="fieldDescription">Default: 2,000,000. Set 0 to use TVHeadend's default.</div></div>
                             <div class="inputContainer"><input is="emby-input" type="number" min="0" max="120" step="1" id="txtHTSPStallTimeoutSeconds" label="Silent-stream watchdog (seconds)" /><div class="fieldDescription">Reconnect when the producer receives no playable packets. Set 0 to disable.</div></div>
                         </div>
-                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPFilterControlStreams" /><span>Filter CA/control/data streams upstream</span></label><div class="fieldDescription checkboxFieldDescription">Optional HTSP v12+ optimization. Video, audio, and subtitles are never filtered.</div></div>
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPFilterControlStreams" /><span>Filter CA/control/data streams upstream</span></label><div class="fieldDescription checkboxFieldDescription">Optional HTSP v12+ optimization. Asks TVHeadend not to send CA/ECM/private control or data stream indexes that the plugin would discard locally. Video, audio, and subtitles are never filtered; normally leave this disabled.</div></div>
                     </div>
                 </details>
 
@@ -293,15 +311,9 @@
                     </div>
                 </details>
 
-                <button is="emby-button" type="submit" class="raised button-submit block"><span>Save settings</span></button>
+                <button is="emby-button" type="submit" class="raised button-submit block" title="Save all TVHeadend plugin settings shown on this page."><span>Save settings</span></button>
             </form>
 
-            <div class="tvhStatusHeader">
-                <div><h2>Plugin status</h2><div id="statusUpdated" class="tvhMuted">Loading runtime information…</div><div id="statusAnnouncer" class="tvhSrOnly" role="status" aria-live="polite" aria-atomic="true"></div></div>
-                <div class="tvhInlineButtons"><button is="emby-button" type="button" id="btnRefreshStatus" class="raised" aria-controls="statusSummary activeTuners"><span>Refresh</span></button></div>
-            </div>
-            <div id="statusSummary" class="tvhStatusSummary" aria-label="Plugin runtime summary"></div>
-            <div id="activeTuners" aria-busy="true"><div class="tvhEmpty">Loading active tuners…</div></div>
         </div>
     </div>
 </div>

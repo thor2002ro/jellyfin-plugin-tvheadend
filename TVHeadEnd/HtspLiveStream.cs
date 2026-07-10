@@ -48,6 +48,8 @@ namespace TVHeadEnd
         private const int MinStallWatchdogSeconds = 5;
         private const int MaxStallWatchdogSeconds = 120;
         private const int MaxHtspQueueDepth = 20000000;
+        private const int SignalErrorWindowSeconds = 5;
+        private const int SignalRecoveryAttemptWindowSeconds = 60;
 
         private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
 
@@ -100,6 +102,10 @@ namespace TVHeadEnd
         private int _lastMetadataSubscriptionId;
         private int _lastFilteredSubscriptionId;
         private int _stallWatchdogTriggered;
+        private int _awaitingCleanVideoRandomAccess;
+        private int _signalRecoveryReconnectScheduled;
+        private int _signalRecoveryAttempts;
+        private int _signalRecoverySuppressionLogged;
         private bool _closing;
         private bool _started;
         private bool _recovering;
@@ -115,6 +121,12 @@ namespace TVHeadEnd
         private long _lastQueuePackets;
         private long _lastQueueBytes;
         private long _lastQueueDelayUs;
+        private long _frontendUnlockSinceUtcTicks;
+        private long _videoDamageSinceUtcTicks;
+        private long _signalErrorWindowStartUtcTicks;
+        private long _signalErrorWindowUncIncrease;
+        private long _lastSignalRecoveryUtcTicks;
+        private long _signalRecoveryAttemptWindowStartUtcTicks;
         private SignalSnapshot _signalSnapshot = new SignalSnapshot();
         private string _sourceAdapter;
         private string _sourceService;
@@ -1755,6 +1767,25 @@ namespace TVHeadEnd
             var streamInfo = _muxer.GetStreamInfo(streamIndex);
             var preparedPayload = PrepareVideoPayloadForBootstrap(streamInfo, payload, frameType, out var randomAccess);
 
+            if (ShouldDropDamagedVideo(streamInfo, randomAccess))
+            {
+                return;
+            }
+
+            if (streamInfo != null
+                && streamInfo.Kind == HtspTransportStreamMuxer.ElementaryStreamKind.Video
+                && randomAccess
+                && Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 1) == 1)
+            {
+                var damagedForMs = GetElapsedMilliseconds(Interlocked.Exchange(ref _videoDamageSinceUtcTicks, 0));
+                _muxer.MarkStreamDiscontinuity(streamIndex, repeatProgramTables: true);
+                ResetStartupCacheForNewSubscription(clearParameterSets: false);
+                _logger.LogInformation(
+                    "HTSP video recovered for channel {ChannelId} at a verified random-access frame after {DamagedForMs}ms; PAT/PMT and a one-shot video discontinuity will be emitted",
+                    _channelId,
+                    damagedForMs);
+            }
+
             RecordMuxPacket(streamIndex, payload, pts, dts, duration, frameType, randomAccess);
 
             var chunk = _muxer.WritePacket(
@@ -1769,6 +1800,106 @@ namespace TVHeadEnd
             {
                 WriteOutput(chunk, randomAccess);
             }
+        }
+
+
+        private bool ShouldDropDamagedVideo(HtspTransportStreamMuxer.StreamInfo streamInfo, bool randomAccess)
+        {
+            if (streamInfo == null
+                || streamInfo.Kind != HtspTransportStreamMuxer.ElementaryStreamKind.Video
+                || Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) == 0
+                || randomAccess)
+            {
+                return false;
+            }
+
+            var damagedSinceTicks = Interlocked.Read(ref _videoDamageSinceUtcTicks);
+            var waitSeconds = GetConfiguredSignalIdrWaitSeconds();
+            if (damagedSinceTicks > 0
+                && waitSeconds > 0
+                && DateTime.UtcNow - new DateTime(damagedSinceTicks, DateTimeKind.Utc) >= TimeSpan.FromSeconds(waitSeconds))
+            {
+                RequestSignalRecoveryReconnect("No verified random-access video frame arrived within the signal recovery timeout.");
+            }
+
+            return true;
+        }
+
+        private void MarkVideoDamaged(string reason)
+        {
+            if (Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 1, 0) == 0)
+            {
+                Interlocked.Exchange(ref _videoDamageSinceUtcTicks, DateTime.UtcNow.Ticks);
+                _logger.LogWarning(
+                    "HTSP video marked damaged for channel {ChannelId}: {Reason}. Inter-frame video will be dropped until a verified IDR/IRAP arrives; audio and subtitles remain live",
+                    _channelId,
+                    reason);
+            }
+        }
+
+        private void RequestSignalRecoveryReconnect(string reason)
+        {
+            if (!GetConfiguredSignalRecoveryEnabled()
+                || _closing
+                || _recovering
+                || Interlocked.CompareExchange(ref _signalRecoveryReconnectScheduled, 1, 0) != 0)
+            {
+                return;
+            }
+
+            var nowTicks = DateTime.UtcNow.Ticks;
+            var cooldown = TimeSpan.FromSeconds(GetConfiguredSignalRecoveryCooldownSeconds());
+            var lastTicks = Interlocked.Read(ref _lastSignalRecoveryUtcTicks);
+            if (lastTicks > 0 && DateTime.UtcNow - new DateTime(lastTicks, DateTimeKind.Utc) < cooldown)
+            {
+                Interlocked.Exchange(ref _signalRecoveryReconnectScheduled, 0);
+                return;
+            }
+
+            var windowStart = Interlocked.Read(ref _signalRecoveryAttemptWindowStartUtcTicks);
+            if (windowStart <= 0 || DateTime.UtcNow - new DateTime(windowStart, DateTimeKind.Utc) >= TimeSpan.FromSeconds(SignalRecoveryAttemptWindowSeconds))
+            {
+                Interlocked.Exchange(ref _signalRecoveryAttemptWindowStartUtcTicks, nowTicks);
+                Interlocked.Exchange(ref _signalRecoveryAttempts, 0);
+                Interlocked.Exchange(ref _signalRecoverySuppressionLogged, 0);
+            }
+
+            var attempt = Interlocked.Increment(ref _signalRecoveryAttempts);
+            var maximum = GetConfiguredSignalRecoveryMaxReconnects();
+            if (maximum <= 0 || attempt > maximum)
+            {
+                Interlocked.Exchange(ref _signalRecoveryReconnectScheduled, 0);
+                if (Interlocked.CompareExchange(ref _signalRecoverySuppressionLogged, 1, 0) == 0)
+                {
+                    _logger.LogWarning(
+                        "HTSP signal recovery reconnect suppressed for channel {ChannelId}: attempt {Attempt} exceeds configured maximum {Maximum} within {WindowSeconds}s. Waiting for a clean random-access frame instead",
+                        _channelId,
+                        attempt,
+                        maximum,
+                        SignalRecoveryAttemptWindowSeconds);
+                }
+
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastSignalRecoveryUtcTicks, nowTicks);
+            var error = new IOException("Signal-triggered HTSP recovery: " + reason);
+            _logger.LogWarning(
+                error,
+                "HTSP signal recovery reconnect requested for channel {ChannelId}: attempt {Attempt}/{Maximum}, cooldown={CooldownSeconds}s",
+                _channelId,
+                attempt,
+                maximum,
+                (int)cooldown.TotalSeconds);
+            Interlocked.Exchange(ref _signalRecoveryReconnectScheduled, 0);
+            onError(error);
+        }
+
+        private static long GetElapsedMilliseconds(long utcTicks)
+        {
+            return utcTicks > 0
+                ? Math.Max(0, (long)(DateTime.UtcNow - new DateTime(utcTicks, DateTimeKind.Utc)).TotalMilliseconds)
+                : 0;
         }
 
         private static char GetFrameType(HTSMessage response)
@@ -3036,6 +3167,8 @@ namespace TVHeadEnd
             var snrChanged = HasMeaningfulFrontendChange(previous?.SnrRaw, current.SnrRaw);
             var summary = FormatSignalSummary(current);
 
+            EvaluateSignalRecovery(current, lockIsPresent, uncIncrease);
+
             if (lockChanged && !lockIsPresent)
             {
                 _logger.LogWarning(
@@ -3074,6 +3207,60 @@ namespace TVHeadEnd
             }
         }
 
+        private void EvaluateSignalRecovery(SignalSnapshot current, bool hasLock, long uncIncrease)
+        {
+            if (!GetConfiguredSignalRecoveryEnabled())
+            {
+                return;
+            }
+
+            var nowTicks = current.UpdatedUtc.Ticks;
+            if (hasLock)
+            {
+                Interlocked.Exchange(ref _frontendUnlockSinceUtcTicks, 0);
+            }
+            else
+            {
+                var unlockStart = Interlocked.Read(ref _frontendUnlockSinceUtcTicks);
+                if (unlockStart <= 0)
+                {
+                    Interlocked.CompareExchange(ref _frontendUnlockSinceUtcTicks, nowTicks, 0);
+                    unlockStart = Interlocked.Read(ref _frontendUnlockSinceUtcTicks);
+                }
+
+                var threshold = GetConfiguredSignalLockLossSeconds();
+                if (threshold > 0
+                    && current.UpdatedUtc - new DateTime(unlockStart, DateTimeKind.Utc) >= TimeSpan.FromSeconds(threshold))
+                {
+                    MarkVideoDamaged("Frontend lock has been absent for at least " + threshold + " seconds.");
+                    RequestSignalRecoveryReconnect("Sustained frontend lock loss.");
+                }
+            }
+
+            if (uncIncrease <= 0)
+            {
+                return;
+            }
+
+            var windowStart = Interlocked.Read(ref _signalErrorWindowStartUtcTicks);
+            if (windowStart <= 0
+                || current.UpdatedUtc - new DateTime(windowStart, DateTimeKind.Utc) >= TimeSpan.FromSeconds(SignalErrorWindowSeconds))
+            {
+                Interlocked.Exchange(ref _signalErrorWindowStartUtcTicks, nowTicks);
+                Interlocked.Exchange(ref _signalErrorWindowUncIncrease, 0);
+            }
+
+            var burst = Interlocked.Add(ref _signalErrorWindowUncIncrease, uncIncrease);
+            var thresholdUnc = GetConfiguredSignalUncBurstThreshold();
+            if (thresholdUnc > 0 && burst >= thresholdUnc)
+            {
+                MarkVideoDamaged("Uncorrected block count increased by " + burst + " within " + SignalErrorWindowSeconds + " seconds.");
+                RequestSignalRecoveryReconnect("Rapid increase in uncorrected transport blocks.");
+                Interlocked.Exchange(ref _signalErrorWindowStartUtcTicks, nowTicks);
+                Interlocked.Exchange(ref _signalErrorWindowUncIncrease, 0);
+            }
+        }
+
         private string BuildHealthSummary()
         {
             SignalSnapshot signal;
@@ -3095,7 +3282,9 @@ namespace TVHeadEnd
                 + "/" + Interlocked.Read(ref _lastQueuePdrops)
                 + "/" + Interlocked.Read(ref _lastQueueBdrops)
                 + ", lastMuxPacketMs=" + lastPacketAgeMs
-                + ", reconnectAttempts=" + Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0);
+                + ", reconnectAttempts=" + Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0)
+                + ", signalRecoveryAttempts=" + Interlocked.CompareExchange(ref _signalRecoveryAttempts, 0, 0)
+                + ", awaitingCleanVideo=" + (Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) != 0);
         }
 
         private static string FormatSignalSummary(SignalSnapshot signal)
@@ -3280,6 +3469,36 @@ namespace TVHeadEnd
                 SharedHubsByChannelId.TryRemove(_channelId, out _);
                 _registeredAsSharedHub = false;
             }
+        }
+
+        private static bool GetConfiguredSignalRecoveryEnabled()
+        {
+            return Plugin.Instance?.Configuration?.HTSPSignalRecoveryEnabled ?? true;
+        }
+
+        private static int GetConfiguredSignalLockLossSeconds()
+        {
+            return Math.Max(1, Math.Min(30, Plugin.Instance?.Configuration?.HTSPSignalLockLossSeconds ?? 3));
+        }
+
+        private static int GetConfiguredSignalUncBurstThreshold()
+        {
+            return Math.Max(1, Math.Min(1000, Plugin.Instance?.Configuration?.HTSPSignalUncBurstThreshold ?? 5));
+        }
+
+        private static int GetConfiguredSignalIdrWaitSeconds()
+        {
+            return Math.Max(1, Math.Min(15, Plugin.Instance?.Configuration?.HTSPSignalIdrWaitSeconds ?? 3));
+        }
+
+        private static int GetConfiguredSignalRecoveryMaxReconnects()
+        {
+            return Math.Max(0, Math.Min(10, Plugin.Instance?.Configuration?.HTSPSignalRecoveryMaxReconnects ?? 2));
+        }
+
+        private static int GetConfiguredSignalRecoveryCooldownSeconds()
+        {
+            return Math.Max(1, Math.Min(300, Plugin.Instance?.Configuration?.HTSPSignalRecoveryCooldownSeconds ?? 15));
         }
 
         private void ResetConnectionAttemptSignals()

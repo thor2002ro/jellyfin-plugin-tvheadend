@@ -73,6 +73,28 @@
                 </div>
                 <div class="checkboxContainer checkboxContainer-withDescription">
                     <label>
+                        <input is="emby-checkbox" type="checkbox" id="chkHTSPSignalRecoveryEnabled" />
+                        <span>Recover automatically from severe tuner signal errors</span>
+                    </label>
+                    <div class="fieldDescription checkboxFieldDescription">Keeps audio/subtitles flowing, drops damaged inter-frame video until a verified IDR/IRAP, and performs bounded HTSP reconnects after sustained lock loss or rapid uncorrected-block growth.</div>
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="1" max="30" step="1" id="txtHTSPSignalLockLossSeconds" label="Signal lock-loss threshold (seconds)" />
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="1" max="1000" step="1" id="txtHTSPSignalUncBurstThreshold" label="UNC burst threshold (within 5 seconds)" />
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="1" max="15" step="1" id="txtHTSPSignalIdrWaitSeconds" label="Wait for clean IDR before reconnect (seconds)" />
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="0" max="10" step="1" id="txtHTSPSignalRecoveryMaxReconnects" label="Maximum signal reconnects per 60 seconds" />
+                </div>
+                <div class="inputContainer">
+                    <input is="emby-input" type="number" min="1" max="300" step="1" id="txtHTSPSignalRecoveryCooldownSeconds" label="Signal reconnect cooldown (seconds)" />
+                </div>
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
                         <input is="emby-checkbox" type="checkbox" id="chkForceDeinterlace" />
                         <span>Force video deinterlacing for all channels and recordings. (Experimental)</span>
                     </label>

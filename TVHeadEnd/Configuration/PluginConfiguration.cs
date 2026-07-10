@@ -26,6 +26,12 @@ namespace TVHeadEnd.Configuration
         public int HTSPQueueDepth { get; set; }
         public int HTSPStallTimeoutSeconds { get; set; }
         public bool HTSPFilterControlStreams { get; set; }
+        public bool HTSPSignalRecoveryEnabled { get; set; }
+        public int HTSPSignalLockLossSeconds { get; set; }
+        public int HTSPSignalUncBurstThreshold { get; set; }
+        public int HTSPSignalIdrWaitSeconds { get; set; }
+        public int HTSPSignalRecoveryMaxReconnects { get; set; }
+        public int HTSPSignalRecoveryCooldownSeconds { get; set; }
 
         public PluginConfiguration()
         {
@@ -47,6 +53,12 @@ namespace TVHeadEnd.Configuration
             HTSPQueueDepth = 2000000;
             HTSPStallTimeoutSeconds = 15;
             HTSPFilterControlStreams = false;
+            HTSPSignalRecoveryEnabled = true;
+            HTSPSignalLockLossSeconds = 3;
+            HTSPSignalUncBurstThreshold = 5;
+            HTSPSignalIdrWaitSeconds = 3;
+            HTSPSignalRecoveryMaxReconnects = 2;
+            HTSPSignalRecoveryCooldownSeconds = 15;
         }
     }
 }

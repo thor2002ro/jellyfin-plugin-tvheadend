@@ -31,6 +31,12 @@ export default function (view, params) {
             page.querySelector('#txtHTSPQueueDepth').value = Number.isFinite(config.HTSPQueueDepth) ? config.HTSPQueueDepth : 2000000;
             page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(config.HTSPStallTimeoutSeconds) ? config.HTSPStallTimeoutSeconds : 15;
             page.querySelector('#chkHTSPFilterControlStreams').checked = config.HTSPFilterControlStreams === true;
+            page.querySelector('#chkHTSPSignalRecoveryEnabled').checked = config.HTSPSignalRecoveryEnabled !== false;
+            page.querySelector('#txtHTSPSignalLockLossSeconds').value = Number.isFinite(config.HTSPSignalLockLossSeconds) ? config.HTSPSignalLockLossSeconds : 3;
+            page.querySelector('#txtHTSPSignalUncBurstThreshold').value = Number.isFinite(config.HTSPSignalUncBurstThreshold) ? config.HTSPSignalUncBurstThreshold : 5;
+            page.querySelector('#txtHTSPSignalIdrWaitSeconds').value = Number.isFinite(config.HTSPSignalIdrWaitSeconds) ? config.HTSPSignalIdrWaitSeconds : 3;
+            page.querySelector('#txtHTSPSignalRecoveryMaxReconnects').value = Number.isFinite(config.HTSPSignalRecoveryMaxReconnects) ? config.HTSPSignalRecoveryMaxReconnects : 2;
+            page.querySelector('#txtHTSPSignalRecoveryCooldownSeconds').value = Number.isFinite(config.HTSPSignalRecoveryCooldownSeconds) ? config.HTSPSignalRecoveryCooldownSeconds : 15;
             Dashboard.hideLoadingMsg();
         });
     });
@@ -57,6 +63,12 @@ export default function (view, params) {
             config.HTSPQueueDepth = Math.max(0, Math.min(20000000, parseInt(form.querySelector('#txtHTSPQueueDepth').value, 10) || 0));
             config.HTSPStallTimeoutSeconds = Math.max(0, Math.min(120, parseInt(form.querySelector('#txtHTSPStallTimeoutSeconds').value, 10) || 0));
             config.HTSPFilterControlStreams = form.querySelector('#chkHTSPFilterControlStreams').checked;
+            config.HTSPSignalRecoveryEnabled = form.querySelector('#chkHTSPSignalRecoveryEnabled').checked;
+            config.HTSPSignalLockLossSeconds = Math.max(1, Math.min(30, parseInt(form.querySelector('#txtHTSPSignalLockLossSeconds').value, 10) || 3));
+            config.HTSPSignalUncBurstThreshold = Math.max(1, Math.min(1000, parseInt(form.querySelector('#txtHTSPSignalUncBurstThreshold').value, 10) || 5));
+            config.HTSPSignalIdrWaitSeconds = Math.max(1, Math.min(15, parseInt(form.querySelector('#txtHTSPSignalIdrWaitSeconds').value, 10) || 3));
+            config.HTSPSignalRecoveryMaxReconnects = Math.max(0, Math.min(10, parseInt(form.querySelector('#txtHTSPSignalRecoveryMaxReconnects').value, 10) || 0));
+            config.HTSPSignalRecoveryCooldownSeconds = Math.max(1, Math.min(300, parseInt(form.querySelector('#txtHTSPSignalRecoveryCooldownSeconds').value, 10) || 15));
             ApiClient.updatePluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId, config).then(Dashboard.processPluginConfigurationUpdateResult);
         });
         return false;

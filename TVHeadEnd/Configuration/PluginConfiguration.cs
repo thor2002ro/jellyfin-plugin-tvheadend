@@ -1,4 +1,4 @@
-using System.Diagnostics.CodeAnalysis;
+﻿using System;
 using MediaBrowser.Model.Plugins;
 
 namespace TVHeadEnd.Configuration
@@ -36,6 +36,12 @@ namespace TVHeadEnd.Configuration
         public int HTSPSignalIdrWaitSeconds { get; set; }
         public int HTSPSignalRecoveryMaxReconnects { get; set; }
         public int HTSPSignalRecoveryCooldownSeconds { get; set; }
+        public bool HTSPEnableStreamSharing { get; set; }
+        public bool HTSPKeyframeStartupEnabled { get; set; }
+        public bool HTSPHealthLoggingEnabled { get; set; }
+        public int HTSPHealthLogIntervalSeconds { get; set; }
+        public bool HTSPSignalHealthLoggingEnabled { get; set; }
+        public bool HTSPDetailedDiagnostics { get; set; }
 
         public PluginConfiguration()
         {
@@ -62,6 +68,12 @@ namespace TVHeadEnd.Configuration
             HTSPSignalIdrWaitSeconds = 3;
             HTSPSignalRecoveryMaxReconnects = 2;
             HTSPSignalRecoveryCooldownSeconds = 15;
+            HTSPEnableStreamSharing = true;
+            HTSPKeyframeStartupEnabled = true;
+            HTSPHealthLoggingEnabled = true;
+            HTSPHealthLogIntervalSeconds = 30;
+            HTSPSignalHealthLoggingEnabled = true;
+            HTSPDetailedDiagnostics = false;
         }
 
         public string TVH_ServerName { get; set; }

@@ -73,6 +73,7 @@ namespace TVHeadEnd
         private readonly Dictionary<int, long> _muxPacketBytes = new Dictionary<int, long>();
         private readonly Dictionary<int, long> _muxKeyFrameCounts = new Dictionary<int, long>();
         private readonly object _muxPacketStatsLock = new object();
+        private readonly object _signalStateLock = new object();
         private readonly object _connectionStateLock = new object();
         private readonly object _clientAbortSync = new object();
         private readonly object _readerStateLock = new object();
@@ -111,6 +112,12 @@ namespace TVHeadEnd
         private long _lastQueueIdrops;
         private long _lastQueuePdrops;
         private long _lastQueueBdrops;
+        private long _lastQueuePackets;
+        private long _lastQueueBytes;
+        private long _lastQueueDelayUs;
+        private SignalSnapshot _signalSnapshot = new SignalSnapshot();
+        private string _sourceAdapter;
+        private string _sourceService;
         private int? _primaryVideoStreamIndex;
         private bool _startupCacheKeyframeAligned;
         private bool _startupCacheOverflowLogged;
@@ -124,6 +131,26 @@ namespace TVHeadEnd
         private readonly Dictionary<string, List<BlockingByteStream>> _consumerQueuesByOwner = new Dictionary<string, List<BlockingByteStream>>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CancellationTokenSource> _ownerIdleDisconnects = new Dictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _sharedPlaybackReferences = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class SignalSnapshot
+        {
+            public DateTime UpdatedUtc { get; set; }
+
+            public string Status { get; set; }
+
+            public int? SignalRaw { get; set; }
+
+            public int? SnrRaw { get; set; }
+
+            public long? Ber { get; set; }
+
+            public long? Unc { get; set; }
+
+            public SignalSnapshot Clone()
+            {
+                return (SignalSnapshot)MemberwiseClone();
+            }
+        }
 
         private static TaskCompletionSource<bool> CreateFirstPacketSource()
         {
@@ -2034,7 +2061,11 @@ namespace TVHeadEnd
 
             if (!string.IsNullOrWhiteSpace(periodicSummary))
             {
-                _logger.LogInformation("HTSP mux packet counters: {MuxPacketSummary}", periodicSummary);
+                _logger.LogInformation(
+                    "HTSP health channel {ChannelId}: {Health}; streams=[{MuxPacketSummary}]",
+                    _channelId,
+                    BuildHealthSummary(),
+                    periodicSummary);
             }
         }
 
@@ -2922,6 +2953,9 @@ namespace TVHeadEnd
             Interlocked.Exchange(ref _lastQueueIdrops, 0);
             Interlocked.Exchange(ref _lastQueuePdrops, 0);
             Interlocked.Exchange(ref _lastQueueBdrops, 0);
+            Interlocked.Exchange(ref _lastQueuePackets, 0);
+            Interlocked.Exchange(ref _lastQueueBytes, 0);
+            Interlocked.Exchange(ref _lastQueueDelayUs, 0);
         }
 
         private void LogQueueStatus(HTSMessage response)
@@ -2939,6 +2973,9 @@ namespace TVHeadEnd
             var bytes = GetLong(response, "bytes", 0);
             var delay = GetLong(response, "delay", 0);
             var queueDepth = GetConfiguredQueueDepth();
+            Interlocked.Exchange(ref _lastQueuePackets, packets);
+            Interlocked.Exchange(ref _lastQueueBytes, bytes);
+            Interlocked.Exchange(ref _lastQueueDelayUs, delay);
 
             if (deltaIdrops > 0 || deltaPdrops > 0 || deltaBdrops > 0)
             {
@@ -2972,14 +3009,177 @@ namespace TVHeadEnd
 
         private void LogSignalStatus(HTSMessage response)
         {
-            _logger.LogTrace(
-                "HTSP signal {SubscriptionId}: status={Status}, snr={Snr}, signal={Signal}, ber={Ber}, unc={Unc}",
-                _subscriptionId,
-                response.getString("feStatus", string.Empty),
-                GetInt(response, "feSNR", 0),
-                GetInt(response, "feSignal", 0),
-                GetInt(response, "feBER", 0),
-                GetInt(response, "feUNC", 0));
+            var current = new SignalSnapshot
+            {
+                UpdatedUtc = DateTime.UtcNow,
+                Status = response.getString("feStatus", string.Empty),
+                SnrRaw = GetNullableInt(response, "feSNR"),
+                SignalRaw = GetNullableInt(response, "feSignal"),
+                Ber = GetNullableLong(response, "feBER"),
+                Unc = GetNullableLong(response, "feUNC")
+            };
+
+            SignalSnapshot previous;
+            lock (_signalStateLock)
+            {
+                previous = _signalSnapshot;
+                _signalSnapshot = current;
+            }
+
+            var firstValidStatus = previous == null || previous.UpdatedUtc == default;
+            var lockWasPresent = HasFrontendLock(previous?.Status);
+            var lockIsPresent = HasFrontendLock(current.Status);
+            var lockChanged = !firstValidStatus && lockWasPresent != lockIsPresent;
+            var uncIncrease = GetCounterIncrease(previous?.Unc, current.Unc);
+            var berIncrease = GetCounterIncrease(previous?.Ber, current.Ber);
+            var signalChanged = HasMeaningfulFrontendChange(previous?.SignalRaw, current.SignalRaw);
+            var snrChanged = HasMeaningfulFrontendChange(previous?.SnrRaw, current.SnrRaw);
+            var summary = FormatSignalSummary(current);
+
+            if (lockChanged && !lockIsPresent)
+            {
+                _logger.LogWarning(
+                    "HTSP signal lock lost for channel {ChannelId}: adapter={Adapter}, service={Service}, {SignalSummary}",
+                    _channelId,
+                    _sourceAdapter ?? string.Empty,
+                    _sourceService ?? string.Empty,
+                    summary);
+            }
+            else if (uncIncrease > 0 || berIncrease > 0)
+            {
+                _logger.LogWarning(
+                    "HTSP signal errors increased for channel {ChannelId}: adapter={Adapter}, service={Service}, newBER={NewBer}, newUNC={NewUnc}, {SignalSummary}, queueDrops I/P/B={IDrops}/{PDrops}/{BDrops}",
+                    _channelId,
+                    _sourceAdapter ?? string.Empty,
+                    _sourceService ?? string.Empty,
+                    berIncrease,
+                    uncIncrease,
+                    summary,
+                    Interlocked.Read(ref _lastQueueIdrops),
+                    Interlocked.Read(ref _lastQueuePdrops),
+                    Interlocked.Read(ref _lastQueueBdrops));
+            }
+            else if (firstValidStatus || lockChanged || signalChanged || snrChanged)
+            {
+                _logger.LogInformation(
+                    "HTSP signal channel {ChannelId}: adapter={Adapter}, service={Service}, {SignalSummary}",
+                    _channelId,
+                    _sourceAdapter ?? string.Empty,
+                    _sourceService ?? string.Empty,
+                    summary);
+            }
+            else
+            {
+                _logger.LogTrace("HTSP signal {SubscriptionId}: {SignalSummary}", _subscriptionId, summary);
+            }
+        }
+
+        private string BuildHealthSummary()
+        {
+            SignalSnapshot signal;
+            lock (_signalStateLock)
+            {
+                signal = _signalSnapshot?.Clone();
+            }
+
+            var lastPacketTicks = Interlocked.Read(ref _lastPlayableMuxPacketUtcTicks);
+            var lastPacketAgeMs = lastPacketTicks > 0
+                ? Math.Max(0, (long)(DateTime.UtcNow - new DateTime(lastPacketTicks, DateTimeKind.Utc)).TotalMilliseconds)
+                : -1;
+
+            return FormatSignalSummary(signal)
+                + ", queuePackets=" + Interlocked.Read(ref _lastQueuePackets)
+                + ", queueBytes=" + Interlocked.Read(ref _lastQueueBytes)
+                + ", queueDelayUs=" + Interlocked.Read(ref _lastQueueDelayUs)
+                + ", queueDrops=" + Interlocked.Read(ref _lastQueueIdrops)
+                + "/" + Interlocked.Read(ref _lastQueuePdrops)
+                + "/" + Interlocked.Read(ref _lastQueueBdrops)
+                + ", lastMuxPacketMs=" + lastPacketAgeMs
+                + ", reconnectAttempts=" + Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0);
+        }
+
+        private static string FormatSignalSummary(SignalSnapshot signal)
+        {
+            if (signal == null || signal.UpdatedUtc == default)
+            {
+                return "signal=unavailable";
+            }
+
+            return "status=" + (string.IsNullOrWhiteSpace(signal.Status) ? "unknown" : signal.Status)
+                + ", signal=" + FormatFrontendValue(signal.SignalRaw)
+                + ", snr=" + FormatFrontendValue(signal.SnrRaw)
+                + ", ber=" + (signal.Ber.HasValue ? signal.Ber.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "n/a")
+                + ", unc=" + (signal.Unc.HasValue ? signal.Unc.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "n/a")
+                + ", ageMs=" + Math.Max(0, (long)(DateTime.UtcNow - signal.UpdatedUtc).TotalMilliseconds);
+        }
+
+        private static string FormatFrontendValue(int? rawValue)
+        {
+            var percent = NormalizeFrontendValue(rawValue);
+            if (!rawValue.HasValue)
+            {
+                return "n/a";
+            }
+
+            return percent.HasValue
+                ? percent.Value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + "% (raw=" + rawValue.Value + ")"
+                : "raw=" + rawValue.Value;
+        }
+
+        private static double? NormalizeFrontendValue(int? value)
+        {
+            if (!value.HasValue || value.Value < 0)
+            {
+                return null;
+            }
+
+            if (value.Value <= 100)
+            {
+                return value.Value;
+            }
+
+            if (value.Value <= 65535)
+            {
+                return value.Value * 100.0 / 65535.0;
+            }
+
+            return null;
+        }
+
+        private static bool HasMeaningfulFrontendChange(int? previous, int? current)
+        {
+            var previousPercent = NormalizeFrontendValue(previous);
+            var currentPercent = NormalizeFrontendValue(current);
+            return previousPercent.HasValue
+                && currentPercent.HasValue
+                && Math.Abs(previousPercent.Value - currentPercent.Value) >= 5.0;
+        }
+
+        private static bool HasFrontendLock(string status)
+        {
+            if (string.IsNullOrWhiteSpace(status))
+            {
+                return false;
+            }
+
+            return status.Split(new[] { ' ', '|', ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Any(token => string.Equals(token.Trim(), "LOCK", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(token.Trim(), "GOOD", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static long GetCounterIncrease(long? previous, long? current)
+        {
+            if (!current.HasValue || current.Value <= 0)
+            {
+                return 0;
+            }
+
+            if (!previous.HasValue || current.Value < previous.Value)
+            {
+                return current.Value;
+            }
+
+            return current.Value - previous.Value;
         }
 
         private void LogTimeshiftStatus(HTSMessage response)
@@ -3030,13 +3230,15 @@ namespace TVHeadEnd
                     return;
                 }
 
+                _sourceAdapter = source.getString("adapter", string.Empty);
+                _sourceService = source.getString("service", string.Empty);
                 _logger.LogInformation(
                     "HTSP source: adapter={Adapter}, network={Network}, mux={Mux}, provider={Provider}, service={Service}, satpos={SatPos}",
-                    source.getString("adapter", string.Empty),
+                    _sourceAdapter,
                     source.getString("network", string.Empty),
                     source.getString("mux", string.Empty),
                     source.getString("provider", string.Empty),
-                    source.getString("service", string.Empty),
+                    _sourceService,
                     source.getString("satpos", string.Empty));
             }
             catch (Exception ex)
@@ -3239,6 +3441,16 @@ namespace TVHeadEnd
         private static long GetLong(HTSMessage message, string field, long defaultValue)
         {
             return message.containsField(field) ? message.getLong(field) : defaultValue;
+        }
+
+        private static int? GetNullableInt(HTSMessage message, string field)
+        {
+            return message.containsField(field) ? message.getInt(field) : null;
+        }
+
+        private static long? GetNullableLong(HTSMessage message, string field)
+        {
+            return message.containsField(field) ? message.getLong(field) : null;
         }
 
         public void Dispose()

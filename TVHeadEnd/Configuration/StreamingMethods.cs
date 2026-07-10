@@ -6,19 +6,11 @@ namespace TVHeadEnd.Configuration
         public const string HttpBasic = "HttpBasic";
         public const string Htsp = "Htsp";
 
-        public static string GetEffective(string streamingMethod, bool enableSubsMaudios)
+        public static string GetEffective(string streamingMethod)
         {
-            if (streamingMethod == HttpBasic || streamingMethod == Htsp)
-            {
-                return streamingMethod;
-            }
-
-            if (streamingMethod == HttpTicket)
-            {
-                return streamingMethod;
-            }
-
-            return enableSubsMaudios ? HttpBasic : Htsp;
+            return streamingMethod == HttpBasic || streamingMethod == HttpTicket || streamingMethod == Htsp
+                ? streamingMethod
+                : Htsp;
         }
     }
 }

@@ -87,7 +87,29 @@ namespace TVHeadEnd.DataHelper
             }
         }
 
-        public Task<IEnumerable<MyRecordingInfo>> BuildDvrInfos(CancellationToken cancellationToken)
+        public long ResolveDvrId(string dvrId)
+        {
+            if (uint.TryParse(dvrId, out var numericId))
+            {
+                return numericId;
+            }
+
+            lock (_data)
+            {
+                foreach (var entry in _data)
+                {
+                    if (entry.Value.containsField("idStr")
+                        && string.Equals(entry.Value.getString("idStr"), dvrId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return entry.Value.getLong("id");
+                    }
+                }
+            }
+
+            throw new ArgumentException("Unknown TVHeadend DVR identifier.", nameof(dvrId));
+        }
+
+        public Task<IEnumerable<MyRecordingInfo>> buildDvrInfos(CancellationToken cancellationToken)
         {
             return Task.Run<IEnumerable<MyRecordingInfo>>(() =>
             {
@@ -105,163 +127,101 @@ namespace TVHeadEnd.DataHelper
                         HTSMessage m = entry.Value;
                         MyRecordingInfo ri = new MyRecordingInfo();
 
-                        try
+                        if (m.TryGetString("error", out var error)
+                            && error.Contains("missing", StringComparison.OrdinalIgnoreCase))
                         {
-                            if (m.ContainsField("error"))
-                            {
-                                // When TVHeadend recordings are removed, their info can
-                                // still be kept around with a status of "completed".
-                                // The only way to identify them is from the error string
-                                // which is set to "File missing". Use that to not show
-                                // non-existing deleted recordings.
-                                if (m.GetString("error")?.Contains("missing", StringComparison.Ordinal) == true)
-                                {
-                                    continue;
-                                }
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            // TVHeadend retains deleted recordings as completed with "File missing".
+                            continue;
                         }
 
-                        try
+                        if (m.TryGetString("idStr", out var id))
                         {
-                            if (m.ContainsField("id"))
-                            {
-                                ri.Id = string.Empty + m.GetInt("id");
-                            }
+                            ri.Id = id;
                         }
-                        catch (InvalidCastException)
+                        else if (m.TryGetLong("id", out var numericId))
                         {
+                            ri.Id = numericId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
-                        try
+                        if (m.TryGetString("ratingLabel", out var ratingLabel))
                         {
-                            if (m.ContainsField("path"))
-                            {
-                                ri.Path = string.Empty + m.GetString("path");
-                            }
+                            ri.OfficialRating = ratingLabel;
                         }
-                        catch (InvalidCastException)
+                        else if (m.TryGetInt("ageRating", out var ageRating) && ageRating > 0)
                         {
+                            ri.OfficialRating = ageRating + "+";
                         }
 
-                        try
+                        if (m.TryGetString("path", out var path))
                         {
-                            if (m.ContainsField("url"))
-                            {
-                                ri.Url = string.Empty + m.GetString("url");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.Path = path;
                         }
 
-                        try
+                        if (m.TryGetString("url", out var url))
                         {
-                            if (m.ContainsField("channel"))
-                            {
-                                ri.ChannelId = string.Empty + m.GetInt("channel");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.Url = url;
                         }
 
-                        try
+                        if (m.TryGetLong("channel", out var channel))
                         {
-                            if (m.ContainsField("start"))
-                            {
-                                long unixUtc = m.GetLong("start");
-                                ri.StartDate = _initialDateTimeUTC.AddSeconds(unixUtc).ToUniversalTime();
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.ChannelId = channel.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
-                        try
+                        if (m.TryGetLong("start", out var start))
                         {
-                            if (m.ContainsField("stop"))
-                            {
-                                long unixUtc = m.GetLong("stop");
-                                ri.EndDate = _initialDateTimeUTC.AddSeconds(unixUtc).ToUniversalTime();
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.StartDate = _initialDateTimeUTC.AddSeconds(start).ToUniversalTime();
                         }
 
-                        try
+                        if (m.TryGetLong("stop", out var stop))
                         {
-                            if (m.ContainsField("title"))
-                            {
-                                ri.Name = m.GetString("title");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.EndDate = _initialDateTimeUTC.AddSeconds(stop).ToUniversalTime();
                         }
 
-                        try
+                        if (m.TryGetString("title", out var title))
                         {
-                            // Up to HTSP v31 "description" is a collapsed fallback of
-                            // description/summary/subtitle; from v32 on the three fields are
-                            // independent, so fall back to keep an overview in both layouts.
-                            ri.Overview = m.GetString("description", null)
-                                ?? m.GetString("summary", null)
-                                ?? m.GetString("subtitle", null);
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.Name = title;
                         }
 
-                        try
+                        if (m.TryGetString("description", out var description))
                         {
-                            if (m.ContainsField("subtitle"))
-                            {
-                                ri.EpisodeTitle = m.GetString("subtitle");
-                                ri.IsSeries = true;
-                            }
+                            ri.Overview = description;
                         }
-                        catch (InvalidCastException)
+
+                        if (string.IsNullOrWhiteSpace(ri.Overview) && m.TryGetString("comment", out var comment))
                         {
+                            ri.Overview = comment;
+                        }
+
+                        if (m.TryGetString("subtitle", out var subtitle))
+                        {
+                            ri.EpisodeTitle = subtitle;
+                            ri.IsSeries = true;
                         }
 
                         ri.HasImage = false;
                         // public string ImagePath { get; set; }
                         // public string ImageUrl { get; set; }
 
-                        try
+                        if (m.TryGetString("state", out var state))
                         {
-                            if (m.ContainsField("state"))
+                            switch (state)
                             {
-                                string? state = m.GetString("state");
-                                switch (state)
-                                {
-                                    case "completed":
-                                        ri.Status = RecordingStatus.Completed;
-                                        break;
-                                    case "scheduled":
-                                        ri.Status = RecordingStatus.New;
-                                        continue;
-                                    // break;
-                                    case "missed":
-                                        ri.Status = RecordingStatus.Error;
-                                        break;
-                                    case "recording":
-                                        ri.Status = RecordingStatus.InProgress;
-                                        break;
-
-                                    default:
-                                        _logger.LogCritical("[TVHclient] DvrDataHelper.buildDvrInfos: state '{State}' not handled", state);
-                                        continue;
-                                        // break;
-                                }
+                                case "completed":
+                                    ri.Status = RecordingStatus.Completed;
+                                    break;
+                                case "scheduled":
+                                    ri.Status = RecordingStatus.New;
+                                    continue;
+                                case "missed":
+                                    ri.Status = RecordingStatus.Error;
+                                    break;
+                                case "recording":
+                                    ri.Status = RecordingStatus.InProgress;
+                                    break;
+                                default:
+                                    _logger.LogCritical("[TVHclient] DvrDataHelper.buildDvrInfos: state '{state}' not handled", state);
+                                    continue;
                             }
-                        }
-                        catch (InvalidCastException)
-                        {
                         }
 
                         // Path must not be set to force emby use of the LiveTvService methods!!!!
@@ -270,26 +230,14 @@ namespace TVHeadEnd.DataHelper
                         //    ri.Path = m.GetString("path");
                         // }
 
-                        try
+                        if (m.TryGetString("autorecId", out var autorecId))
                         {
-                            if (m.ContainsField("autorecId"))
-                            {
-                                ri.SeriesTimerId = m.GetString("autorecId");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.SeriesTimerId = autorecId;
                         }
 
-                        try
+                        if (m.TryGetLong("eventId", out var eventId))
                         {
-                            if (m.ContainsField("eventId"))
-                            {
-                                ri.ProgramId = string.Empty + m.GetInt("eventId");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ri.ProgramId = eventId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
                         /*
@@ -337,148 +285,81 @@ namespace TVHeadEnd.DataHelper
                         HTSMessage m = entry.Value;
                         TimerInfo ti = new TimerInfo();
 
-                        try
+                        if (m.TryGetString("idStr", out var id))
                         {
-                            if (m.ContainsField("id"))
-                            {
-                                ti.Id = string.Empty + m.GetInt("id");
-                            }
+                            ti.Id = id;
                         }
-                        catch (InvalidCastException)
+                        else if (m.TryGetLong("id", out var numericId))
                         {
+                            ti.Id = numericId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
-                        try
+                        if (m.TryGetLong("channel", out var channel))
                         {
-                            if (m.ContainsField("channel"))
-                            {
-                                ti.ChannelId = string.Empty + m.GetInt("channel");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.ChannelId = channel.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
-                        try
+                        if (m.TryGetLong("start", out var start))
                         {
-                            if (m.ContainsField("start"))
-                            {
-                                long unixUtc = m.GetLong("start");
-                                ti.StartDate = _initialDateTimeUTC.AddSeconds(unixUtc).ToUniversalTime();
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.StartDate = _initialDateTimeUTC.AddSeconds(start).ToUniversalTime();
                         }
 
-                        try
+                        if (m.TryGetLong("stop", out var stop))
                         {
-                            if (m.ContainsField("stop"))
-                            {
-                                long unixUtc = m.GetLong("stop");
-                                ti.EndDate = _initialDateTimeUTC.AddSeconds(unixUtc).ToUniversalTime();
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.EndDate = _initialDateTimeUTC.AddSeconds(stop).ToUniversalTime();
                         }
 
-                        try
+                        if (m.TryGetString("title", out var title))
                         {
-                            if (m.ContainsField("title"))
-                            {
-                                ti.Name = m.GetString("title");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.Name = title;
                         }
 
-                        try
+                        if (m.TryGetString("description", out var description))
                         {
-                            ti.Overview = m.GetString("description", null)
-                                ?? m.GetString("summary", null)
-                                ?? m.GetString("subtitle", null);
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.Overview = description;
                         }
 
-                        try
+                        if (string.IsNullOrWhiteSpace(ti.Overview) && m.TryGetString("comment", out var comment))
                         {
-                            if (m.ContainsField("state"))
-                            {
-                                string? state = m.GetString("state");
-                                switch (state)
-                                {
-                                    case "scheduled":
-                                        ti.Status = RecordingStatus.New;
-                                        break;
-                                    default:
-                                        // only scheduled timers need to be delivered
-                                        continue;
-                                }
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.Overview = comment;
                         }
 
-                        try
+                        if (m.TryGetString("state", out var state) && state != "scheduled")
                         {
-                            if (m.ContainsField("startExtra"))
-                            {
-                                ti.PrePaddingSeconds = (int)m.GetLong("startExtra") * 60;
-                                ti.IsPrePaddingRequired = true;
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            // Only scheduled timers need to be delivered.
+                            continue;
                         }
 
-                        try
+                        if (state == "scheduled")
                         {
-                            if (m.ContainsField("stopExtra"))
-                            {
-                                ti.PostPaddingSeconds = (int)m.GetLong("stopExtra") * 60;
-                                ti.IsPostPaddingRequired = true;
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.Status = RecordingStatus.New;
                         }
 
-                        try
+                        if (m.TryGetLong("startExtra", out var startExtra))
                         {
-                            if (m.ContainsField("priority"))
-                            {
-                                ti.Priority = m.GetInt("priority");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.PrePaddingSeconds = (int)startExtra * 60;
+                            ti.IsPrePaddingRequired = true;
                         }
 
-                        try
+                        if (m.TryGetLong("stopExtra", out var stopExtra))
                         {
-                            if (m.ContainsField("autorecId"))
-                            {
-                                ti.SeriesTimerId = m.GetString("autorecId");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            ti.PostPaddingSeconds = (int)stopExtra * 60;
+                            ti.IsPostPaddingRequired = true;
                         }
 
-                        try
+                        if (m.TryGetInt("priority", out var priority))
                         {
-                            if (m.ContainsField("eventId"))
-                            {
-                                ti.ProgramId = string.Empty + m.GetInt("eventId");
-                            }
+                            ti.Priority = priority;
                         }
-                        catch (InvalidCastException)
+
+                        if (m.TryGetString("autorecId", out var autorecId))
                         {
+                            ti.SeriesTimerId = autorecId;
+                        }
+
+                        if (m.TryGetLong("eventId", out var eventId))
+                        {
+                            ti.ProgramId = eventId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
                         result.Add(ti);

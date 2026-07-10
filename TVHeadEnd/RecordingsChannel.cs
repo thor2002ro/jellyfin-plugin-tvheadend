@@ -14,7 +14,8 @@ using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Logging;
-using TVHeadEnd.TimeoutHelper;
+using TVHeadEnd.HTSP;
+using TVHeadEnd.HTSP_Responses;
 
 namespace TVHeadEnd
 {
@@ -163,17 +164,15 @@ namespace TVHeadEnd
                 return [];
             }
 
-            TaskWithTimeoutRunner<IEnumerable<MyRecordingInfo>> twtr = new TaskWithTimeoutRunner<IEnumerable<MyRecordingInfo>>(_timeout);
-            TaskWithTimeoutResult<IEnumerable<MyRecordingInfo>> twtRes = await
-                twtr.RunWithTimeout(_htsConnectionHandler.BuildDvrInfos(cancellationToken)).ConfigureAwait(false);
-
-            if (twtRes.HasTimeout)
+            try
+            {
+                return await _htsConnectionHandler.BuildDvrInfos(cancellationToken).WaitAsync(TIMEOUT, cancellationToken);
+            }
+            catch (TimeoutException)
             {
                 _logger.LogDebug("[TVHclient] GetAllRecordingsAsync - Timeout");
                 return [];
             }
-
-            return twtRes.Result;
         }
 
         public bool CanDelete(BaseItem item)
@@ -255,7 +254,7 @@ namespace TVHeadEnd
 
         private ChannelItemInfo ConvertToChannelItem(MyRecordingInfo item)
         {
-            var path = BuildRecordingPath(item.Id ?? string.Empty);
+            var path = buildRecordingPath(_htsConnectionHandler.ResolveDvrId(item.Id).ToString(CultureInfo.InvariantCulture));
 
             _logger.LogDebug("[TVHclient] ConvertToChannelItem - Creating ChannelItemInfo");
 

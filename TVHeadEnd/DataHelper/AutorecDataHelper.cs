@@ -103,37 +103,27 @@ namespace TVHeadEnd.DataHelper
                         HTSMessage m = entry.Value;
                         SeriesTimerInfo sti = new SeriesTimerInfo();
 
-                        try
+                        if (m.TryGetString("id", out var id))
                         {
-                            if (m.ContainsField("id"))
-                            {
-                                sti.Id = m.GetString("id");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Id = id;
                         }
 
-                        try
+                        if (m.TryGetInt("broadcastType", out var broadcastType))
                         {
-                            if (m.ContainsField("daysOfWeek"))
-                            {
-                                int daysOfWeek = m.GetInt("daysOfWeek");
-                                sti.Days = GetDayOfWeekListFromInt(daysOfWeek);
-                            }
+                            sti.RecordNewOnly = broadcastType == 1 || broadcastType == 3;
                         }
-                        catch (InvalidCastException)
+
+                        if (m.TryGetInt("daysOfWeek", out var daysOfWeek))
                         {
+                            sti.Days = getDayOfWeekListFromInt(daysOfWeek);
                         }
 
                         sti.StartDate = DateTime.Now.ToUniversalTime();
 
-                        try
+                        if (m.TryGetInt("retention", out var retentionInDays))
                         {
-                            if (m.ContainsField("retention"))
+                            try
                             {
-                                int retentionInDays = m.GetInt("retention");
-
                                 if (DateTime.MaxValue.AddDays(-retentionInDays) < DateTime.Now)
                                 {
                                     _logger.LogError("[TVHclient] AutorecDataHelper.buildAutorecInfos: change during 'EndDate' calculation: set retention value from '{Days}' to '365' days", retentionInDays);
@@ -144,89 +134,48 @@ namespace TVHeadEnd.DataHelper
                                     sti.EndDate = DateTime.Now.AddDays(retentionInDays).ToUniversalTime();
                                 }
                             }
-                        }
-                        catch (Exception e)
-                        {
-                            _logger.LogError(e, "[TVHclient] AutorecDataHelper.buildAutorecInfos: exception during 'EndDate' calculation. HTSMessage: {M}", m.ToString());
-                        }
-
-                        try
-                        {
-                            if (m.ContainsField("channel"))
+                            catch (ArgumentOutOfRangeException e)
                             {
-                                sti.ChannelId = string.Empty + m.GetInt("channel");
+                                _logger.LogError(e, "[TVHclient] AutorecDataHelper.buildAutorecInfos: exception during 'EndDate' calculation. HTSMessage: {m}", m.ToString());
                             }
                         }
-                        catch (InvalidCastException)
+
+                        if (m.TryGetLong("channel", out var channel))
                         {
+                            sti.ChannelId = channel.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         }
 
-                        try
+                        if (m.TryGetLong("startExtra", out var startExtra))
                         {
-                            if (m.ContainsField("startExtra"))
-                            {
-                                sti.PrePaddingSeconds = (int)m.GetLong("startExtra") * 60;
-                                sti.IsPrePaddingRequired = true;
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.PrePaddingSeconds = (int)startExtra * 60;
+                            sti.IsPrePaddingRequired = true;
                         }
 
-                        try
+                        if (m.TryGetLong("stopExtra", out var stopExtra))
                         {
-                            if (m.ContainsField("stopExtra"))
-                            {
-                                sti.PostPaddingSeconds = (int)m.GetLong("stopExtra") * 60;
-                                sti.IsPostPaddingRequired = true;
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.PostPaddingSeconds = (int)stopExtra * 60;
+                            sti.IsPostPaddingRequired = true;
                         }
 
-                        try
+                        if (m.TryGetString("title", out var title))
                         {
-                            if (m.ContainsField("title"))
-                            {
-                                sti.Name = m.GetString("title");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Name = title;
+                            sti.SeriesId = title;
                         }
 
-                        try
+                        if (m.TryGetString("description", out var description))
                         {
-                            if (m.ContainsField("description"))
-                            {
-                                sti.Overview = m.GetString("description");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Overview = description;
                         }
 
-                        try
+                        if (string.IsNullOrWhiteSpace(sti.Overview) && m.TryGetString("comment", out var comment))
                         {
-                            if (m.ContainsField("priority"))
-                            {
-                                sti.Priority = m.GetInt("priority");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Overview = comment;
                         }
 
-                        try
+                        if (m.TryGetInt("priority", out var priority))
                         {
-                            if (m.ContainsField("title"))
-                            {
-                                sti.SeriesId = m.GetString("title");
-                            }
-                        }
-                        catch (InvalidCastException)
-                        {
+                            sti.Priority = priority;
                         }
 
                         /*

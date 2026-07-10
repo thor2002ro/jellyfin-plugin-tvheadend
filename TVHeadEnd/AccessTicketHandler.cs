@@ -7,7 +7,6 @@ using Microsoft.Extensions.Logging;
 using TVHeadEnd.HTSP;
 using TVHeadEnd.HTSP_Responses;
 using TVHeadEnd.Helper;
-using TVHeadEnd.TimeoutHelper;
 
 namespace TVHeadEnd;
 
@@ -16,6 +15,7 @@ public class AccessTicketHandler
     private readonly ILogger<AccessTicketHandler> _logger;
 
     private readonly HTSConnectionHandler _htsConnectionHandler;
+    private readonly TicketType _ticketType;
     private readonly string _ticketItemType;
     private readonly TimeSpan _requestTimeout;
     private readonly int _requestRetries;
@@ -38,6 +38,7 @@ public class AccessTicketHandler
         _requestTimeout = requestTimeout;
         _requestRetries = requestRetries;
         _ticketLifeSpan = ticketLifeSpan;
+        _ticketType = ticketType;
 
         _ticketItemType = ticketType switch
         {
@@ -136,25 +137,27 @@ public class AccessTicketHandler
     private async Task<HTSMessage> RequestTicket(string itemId, CancellationToken cancellation)
     {
         var request = new HTSMessage { Method = "getTicket" };
-        request.putField(_ticketItemType, HtspFieldHelper.ParseUInt32Id(itemId, _ticketItemType));
+        var numericId = _ticketType == TicketType.Channel
+            ? _htsConnectionHandler.ResolveChannelId(itemId)
+            : _htsConnectionHandler.ResolveDvrId(itemId);
+        request.putField(_ticketItemType, numericId);
 
         for (int attempt = 1, lastAttempt = 1 + _requestRetries;
              attempt <= lastAttempt && !cancellation.IsCancellationRequested;
              attempt++)
         {
-            var runner = new TaskWithTimeoutRunner<HTSMessage>(_requestTimeout * attempt);
-            var result = await runner.RunWithTimeout(Task.Run(
-                () =>
+            try
+            {
+                return await Task.Run(() =>
                 {
                     var response = new LoopBackResponseHandler();
                     _htsConnectionHandler.SendMessage(request, response);
-                    return response.GetResponse();
-                },
-                cancellation)).ConfigureAwait(false);
-
-            if (!result.HasTimeout)
+                    return response.getResponse();
+                }, cancellation).WaitAsync(_requestTimeout * attempt, cancellation);
+            }
+            catch (TimeoutException)
             {
-                return result.Result;
+                // Retry with the longer timeout for the next attempt.
             }
         }
 

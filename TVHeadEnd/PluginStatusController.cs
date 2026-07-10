@@ -109,7 +109,7 @@ namespace TVHeadEnd
         }
 
         [HttpGet]
-        public async Task<ActionResult<IReadOnlyList<string>>> GetProfiles(CancellationToken cancellationToken)
+        public async Task<ActionResult<IReadOnlyList<RecordingProfileInfo>>> GetProfiles(CancellationToken cancellationToken)
         {
             var configuration = Plugin.Instance.Configuration;
             var webRoot = (configuration.WebRoot ?? string.Empty).Trim('/');
@@ -126,16 +126,27 @@ namespace TVHeadEnd
             using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (!document.RootElement.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array)
             {
-                return Ok(Array.Empty<string>());
+                return Ok(Array.Empty<RecordingProfileInfo>());
             }
 
             return Ok(entries.EnumerateArray()
                 .Where(entry => !entry.TryGetProperty("enabled", out var enabled) || enabled.ValueKind != JsonValueKind.False)
-                .Select(entry => entry.TryGetProperty("name", out var name) ? name.GetString() : null)
-                .Where(name => !string.IsNullOrWhiteSpace(name))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .Select(entry => new RecordingProfileInfo
+                {
+                    Id = entry.TryGetProperty("uuid", out var uuid) ? uuid.GetString() : null,
+                    Name = entry.TryGetProperty("name", out var name) ? name.GetString() : null
+                })
+                .Where(profile => !string.IsNullOrWhiteSpace(profile.Name))
+                .GroupBy(profile => profile.Id ?? profile.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .OrderBy(profile => profile.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray());
         }
+    }
+
+    public sealed class RecordingProfileInfo
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
     }
 }

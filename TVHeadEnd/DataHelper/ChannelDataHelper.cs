@@ -13,7 +13,7 @@ namespace TVHeadEnd.DataHelper
     public class ChannelDataHelper
     {
         private readonly ILogger<ChannelDataHelper> _logger;
-        private readonly Dictionary<int, HTSMessage> _data;
+        private readonly Dictionary<long, HTSMessage> _data;
         private readonly Dictionary<string, string> _piconData;
         private string _channelType4Other = "Ignore";
 
@@ -21,13 +21,22 @@ namespace TVHeadEnd.DataHelper
         {
             _logger = logger;
 
-            _data = new Dictionary<int, HTSMessage>();
+            _data = new Dictionary<long, HTSMessage>();
             _piconData = new Dictionary<string, string>();
         }
 
-        public void SetChannelType4Other(string? channelType4Other)
+        public void SetChannelType4Other(string channelType4Other)
         {
-            _channelType4Other = channelType4Other ?? "Ignore";
+            _channelType4Other = channelType4Other;
+        }
+
+        public void Clean()
+        {
+            lock (_data)
+            {
+                _data.Clear();
+                _piconData.Clear();
+            }
         }
 
         public void Add(HTSMessage message)
@@ -36,8 +45,8 @@ namespace TVHeadEnd.DataHelper
             {
                 try
                 {
-                    int channelID = message.GetInt("channelId");
-                    if (_data.TryGetValue(channelID, out var storedMessage))
+                    long channelID = message.getLong("channelId");
+                    if (_data.ContainsKey(channelID))
                     {
                         if (storedMessage != null)
                         {
@@ -77,6 +86,38 @@ namespace TVHeadEnd.DataHelper
             return result;
         }
 
+        public long ResolveChannelId(string channelId)
+        {
+            if (uint.TryParse(channelId, out var numericId))
+            {
+                return numericId;
+            }
+
+            lock (_data)
+            {
+                foreach (var entry in _data)
+                {
+                    if (entry.Value.containsField("channelIdStr")
+                        && string.Equals(entry.Value.getString("channelIdStr"), channelId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return entry.Key;
+                    }
+                }
+            }
+
+            throw new ArgumentException("Unknown TVHeadend channel identifier.", nameof(channelId));
+        }
+
+        public string GetExternalChannelId(long channelId)
+        {
+            lock (_data)
+            {
+                return _data.TryGetValue(channelId, out var message) && message.containsField("channelIdStr")
+                    ? message.getString("channelIdStr")
+                    : channelId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+
         public Task<IEnumerable<ChannelInfo>> BuildChannelInfos(CancellationToken cancellationToken)
         {
             return Task.Run<IEnumerable<ChannelInfo>>(() =>
@@ -84,7 +125,7 @@ namespace TVHeadEnd.DataHelper
                 lock (_data)
                 {
                     List<ChannelInfo> result = new List<ChannelInfo>();
-                    foreach (KeyValuePair<int, HTSMessage> entry in _data)
+                    foreach (KeyValuePair<long, HTSMessage> entry in _data)
                     {
                         if (cancellationToken.IsCancellationRequested)
                         {
@@ -97,7 +138,7 @@ namespace TVHeadEnd.DataHelper
                         try
                         {
                             ChannelInfo ci = new ChannelInfo();
-                            ci.Id = string.Empty + entry.Key;
+                            ci.Id = m.containsField("channelIdStr") ? m.getString("channelIdStr") : "" + entry.Key;
 
                             ci.ImagePath = string.Empty;
 
@@ -144,8 +185,12 @@ namespace TVHeadEnd.DataHelper
                                 IList? tunerInfoList = m.GetList("services");
                                 if (tunerInfoList != null && tunerInfoList.Count > 0)
                                 {
-                                    HTSMessage? firstServiceInList = tunerInfoList[0] as HTSMessage;
-                                    if (firstServiceInList != null && firstServiceInList.ContainsField("type"))
+                                    HTSMessage firstServiceInList = (HTSMessage)tunerInfoList[0];
+                                    if (firstServiceInList.containsField("providername"))
+                                    {
+                                        ci.ChannelGroup = firstServiceInList.getString("providername");
+                                    }
+                                    if (firstServiceInList.containsField("type"))
                                     {
                                         string? type = firstServiceInList.GetString("type")?.ToLowerInvariant();
                                         switch (type)

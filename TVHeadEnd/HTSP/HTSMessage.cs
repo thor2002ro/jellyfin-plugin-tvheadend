@@ -5,8 +5,6 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using Microsoft.Extensions.Logging;
-using TVHeadEnd.Helper;
 
 namespace TVHeadEnd.HTSP
 {
@@ -112,7 +110,22 @@ namespace TVHeadEnd.HTSP
             return GetLong(name);
         }
 
-        public int GetInt(string name)
+        public bool TryGetLong(string name, out long value)
+        {
+            value = default;
+            if (!_dict.TryGetValue(name, out var field)
+                || field is not System.Numerics.BigInteger number
+                || number < long.MinValue
+                || number > long.MaxValue)
+            {
+                return false;
+            }
+
+            value = (long)number;
+            return true;
+        }
+
+        public int getInt(string name)
         {
             return (int)GetBigInteger(name);
         }
@@ -125,6 +138,21 @@ namespace TVHeadEnd.HTSP
             }
 
             return GetInt(name);
+        }
+
+        public bool TryGetInt(string name, out int value)
+        {
+            value = default;
+            if (!_dict.TryGetValue(name, out var field)
+                || field is not System.Numerics.BigInteger number
+                || number < int.MinValue
+                || number > int.MaxValue)
+            {
+                return false;
+            }
+
+            value = (int)number;
+            return true;
         }
 
         public bool getBool(string name)
@@ -203,7 +231,79 @@ namespace TVHeadEnd.HTSP
             return obj.ToString();
         }
 
-        public IList GetList(string name)
+        public bool TryGetString(string name, out string value)
+        {
+            value = null;
+            if (!_dict.TryGetValue(name, out var field) || field == null)
+            {
+                return false;
+            }
+
+            value = field.ToString();
+            return true;
+        }
+
+        public IList<long?> getLongList(string name)
+        {
+            List<long?> list = new List<long?>();
+
+            if (!containsField(name))
+            {
+                return list;
+            }
+
+            foreach (object obj in (IList)_dict[name])
+            {
+                if (obj is System.Numerics.BigInteger)
+                {
+                    list.Add((long)((System.Numerics.BigInteger)obj));
+                }
+            }
+
+            return list;
+        }
+
+        internal IList<long?> getLongList(string name, IList<long?> std)
+        {
+            if (!containsField(name))
+            {
+                return std;
+            }
+
+            return getLongList(name);
+        }
+
+        public IList<int?> getIntList(string name)
+        {
+            List<int?> list = new List<int?>();
+
+            if (!containsField(name))
+            {
+                return list;
+            }
+
+            foreach (object obj in (IList)_dict[name])
+            {
+                if (obj is System.Numerics.BigInteger)
+                {
+                    list.Add((int)((System.Numerics.BigInteger)obj));
+                }
+            }
+
+            return list;
+        }
+
+        internal IList<int?> getIntList(string name, IList<int?> std)
+        {
+            if (!containsField(name))
+            {
+                return std;
+            }
+
+            return getIntList(name);
+        }
+
+        public IList getList(string name)
         {
             return (IList)_dict[name];
         }
@@ -497,14 +597,20 @@ namespace TVHeadEnd.HTSP
             HTSMessage msg = new HTSMessage();
             int cnt = 0;
 
-            ByteBuffer buf = new ByteBuffer(messageData);
-            while (buf.HasRemaining())
+            ReadOnlySpan<byte> buffer = messageData;
+            int offset = 0;
+            while (offset < buffer.Length)
             {
-                type = buf.Get();
-                namelen = buf.Get();
-                datalen = UIntToLong(buf.Get(), buf.Get(), buf.Get(), buf.Get());
+                if (buffer.Length - offset < 6)
+                {
+                    throw new IOException("[TVHclient] HTSMessage.deserializeBinary: incomplete field header");
+                }
 
-                if (buf.Length() < namelen + datalen)
+                type = buffer[offset++];
+                namelen = buffer[offset++];
+                datalen = uIntToLong(buffer[offset++], buffer[offset++], buffer[offset++], buffer[offset++]);
+
+                if (datalen > int.MaxValue || namelen + datalen > buffer.Length - offset)
                 {
                     throw new IOException("[TVHclient] HTSMessage.deserializeBinary: buffer limit exceeded");
                 }
@@ -517,15 +623,14 @@ namespace TVHeadEnd.HTSP
                 }
                 else
                 {
-                    byte[] bName = new byte[namelen];
-                    buf.Get(bName);
-                    name = NewString(bName);
+                    name = Encoding.UTF8.GetString(buffer.Slice(offset, namelen));
+                    offset += namelen;
                 }
 
-                // Get the actual content
-                object? obj;
-                byte[] bData = new byte[datalen];
-                buf.Get(bData);
+                //Get the actual content
+                object obj = null;
+                byte[] bData = buffer.Slice(offset, (int)datalen).ToArray();
+                offset += (int)datalen;
 
                 bool decoded = true;
                 switch (type)

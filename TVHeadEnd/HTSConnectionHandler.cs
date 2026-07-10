@@ -161,7 +161,7 @@ namespace TVHeadEnd
             _priority = config.Priority;
             _profile = config.Profile.Trim();
             _channelType = config.ChannelType.Trim();
-            _streamingMethod = StreamingMethods.GetEffective(config.StreamingMethod, config.EnableSubsMaudios);
+            _streamingMethod = StreamingMethods.GetEffective(config.StreamingMethod);
             _forceDeinterlace = config.ForceDeinterlace;
 
             if (_priority < DvrPriorityImportant || _priority > DvrPriorityNotSet)
@@ -410,6 +410,16 @@ namespace TVHeadEnd
             return _channelDataHelper.BuildChannelInfos(cancellationToken);
         }
 
+        public long ResolveChannelId(string channelId)
+        {
+            return _channelDataHelper.ResolveChannelId(channelId);
+        }
+
+        public long ResolveDvrId(string dvrId)
+        {
+            return _dvrDataHelper.ResolveDvrId(dvrId);
+        }
+
         public int GetPriority()
         {
             Init();
@@ -430,12 +440,6 @@ namespace TVHeadEnd
             return _httpBaseUrl;
         }
 
-        public bool GetEnableSubsMaudios()
-        {
-            init();
-            return _streamingMethod == StreamingMethods.HttpBasic;
-        }
-
         public string GetStreamingMethod()
         {
             init();
@@ -448,19 +452,42 @@ namespace TVHeadEnd
             return _forceDeinterlace;
         }
 
-        public Task<IEnumerable<MyRecordingInfo>> BuildDvrInfos(CancellationToken cancellationToken)
+        public async Task<IEnumerable<MyRecordingInfo>> BuildDvrInfos(CancellationToken cancellationToken)
         {
-            return _dvrDataHelper.BuildDvrInfos(cancellationToken);
+            var recordings = await _dvrDataHelper.buildDvrInfos(cancellationToken).ConfigureAwait(false);
+            foreach (var recording in recordings)
+            {
+                recording.ChannelId = GetExternalChannelId(recording.ChannelId);
+            }
+
+            return recordings;
         }
 
-        public Task<IEnumerable<SeriesTimerInfo>> BuildAutorecInfos(CancellationToken cancellationToken)
+        public async Task<IEnumerable<SeriesTimerInfo>> BuildAutorecInfos(CancellationToken cancellationToken)
         {
-            return _autorecDataHelper.BuildAutorecInfos(cancellationToken);
+            var timers = await _autorecDataHelper.buildAutorecInfos(cancellationToken).ConfigureAwait(false);
+            foreach (var timer in timers)
+            {
+                timer.ChannelId = GetExternalChannelId(timer.ChannelId);
+            }
+
+            return timers;
         }
 
-        public Task<IEnumerable<TimerInfo>> BuildPendingTimersInfos(CancellationToken cancellationToken)
+        public async Task<IEnumerable<TimerInfo>> BuildPendingTimersInfos(CancellationToken cancellationToken)
         {
-            return _dvrDataHelper.BuildPendingTimersInfos(cancellationToken);
+            var timers = await _dvrDataHelper.buildPendingTimersInfos(cancellationToken).ConfigureAwait(false);
+            foreach (var timer in timers)
+            {
+                timer.ChannelId = GetExternalChannelId(timer.ChannelId);
+            }
+
+            return timers;
+        }
+
+        private string GetExternalChannelId(string channelId)
+        {
+            return long.TryParse(channelId, out var numericId) ? _channelDataHelper.GetExternalChannelId(numericId) : channelId;
         }
 
         public void OnError(Exception ex)

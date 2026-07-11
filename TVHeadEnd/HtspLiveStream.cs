@@ -44,6 +44,7 @@ namespace TVHeadEnd
         private const int MaxOpenAttempts = 3;
         private const int MaxLiveReconnectAttempts = 5;
         private const long StartupCacheMaxBytes = 32L * 1024L * 1024L;
+        private static readonly byte[] H264AccessUnitDelimiter = { 0x00, 0x00, 0x00, 0x01, 0x09, 0xF0 };
         private const int MinStallWatchdogSeconds = 5;
         private const int MaxStallWatchdogSeconds = 120;
         private const int MaxHtspQueueDepth = 20000000;
@@ -2032,12 +2033,14 @@ namespace TVHeadEnd
                         && (hasPps || _cachedH264Pps != null));
             }
 
-            if (!randomAccess || (hasSps && hasPps) || _cachedH264Sps == null || _cachedH264Pps == null)
-            {
-                return payload;
-            }
+            var parameterSets = randomAccess
+                && !(hasSps && hasPps)
+                && _cachedH264Sps != null
+                && _cachedH264Pps != null
+                    ? new[] { _cachedH264Sps, _cachedH264Pps }
+                    : Array.Empty<byte[]>();
 
-            return PrependParameterSets(payload, _cachedH264Sps, _cachedH264Pps);
+            return PrepareAnnexBAccessUnit(payload, units, hevc: false, parameterSets);
         }
 
         private byte[] PrepareHevcRandomAccessPayload(byte[] payload, ref bool randomAccess)
@@ -2075,16 +2078,111 @@ namespace TVHeadEnd
                         && (hasPps || _cachedHevcPps != null));
             }
 
-            if (!randomAccess
-                || (hasVps && hasSps && hasPps)
-                || _cachedHevcVps == null
-                || _cachedHevcSps == null
-                || _cachedHevcPps == null)
+            var parameterSets = randomAccess
+                && !(hasVps && hasSps && hasPps)
+                && _cachedHevcVps != null
+                && _cachedHevcSps != null
+                && _cachedHevcPps != null
+                    ? new[] { _cachedHevcVps, _cachedHevcSps, _cachedHevcPps }
+                    : Array.Empty<byte[]>();
+
+            return PrepareAnnexBAccessUnit(payload, units, hevc: true, parameterSets);
+        }
+
+        internal static byte[] PrepareAnnexBAccessUnit(byte[] payload, bool hevc, params byte[][] prefixNalUnits)
+        {
+            return PrepareAnnexBAccessUnit(payload, ParseAnnexBNalUnits(payload, hevc), hevc, prefixNalUnits);
+        }
+
+        private static byte[] PrepareAnnexBAccessUnit(
+            byte[] payload,
+            IReadOnlyList<AnnexBNalUnit> units,
+            bool hevc,
+            params byte[][] prefixNalUnits)
+        {
+            if (payload == null || units == null || units.Count == 0)
             {
                 return payload;
             }
 
-            return PrependParameterSets(payload, _cachedHevcVps, _cachedHevcSps, _cachedHevcPps);
+            var firstVcl = units.FirstOrDefault(i => hevc ? i.Type <= 31 : i.Type >= 1 && i.Type <= 5);
+            if (firstVcl == null)
+            {
+                return payload;
+            }
+
+            var audType = hevc ? 35 : 9;
+            var hasLeadingAud = units[0].Type == audType;
+            var prefixes = prefixNalUnits ?? Array.Empty<byte[]>();
+            var prefixLength = prefixes.Where(i => i != null).Sum(i => i.Length);
+            if (hasLeadingAud && prefixLength == 0)
+            {
+                return payload;
+            }
+
+            var aud = hasLeadingAud ? Array.Empty<byte>() : BuildAccessUnitDelimiter(payload, firstVcl, hevc);
+            if (!hasLeadingAud && aud.Length == 0)
+            {
+                return payload;
+            }
+
+            var insertionOffset = hasLeadingAud ? units[0].Offset + units[0].Length : 0;
+            var result = new byte[payload.Length + aud.Length + prefixLength];
+            var offset = 0;
+
+            if (insertionOffset > 0)
+            {
+                Buffer.BlockCopy(payload, 0, result, 0, insertionOffset);
+                offset = insertionOffset;
+            }
+
+            if (aud.Length > 0)
+            {
+                Buffer.BlockCopy(aud, 0, result, offset, aud.Length);
+                offset += aud.Length;
+            }
+
+            foreach (var prefix in prefixes)
+            {
+                if (prefix == null || prefix.Length == 0)
+                {
+                    continue;
+                }
+
+                Buffer.BlockCopy(prefix, 0, result, offset, prefix.Length);
+                offset += prefix.Length;
+            }
+
+            Buffer.BlockCopy(payload, insertionOffset, result, offset, payload.Length - insertionOffset);
+            return result;
+        }
+
+        private static byte[] BuildAccessUnitDelimiter(byte[] payload, AnnexBNalUnit firstVcl, bool hevc)
+        {
+            if (!hevc)
+            {
+                // primary_pic_type 7 safely describes any H.264 I/SI/P/SP/B access unit.
+                return H264AccessUnitDelimiter;
+            }
+
+            var headerOffset = firstVcl.Offset + firstVcl.StartCodeLength;
+            if (headerOffset + 1 >= payload.Length)
+            {
+                return Array.Empty<byte>();
+            }
+
+            // Keep the VCL layer and temporal id, as FFmpeg's h265_metadata filter does.
+            // pic_type 2 safely describes any HEVC I/P/B access unit.
+            return new byte[]
+            {
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                (byte)(0x46 | (payload[headerOffset] & 0x01)),
+                payload[headerOffset + 1],
+                0x50
+            };
         }
 
         private static List<AnnexBNalUnit> ParseAnnexBNalUnits(byte[] payload, bool hevc)
@@ -2107,8 +2205,14 @@ namespace TVHeadEnd
                 var nextSearchOffset = headerOffset + 1;
                 var hasNext = TryFindAnnexBStartCode(payload, nextSearchOffset, out var nextOffset, out _);
                 var endOffset = hasNext ? nextOffset : payload.Length;
+                var minimumNalBytes = hevc ? 3 : 2; // Header plus at least one RBSP byte.
+                if (endOffset - headerOffset < minimumNalBytes)
+                {
+                    break;
+                }
+
                 var type = hevc ? (payload[headerOffset] >> 1) & 0x3F : payload[headerOffset] & 0x1F;
-                units.Add(new AnnexBNalUnit(startOffset, endOffset - startOffset, type));
+                units.Add(new AnnexBNalUnit(startOffset, endOffset - startOffset, startCodeLength, type));
 
                 if (!hasNext)
                 {
@@ -2159,31 +2263,6 @@ namespace TVHeadEnd
         {
             var result = new byte[unit.Length];
             Buffer.BlockCopy(payload, unit.Offset, result, 0, unit.Length);
-            return result;
-        }
-
-        private static byte[] PrependParameterSets(byte[] payload, params byte[][] parameterSets)
-        {
-            var prefixLength = parameterSets.Where(i => i != null && i.Length > 0).Sum(i => i.Length);
-            if (prefixLength == 0)
-            {
-                return payload;
-            }
-
-            var result = new byte[prefixLength + payload.Length];
-            var offset = 0;
-            foreach (var parameterSet in parameterSets)
-            {
-                if (parameterSet == null || parameterSet.Length == 0)
-                {
-                    continue;
-                }
-
-                Buffer.BlockCopy(parameterSet, 0, result, offset, parameterSet.Length);
-                offset += parameterSet.Length;
-            }
-
-            Buffer.BlockCopy(payload, 0, result, offset, payload.Length);
             return result;
         }
 
@@ -3929,16 +4008,19 @@ namespace TVHeadEnd
 
         private sealed class AnnexBNalUnit
         {
-            public AnnexBNalUnit(int offset, int length, int type)
+            public AnnexBNalUnit(int offset, int length, int startCodeLength, int type)
             {
                 Offset = offset;
                 Length = length;
+                StartCodeLength = startCodeLength;
                 Type = type;
             }
 
             public int Offset { get; }
 
             public int Length { get; }
+
+            public int StartCodeLength { get; }
 
             public int Type { get; }
         }

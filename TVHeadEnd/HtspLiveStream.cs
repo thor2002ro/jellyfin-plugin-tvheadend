@@ -797,23 +797,24 @@ namespace TVHeadEnd
             if (!consumedBytes)
             {
                 _logger.LogDebug(
-                    "HTSP shared reader {ReaderId} for channel {ChannelId}, playback {PlaybackId}, was disposed before consuming bytes; keeping shared hub open",
+                    "HTSP shared reader {ReaderId} for channel {ChannelId}, playback {PlaybackId}, was disposed before consuming bytes; scheduling idle playback cleanup",
                     readerId,
                     _channelId,
                     playbackId);
-                return;
             }
-
-            _logger.LogDebug(
-                "HTSP shared reader {ReaderId} closed for channel {ChannelId}, playback {PlaybackId}; active shared reader count is {ActiveReaderCount}",
-                readerId,
-                _channelId,
-                playbackId,
-                activeReaders);
+            else
+            {
+                _logger.LogDebug(
+                    "HTSP shared reader {ReaderId} closed for channel {ChannelId}, playback {PlaybackId}; active shared reader count is {ActiveReaderCount}",
+                    readerId,
+                    _channelId,
+                    playbackId,
+                    activeReaders);
+            }
 
             if (!OwnerHasConsumerQueues(playbackId))
             {
-                ScheduleOwnerIdleDisconnect(playbackId, "Jellyfin disposed the direct stream reader after consuming data");
+                ScheduleOwnerIdleDisconnect(playbackId, "Jellyfin disposed the last direct stream reader");
             }
         }
 

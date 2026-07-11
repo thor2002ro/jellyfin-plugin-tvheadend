@@ -3408,6 +3408,13 @@ namespace TVHeadEnd
             return null;
         }
 
+        private static double? NormalizeAbsoluteFrontendValue(long? value, double minimum, double maximum)
+        {
+            return value.HasValue
+                ? Math.Max(0, Math.Min(100, ((value.Value / 1000.0) - minimum) * 100 / (maximum - minimum)))
+                : (double?)null;
+        }
+
         private static bool HasMeaningfulFrontendChange(int? previous, int? current, long? previousAbsolute, long? currentAbsolute)
         {
             if (previousAbsolute.HasValue && currentAbsolute.HasValue)
@@ -3642,10 +3649,10 @@ namespace TVHeadEnd
                 SignalStatus = signal?.Status,
                 HasLock = HasFrontendLock(signal?.Status),
                 SignalRaw = signal?.SignalRaw,
-                SignalPercent = NormalizeFrontendValue(signal?.SignalRaw),
+                SignalPercent = NormalizeFrontendValue(signal?.SignalRaw) ?? NormalizeAbsoluteFrontendValue(signal?.SignalAbsolute, -100, -20),
                 SignalDbm = signal?.SignalAbsolute / 1000.0,
                 SnrRaw = signal?.SnrRaw,
-                SnrPercent = NormalizeFrontendValue(signal?.SnrRaw),
+                SnrPercent = NormalizeFrontendValue(signal?.SnrRaw) ?? NormalizeAbsoluteFrontendValue(signal?.SnrAbsolute, 0, 40),
                 SnrDb = signal?.SnrAbsolute / 1000.0,
                 Ber = signal?.Ber,
                 Unc = signal?.Unc,

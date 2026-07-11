@@ -17,6 +17,29 @@ namespace TVHeadEnd
         private const long TimestampForwardDiscontinuity90Khz = 900000; // 10 seconds
         private const long TimestampWrap90Khz = 1L << 33;
         private static readonly TimeSpan TableRepeatInterval = TimeSpan.FromMilliseconds(100);
+        private static readonly byte[] OpusCoupledStreamCounts = { 1, 0, 1, 1, 2, 2, 2, 3, 3 };
+        private static readonly byte[][] OpusChannelMapA =
+        {
+            new byte[] { 0 },
+            new byte[] { 0, 1 },
+            new byte[] { 0, 2, 1 },
+            new byte[] { 0, 1, 2, 3 },
+            new byte[] { 0, 4, 1, 2, 3 },
+            new byte[] { 0, 4, 1, 2, 3, 5 },
+            new byte[] { 0, 4, 1, 2, 3, 5, 6 },
+            new byte[] { 0, 6, 1, 2, 3, 4, 5, 7 }
+        };
+        private static readonly byte[][] OpusChannelMapB =
+        {
+            new byte[] { 0 },
+            new byte[] { 0, 1 },
+            new byte[] { 0, 1, 2 },
+            new byte[] { 0, 1, 2, 3 },
+            new byte[] { 0, 1, 2, 3, 4 },
+            new byte[] { 0, 1, 2, 3, 4, 5 },
+            new byte[] { 0, 1, 2, 3, 4, 5, 6 },
+            new byte[] { 0, 1, 2, 3, 4, 5, 6, 7 }
+        };
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
@@ -279,8 +302,14 @@ namespace TVHeadEnd
             }
 
             var pesPayload = PreparePayloadForPes(stream, payload);
-            var dataAligned = stream.Kind == ElementaryStreamKind.Video || IsDvbSubtitleCodec(stream.Codec);
-            var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned);
+            if (pesPayload.Length == 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            var isDvbTeletext = IsDvbTeletextCodec(stream.Codec);
+            var dataAligned = stream.Kind == ElementaryStreamKind.Video || IsDvbSubtitleCodec(stream.Codec) || isDvbTeletext;
+            var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned, isDvbTeletext);
             var pcr = stream.Pid == _pcrPid ? effectiveClock : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr, randomAccess);
             return output.ToArray();
@@ -507,6 +536,18 @@ namespace TVHeadEnd
             }
         }
 
+        private static bool IsDvbTeletextCodec(string codec)
+        {
+            switch (NormalizeCodec(codec))
+            {
+                case "TELETEXT":
+                case "TTXT":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         private static byte[] PreparePayloadForPes(StreamInfo stream, byte[] payload)
         {
             if (stream == null || payload == null || payload.Length == 0)
@@ -520,9 +561,43 @@ namespace TVHeadEnd
                 case "DVBSUBTITLE":
                 case "DVB_SUBTITLE":
                     return PrepareDvbSubtitlePayload(payload);
+                case "OPUS":
+                    return PrepareOpusPayload(payload);
                 default:
                     return payload;
             }
+        }
+
+        private static byte[] PrepareOpusPayload(byte[] payload)
+        {
+            // Match FFmpeg's MPEG-TS muxer: two bytes are required to detect the
+            // 11-bit Opus control-header prefix, so shorter packets are rejected.
+            if (payload.Length < 2)
+            {
+                return Array.Empty<byte>();
+            }
+
+            if ((((payload[0] << 8) | payload[1]) >> 5) == 0x3FF)
+            {
+                return payload;
+            }
+
+            var result = new byte[payload.Length + 3 + (payload.Length / 255)];
+            result[0] = 0x7F;
+            result[1] = 0xE0;
+            // HTSP exposes no skip-sample side data; add Opus trim flags if that metadata becomes available.
+
+            var remaining = payload.Length;
+            var offset = 2;
+            do
+            {
+                result[offset++] = (byte)Math.Min(remaining, 255);
+                remaining -= 255;
+            }
+            while (remaining >= 0);
+
+            Array.Copy(payload, 0, result, offset, payload.Length);
+            return result;
         }
 
         private static byte[] PrepareDvbSubtitlePayload(byte[] payload)
@@ -572,11 +647,12 @@ namespace TVHeadEnd
             return result;
         }
 
-        private static byte[] BuildPes(int streamId, byte[] payload, long? pts, long? dts, bool dataAligned)
+        private static byte[] BuildPes(int streamId, byte[] payload, long? pts, long? dts, bool dataAligned, bool padTeletextHeader)
         {
             var hasPts = pts.HasValue;
             var hasDts = hasPts && dts.HasValue && dts.Value != pts.Value;
-            var headerDataLength = hasDts ? 10 : (hasPts ? 5 : 0);
+            var timestampHeaderLength = hasDts ? 10 : (hasPts ? 5 : 0);
+            var headerDataLength = padTeletextHeader ? Math.Max(0x24, timestampHeaderLength) : timestampHeaderLength;
             var optionalHeaderLength = 3 + headerDataLength;
             var pesPacketLength = payload.Length + optionalHeaderLength;
             var useZeroLength = streamId >= 0xE0 || pesPacketLength > 0xFFFF;
@@ -600,6 +676,11 @@ namespace TVHeadEnd
             else if (hasPts)
             {
                 WriteTimestamp(output, 0x02, pts.Value);
+            }
+
+            for (var i = timestampHeaderLength; i < headerDataLength; i++)
+            {
+                output.WriteByte(0xFF);
             }
 
             output.Write(payload, 0, payload.Length);
@@ -915,6 +996,7 @@ namespace TVHeadEnd
                     break;
                 case "OPUS":
                     AddRegistrationDescriptor(descriptors, "Opus");
+                    AddDescriptor(descriptors, 0x7F, 0x80, GetOpusChannelConfigCode(stream));
                     break;
                 case "TRUEHD":
                     AddRegistrationDescriptor(descriptors, "HDMV");
@@ -999,6 +1081,68 @@ namespace TVHeadEnd
         {
             var lang = GetIsoLanguageBytes(stream.Language);
             AddDescriptor(descriptors, 0x56, lang[0], lang[1], lang[2], 0x20, 0x00);
+        }
+
+        private static byte GetOpusChannelConfigCode(StreamInfo stream)
+        {
+            var meta = stream?.Meta;
+            var hasOpusHead = meta != null
+                && meta.Length >= 19
+                && meta[0] == (byte)'O'
+                && meta[1] == (byte)'p'
+                && meta[2] == (byte)'u'
+                && meta[3] == (byte)'s'
+                && meta[4] == (byte)'H'
+                && meta[5] == (byte)'e'
+                && meta[6] == (byte)'a'
+                && meta[7] == (byte)'d';
+            var channels = stream?.Channels > 0 ? stream.Channels : (hasOpusHead ? meta[9] : 0);
+
+            if (!hasOpusHead)
+            {
+                return channels >= 1 && channels <= 2 ? (byte)channels : (byte)0xFF;
+            }
+
+            if (meta[18] == 0)
+            {
+                return channels >= 1 && channels <= 2 ? (byte)channels : (byte)0xFF;
+            }
+
+            if (meta[18] != 1 || channels < 1 || channels > 8 || meta.Length < 21 + channels)
+            {
+                return 0xFF;
+            }
+
+            var coupledStreams = OpusCoupledStreamCounts[channels];
+            if (meta[19] == channels - coupledStreams
+                && meta[20] == coupledStreams
+                && MatchesOpusChannelMap(meta, OpusChannelMapA[channels - 1]))
+            {
+                return (byte)channels;
+            }
+
+            if (channels >= 2
+                && meta[19] == channels
+                && meta[20] == 0
+                && MatchesOpusChannelMap(meta, OpusChannelMapB[channels - 1]))
+            {
+                return (byte)(channels | 0x80);
+            }
+
+            return 0xFF;
+        }
+
+        private static bool MatchesOpusChannelMap(byte[] meta, byte[] expected)
+        {
+            for (var i = 0; i < expected.Length; i++)
+            {
+                if (meta[21 + i] != expected[i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static void AddRegistrationDescriptor(List<byte> descriptors, string fourCc)

@@ -15,7 +15,6 @@ namespace TVHeadEnd
         private const long MaxAudioTimestampRegression90Khz = 9000; // 100 ms
         private const long TimestampBackwardDiscontinuity90Khz = 90000; // 1 second
         private const long TimestampForwardDiscontinuity90Khz = 900000; // 10 seconds
-        private const long PcrRepeatInterval90Khz = 3600; // 40 ms (DVB maximum)
         private const long TimestampWrap90Khz = 1L << 33;
         private static readonly TimeSpan TableRepeatInterval = TimeSpan.FromMilliseconds(100);
 
@@ -32,7 +31,6 @@ namespace TVHeadEnd
         private long? _timestampBase;
         private long? _lastUnwrappedTimestamp90Khz;
         private long? _lastMuxClock;
-        private long? _lastPcrClock;
         private string _streamLayoutSignature;
         private byte _pmtVersion;
 
@@ -64,7 +62,6 @@ namespace TVHeadEnd
                 _timestampBase = null;
                 _lastUnwrappedTimestamp90Khz = null;
                 _lastMuxClock = null;
-                _lastPcrClock = null;
             }
 
             // Preserve any one-shot discontinuity flags that have not yet been
@@ -87,6 +84,7 @@ namespace TVHeadEnd
                     stream.LastPts90Khz = previous.LastPts90Khz;
                     stream.LastDts90Khz = previous.LastDts90Khz;
                     stream.LastSourceClock90Khz = previous.LastSourceClock90Khz;
+                    stream.PendingSourceClock90Khz = previous.PendingSourceClock90Khz;
                     stream.TimestampCorrectionCount = previous.TimestampCorrectionCount;
                     stream.TimestampDiscontinuityCount = previous.TimestampDiscontinuityCount;
                 }
@@ -95,6 +93,7 @@ namespace TVHeadEnd
                     stream.LastPts90Khz = null;
                     stream.LastDts90Khz = null;
                     stream.LastSourceClock90Khz = null;
+                    stream.PendingSourceClock90Khz = null;
                     stream.TimestampCorrectionCount = 0;
                     stream.TimestampDiscontinuityCount = 0;
                 }
@@ -231,7 +230,13 @@ namespace TVHeadEnd
             }
 
             var sourceClock = To90KhzTimestamp(dts ?? pts);
-            if (IsTimestampDiscontinuity(stream, sourceClock))
+            var timestampDecision = EvaluateTimestamp(stream, sourceClock);
+            if (timestampDecision == TimestampDecision.Drop)
+            {
+                return Array.Empty<byte>();
+            }
+
+            if (timestampDecision == TimestampDecision.Reset)
             {
                 sourceDiscontinuity = true;
                 stream.TimestampDiscontinuityCount++;
@@ -271,43 +276,54 @@ namespace TVHeadEnd
             var pesPayload = PreparePayloadForPes(stream, payload);
             var dataAligned = stream.Kind == ElementaryStreamKind.Video || IsDvbSubtitleCodec(stream.Codec);
             var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned);
-            long? pcr = null;
-            if (effectiveClock.HasValue
-                && (!_lastPcrClock.HasValue || effectiveClock.Value - _lastPcrClock.Value >= PcrRepeatInterval90Khz))
-            {
-                if (stream.Pid == _pcrPid)
-                {
-                    pcr = effectiveClock;
-                }
-                else
-                {
-                    WritePcrOnlyPacket(output, effectiveClock.Value);
-                }
-
-                _lastPcrClock = effectiveClock;
-            }
-
+            var pcr = stream.Pid == _pcrPid ? effectiveClock : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr, randomAccess);
             return output.ToArray();
         }
 
-        private bool IsTimestampDiscontinuity(StreamInfo stream, long? clock)
+        private TimestampDecision EvaluateTimestamp(StreamInfo stream, long? clock)
         {
             if (!clock.HasValue || stream == null || stream.Kind == ElementaryStreamKind.Private)
             {
-                return false;
+                return TimestampDecision.Accept;
             }
 
             var previous = stream.LastSourceClock90Khz;
-            stream.LastSourceClock90Khz = clock;
             if (!previous.HasValue)
             {
-                return false;
+                stream.LastSourceClock90Khz = clock;
+                stream.PendingSourceClock90Khz = null;
+                return TimestampDecision.Accept;
             }
 
-            var delta = clock.Value - previous.Value;
-            if (clock.Value >= 0 && clock.Value < TimestampWrap90Khz
-                && previous.Value >= 0 && previous.Value < TimestampWrap90Khz)
+            if (IsExpectedTimestampDelta(GetTimestampDelta(previous.Value, clock.Value)))
+            {
+                stream.LastSourceClock90Khz = clock;
+                stream.PendingSourceClock90Khz = null;
+                return TimestampDecision.Accept;
+            }
+
+            if (stream.PendingSourceClock90Khz.HasValue
+                && IsExpectedTimestampDelta(GetTimestampDelta(stream.PendingSourceClock90Khz.Value, clock.Value)))
+            {
+                stream.PendingSourceClock90Khz = null;
+                return TimestampDecision.Reset;
+            }
+
+            stream.PendingSourceClock90Khz = clock;
+            return TimestampDecision.Drop;
+        }
+
+        private static bool IsExpectedTimestampDelta(long delta)
+        {
+            return delta >= -TimestampBackwardDiscontinuity90Khz && delta <= TimestampForwardDiscontinuity90Khz;
+        }
+
+        private static long GetTimestampDelta(long previous, long current)
+        {
+            var delta = current - previous;
+            if (current >= 0 && current < TimestampWrap90Khz
+                && previous >= 0 && previous < TimestampWrap90Khz)
             {
                 if (delta < -(TimestampWrap90Khz / 2))
                 {
@@ -319,7 +335,7 @@ namespace TVHeadEnd
                 }
             }
 
-            return delta < -TimestampBackwardDiscontinuity90Khz || delta > TimestampForwardDiscontinuity90Khz;
+            return delta;
         }
 
         private void ResetTimestampState()
@@ -327,12 +343,12 @@ namespace TVHeadEnd
             _timestampBase = null;
             _lastUnwrappedTimestamp90Khz = null;
             _lastMuxClock = null;
-            _lastPcrClock = null;
             foreach (var stream in _streams.Values)
             {
                 stream.LastPts90Khz = null;
                 stream.LastDts90Khz = null;
                 stream.LastSourceClock90Khz = null;
+                stream.PendingSourceClock90Khz = null;
             }
         }
 
@@ -652,25 +668,6 @@ namespace TVHeadEnd
                 offset += payloadCapacity;
                 first = false;
             }
-        }
-
-        private void WritePcrOnlyPacket(Stream output, long pcr)
-        {
-            var packet = new byte[PacketSize];
-            packet[0] = 0x47;
-            packet[1] = (byte)((_pcrPid >> 8) & 0x1F);
-            packet[2] = (byte)(_pcrPid & 0xFF);
-            packet[3] = (byte)(0x20 | PeekCounter(_pcrPid));
-            packet[4] = 183;
-            packet[5] = (byte)(_pendingDiscontinuityPids.Remove(_pcrPid) ? 0x90 : 0x10);
-            WritePcr(packet, 6, pcr);
-            Array.Fill(packet, (byte)0xFF, 12, PacketSize - 12);
-            output.Write(packet, 0, packet.Length);
-        }
-
-        private byte PeekCounter(int pid)
-        {
-            return _continuityCounters.TryGetValue(pid, out var next) ? (byte)((next + 15) & 0x0F) : (byte)0;
         }
 
         private byte NextCounter(int pid)
@@ -1084,6 +1081,13 @@ namespace TVHeadEnd
             Private
         }
 
+        private enum TimestampDecision
+        {
+            Accept,
+            Drop,
+            Reset
+        }
+
         internal sealed class StreamInfo
         {
             public int Index { get; set; }
@@ -1131,6 +1135,8 @@ namespace TVHeadEnd
             internal long? LastDts90Khz;
 
             internal long? LastSourceClock90Khz;
+
+            internal long? PendingSourceClock90Khz;
 
             internal long TimestampCorrectionCount;
 

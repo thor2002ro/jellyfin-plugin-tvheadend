@@ -1,15 +1,15 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Reflection;
-using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using TVHeadEnd.HTSP;
+using TVHeadEnd.HTSP_Responses;
 
 namespace TVHeadEnd
 {
@@ -148,42 +148,58 @@ namespace TVHeadEnd
     [Route("TVHeadEnd/Profiles")]
     public sealed class PluginProfilesController : ControllerBase
     {
-        private readonly IHttpClientFactory _httpClientFactory;
+        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
+        private readonly HTSConnectionHandler _connectionHandler;
 
-        public PluginProfilesController(IHttpClientFactory httpClientFactory)
+        public PluginProfilesController(HTSConnectionHandler connectionHandler)
         {
-            _httpClientFactory = httpClientFactory;
+            _connectionHandler = connectionHandler;
         }
 
         [HttpGet]
         public async Task<ActionResult<IReadOnlyList<RecordingProfileInfo>>> GetProfiles(CancellationToken cancellationToken)
         {
-            var configuration = Plugin.Instance.Configuration;
-            var webRoot = (configuration.WebRoot ?? string.Empty).Trim('/');
-            var path = "/" + (webRoot.Length == 0 ? string.Empty : webRoot + "/") + "api/dvr/config/grid";
-            var scheme = configuration.UseHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
-            var uri = new UriBuilder(scheme, configuration.TVH_ServerName.Trim(), configuration.HTTP_Port, path) { Query = "limit=999999" }.Uri;
-
-            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes(configuration.Username + ":" + configuration.Password));
-            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
-            using var client = _httpClientFactory.CreateClient();
-            using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (!document.RootElement.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array)
+            if (_connectionHandler.GetServerProtocolVersion() < 16)
             {
                 return Ok(Array.Empty<RecordingProfileInfo>());
             }
 
-            return Ok(entries.EnumerateArray()
-                .Where(entry => !entry.TryGetProperty("enabled", out var enabled) || enabled.ValueKind != JsonValueKind.False)
-                .Select(entry => new RecordingProfileInfo
+            var request = new HTSMessage { Method = "getDvrConfigs" };
+            var handler = new LoopBackResponseHandler();
+            var sequence = _connectionHandler.SendMessage(request, handler);
+            HTSMessage response;
+            try
+            {
+                response = await handler.GetResponseAsync(cancellationToken, RequestTimeout).ConfigureAwait(false);
+            }
+            finally
+            {
+                _connectionHandler.RemoveResponseHandler(sequence);
+            }
+
+            if (response == null)
+            {
+                return StatusCode(StatusCodes.Status502BadGateway, "TVHeadend returned no DVR configuration response.");
+            }
+
+            if (response.getInt("noaccess", 0) != 0)
+            {
+                return StatusCode(
+                    StatusCodes.Status403Forbidden,
+                    "TVHeadend denied access to DVR configurations. Enable Basic recorder access and allow the required DVR configuration for this user.");
+            }
+
+            if (!response.containsField("dvrconfigs"))
+            {
+                return Ok(Array.Empty<RecordingProfileInfo>());
+            }
+
+            return Ok(response.getList("dvrconfigs")
+                .OfType<HTSMessage>()
+                .Select(config => new RecordingProfileInfo
                 {
-                    Id = entry.TryGetProperty("uuid", out var uuid) ? uuid.GetString() : null,
-                    Name = entry.TryGetProperty("name", out var name) ? name.GetString() : null
+                    Id = config.getString("uuid", string.Empty),
+                    Name = config.getString("name", string.Empty)
                 })
                 .Where(profile => !string.IsNullOrWhiteSpace(profile.Name))
                 .GroupBy(profile => profile.Id ?? profile.Name, StringComparer.OrdinalIgnoreCase)

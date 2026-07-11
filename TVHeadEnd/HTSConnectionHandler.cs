@@ -126,6 +126,7 @@ namespace TVHeadEnd
             _channelType = config.ChannelType.Trim();
             _streamingMethod = StreamingMethods.GetEffective(config.StreamingMethod);
             _forceDeinterlace = config.ForceDeinterlace;
+            _tvhTimeZone = null;
             var timeZoneId = config.TVH_TimeZoneId?.Trim();
             if (!string.IsNullOrEmpty(timeZoneId))
             {

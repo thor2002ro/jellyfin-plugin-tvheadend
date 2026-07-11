@@ -242,6 +242,14 @@ export default function (view, params) {
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
     }
 
+    function loadTimeZones(select, selected) {
+        const zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+        if (selected && !zones.includes(selected)) { zones.unshift(selected); }
+        select.replaceChildren(new Option('System default (automatic)', ''));
+        zones.forEach(zone => select.add(new Option(zone, zone)));
+        select.value = selected || '';
+    }
+
     installControlTooltips(view);
 
     view.addEventListener('viewshow', function () {
@@ -249,7 +257,7 @@ export default function (view, params) {
         const page = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
             page.querySelector('#txtTVH_ServerName').value = config.TVH_ServerName || '';
-            page.querySelector('#txtTVH_TimeZoneId').value = config.TVH_TimeZoneId || '';
+            loadTimeZones(page.querySelector('#selTVH_TimeZoneId'), config.TVH_TimeZoneId || '');
             page.querySelector('#txtHTTP_Port').value = config.HTTP_Port || 9981;
             page.querySelector('#chkUseHttps').checked = config.UseHttps === true;
             page.querySelector('#txtHTSP_Port').value = config.HTSP_Port || 9982;
@@ -296,7 +304,7 @@ export default function (view, params) {
         const form = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
             config.TVH_ServerName = form.querySelector('#txtTVH_ServerName').value.trim();
-            config.TVH_TimeZoneId = form.querySelector('#txtTVH_TimeZoneId').value.trim();
+            config.TVH_TimeZoneId = form.querySelector('#selTVH_TimeZoneId').value;
             config.HTTP_Port = intValue(form.querySelector('#txtHTTP_Port'), 9981, 1, 65535);
             config.UseHttps = form.querySelector('#chkUseHttps').checked;
             config.HTSP_Port = intValue(form.querySelector('#txtHTSP_Port'), 9982, 1, 65535);

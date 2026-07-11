@@ -575,7 +575,7 @@ namespace TVHeadEnd
         private static byte[] BuildPes(int streamId, byte[] payload, long? pts, long? dts, bool dataAligned)
         {
             var hasPts = pts.HasValue;
-            var hasDts = dts.HasValue && dts.Value != pts.GetValueOrDefault();
+            var hasDts = hasPts && dts.HasValue && dts.Value != pts.Value;
             var headerDataLength = hasDts ? 10 : (hasPts ? 5 : 0);
             var optionalHeaderLength = 3 + headerDataLength;
             var pesPacketLength = payload.Length + optionalHeaderLength;

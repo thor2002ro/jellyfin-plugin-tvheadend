@@ -1841,8 +1841,26 @@ namespace TVHeadEnd
                 preparedPayload,
                 pts,
                 dts,
+                out var sourceDiscontinuity,
                 forceProgramTables: randomAccess,
                 randomAccess: randomAccess);
+
+            if (sourceDiscontinuity)
+            {
+                ResetStartupCacheForNewSubscription(clearParameterSets: false);
+                if (_primaryVideoStreamIndex.HasValue
+                    && (streamInfo == null
+                        || streamInfo.Kind != HtspTransportStreamMuxer.ElementaryStreamKind.Video
+                        || !randomAccess))
+                {
+                    MarkVideoDamaged("TVHeadend delivered a large normalized timestamp discontinuity.");
+                }
+
+                _logger.LogWarning(
+                    "HTSP timestamp discontinuity on channel {ChannelId}, stream {StreamIndex}; reset the MPEG-TS timeline, PCR, continuity counters, PAT/PMT, and keyframe startup cache",
+                    _channelId,
+                    streamIndex);
+            }
 
             if (chunk.Length > 0)
             {
@@ -2350,11 +2368,13 @@ namespace TVHeadEnd
                 _muxPacketBytes.TryGetValue(i, out var byteCount);
                 _muxKeyFrameCounts.TryGetValue(i, out var keyFrameCount);
                 var timestampFixes = streamInfo?.TimestampCorrectionCount ?? 0;
+                var timestampDiscontinuities = streamInfo?.TimestampDiscontinuityCount ?? 0;
                 return DescribeMuxPacketStream(i, streamInfo)
                     + ": packets=" + packetCount
                     + ", bytes=" + byteCount
                     + (keyFrameCount > 0 ? ", randomAccess=" + keyFrameCount : string.Empty)
-                    + (timestampFixes > 0 ? ", timestampFixes=" + timestampFixes : string.Empty);
+                    + (timestampFixes > 0 ? ", timestampFixes=" + timestampFixes : string.Empty)
+                    + (timestampDiscontinuities > 0 ? ", timestampDiscontinuities=" + timestampDiscontinuities : string.Empty);
             }));
         }
 

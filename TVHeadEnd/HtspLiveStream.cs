@@ -1848,16 +1848,8 @@ namespace TVHeadEnd
             if (sourceDiscontinuity)
             {
                 ResetStartupCacheForNewSubscription(clearParameterSets: false);
-                if (_primaryVideoStreamIndex.HasValue
-                    && (streamInfo == null
-                        || streamInfo.Kind != HtspTransportStreamMuxer.ElementaryStreamKind.Video
-                        || !randomAccess))
-                {
-                    MarkVideoDamaged("TVHeadend delivered a large normalized timestamp discontinuity.");
-                }
-
                 _logger.LogWarning(
-                    "HTSP timestamp discontinuity on channel {ChannelId}, stream {StreamIndex}; reset the MPEG-TS timeline, PCR, continuity counters, PAT/PMT, and keyframe startup cache",
+                    "HTSP timestamp epoch change confirmed on channel {ChannelId}, stream {StreamIndex}; reset the MPEG-TS timeline, continuity counters, PAT/PMT, and startup cache",
                     _channelId,
                     streamIndex);
             }

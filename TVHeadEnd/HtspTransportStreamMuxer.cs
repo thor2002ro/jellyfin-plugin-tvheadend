@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -11,8 +12,8 @@ namespace TVHeadEnd
         private const int PacketSize = 188;
         private const int PmtPid = 0x100;
         private const int FirstElementaryPid = 0x101;
-        private const int RepeatTablesEveryPesPackets = 4;
         private const long MaxAudioTimestampRegression90Khz = 9000; // 100 ms
+        private static readonly TimeSpan TableRepeatInterval = TimeSpan.FromMilliseconds(250);
 
         private readonly Dictionary<int, StreamInfo> _streams = new Dictionary<int, StreamInfo>();
         private readonly Dictionary<int, byte> _continuityCounters = new Dictionary<int, byte>();
@@ -22,7 +23,7 @@ namespace TVHeadEnd
         private int _nextPid = FirstElementaryPid;
         private int _nextVideoStreamId;
         private int _nextAudioStreamId;
-        private int _packetsSinceTables;
+        private long _lastTablesTimestamp;
         private int _pcrPid = PmtPid;
         private long? _timestampBase;
         private long? _lastMuxClock;
@@ -65,7 +66,6 @@ namespace TVHeadEnd
             _nextPid = FirstElementaryPid;
             _nextVideoStreamId = 0;
             _nextAudioStreamId = 0;
-            _packetsSinceTables = 0;
             _pcrPid = PmtPid;
 
             foreach (var stream in (streams ?? Enumerable.Empty<StreamInfo>())
@@ -162,7 +162,6 @@ namespace TVHeadEnd
         public void MarkSourceDiscontinuity()
         {
             _wroteTables = false;
-            _packetsSinceTables = 0;
             _continuityCounters.Clear();
             _timestampBase = null;
             _lastMuxClock = null;
@@ -180,7 +179,6 @@ namespace TVHeadEnd
             if (repeatProgramTables)
             {
                 _wroteTables = false;
-                _packetsSinceTables = 0;
                 _pendingDiscontinuityPids.Add(0);
                 _pendingDiscontinuityPids.Add(PmtPid);
             }
@@ -220,11 +218,12 @@ namespace TVHeadEnd
                 _wroteTables = false;
             }
 
-            if (!_wroteTables || _packetsSinceTables >= RepeatTablesEveryPesPackets)
+            var now = Stopwatch.GetTimestamp();
+            if (!_wroteTables || Stopwatch.GetElapsedTime(_lastTablesTimestamp, now) >= TableRepeatInterval)
             {
                 WriteTables(output);
                 _wroteTables = true;
-                _packetsSinceTables = 0;
+                _lastTablesTimestamp = now;
             }
 
             var tsDts = ToTsTimestamp(dts);
@@ -252,7 +251,6 @@ namespace TVHeadEnd
             var pes = BuildPes(stream.StreamId, pesPayload, tsPts, tsDts, dataAligned);
             var pcr = stream.Pid == _pcrPid ? tsDts ?? tsPts : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr, randomAccess);
-            _packetsSinceTables++;
             return output.ToArray();
         }
 

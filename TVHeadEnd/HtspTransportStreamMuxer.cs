@@ -87,6 +87,8 @@ namespace TVHeadEnd
                     stream.PendingSourceClock90Khz = previous.PendingSourceClock90Khz;
                     stream.TimestampCorrectionCount = previous.TimestampCorrectionCount;
                     stream.TimestampDiscontinuityCount = previous.TimestampDiscontinuityCount;
+                    stream.TimestampAnomalyDropCount = previous.TimestampAnomalyDropCount;
+                    stream.AudInsertionCount = previous.AudInsertionCount;
                 }
                 else
                 {
@@ -96,6 +98,8 @@ namespace TVHeadEnd
                     stream.PendingSourceClock90Khz = null;
                     stream.TimestampCorrectionCount = 0;
                     stream.TimestampDiscontinuityCount = 0;
+                    stream.TimestampAnomalyDropCount = 0;
+                    stream.AudInsertionCount = 0;
                 }
 
                 if (!TryConfigureStream(stream))
@@ -233,6 +237,7 @@ namespace TVHeadEnd
             var timestampDecision = EvaluateTimestamp(stream, sourceClock);
             if (timestampDecision == TimestampDecision.Drop)
             {
+                stream.TimestampAnomalyDropCount++;
                 return Array.Empty<byte>();
             }
 
@@ -1141,6 +1146,10 @@ namespace TVHeadEnd
             internal long TimestampCorrectionCount;
 
             internal long TimestampDiscontinuityCount;
+
+            internal long TimestampAnomalyDropCount;
+
+            internal long AudInsertionCount;
         }
     }
 }

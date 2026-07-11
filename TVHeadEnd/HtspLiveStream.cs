@@ -1994,16 +1994,16 @@ namespace TVHeadEnd
             {
                 case "H264":
                 case "AVC":
-                    return PrepareH264RandomAccessPayload(payload, ref randomAccess);
+                    return PrepareH264RandomAccessPayload(stream, payload, ref randomAccess);
                 case "HEVC":
                 case "H265":
-                    return PrepareHevcRandomAccessPayload(payload, ref randomAccess);
+                    return PrepareHevcRandomAccessPayload(stream, payload, ref randomAccess);
                 default:
                     return payload;
             }
         }
 
-        private byte[] PrepareH264RandomAccessPayload(byte[] payload, ref bool randomAccess)
+        private byte[] PrepareH264RandomAccessPayload(HtspTransportStreamMuxer.StreamInfo stream, byte[] payload, ref bool randomAccess)
         {
             var units = ParseAnnexBNalUnits(payload, hevc: false);
             var hasIdr = units.Any(i => i.Type == 5);
@@ -2040,10 +2040,16 @@ namespace TVHeadEnd
                     ? new[] { _cachedH264Sps, _cachedH264Pps }
                     : Array.Empty<byte[]>();
 
-            return PrepareAnnexBAccessUnit(payload, units, hevc: false, parameterSets);
+            var result = PrepareAnnexBAccessUnit(payload, units, hevc: false, out var audInserted, parameterSets);
+            if (audInserted)
+            {
+                stream.AudInsertionCount++;
+            }
+
+            return result;
         }
 
-        private byte[] PrepareHevcRandomAccessPayload(byte[] payload, ref bool randomAccess)
+        private byte[] PrepareHevcRandomAccessPayload(HtspTransportStreamMuxer.StreamInfo stream, byte[] payload, ref bool randomAccess)
         {
             var units = ParseAnnexBNalUnits(payload, hevc: true);
             var hasRandomAccess = units.Any(i => i.Type >= 16 && i.Type <= 21);
@@ -2086,20 +2092,28 @@ namespace TVHeadEnd
                     ? new[] { _cachedHevcVps, _cachedHevcSps, _cachedHevcPps }
                     : Array.Empty<byte[]>();
 
-            return PrepareAnnexBAccessUnit(payload, units, hevc: true, parameterSets);
+            var result = PrepareAnnexBAccessUnit(payload, units, hevc: true, out var audInserted, parameterSets);
+            if (audInserted)
+            {
+                stream.AudInsertionCount++;
+            }
+
+            return result;
         }
 
         internal static byte[] PrepareAnnexBAccessUnit(byte[] payload, bool hevc, params byte[][] prefixNalUnits)
         {
-            return PrepareAnnexBAccessUnit(payload, ParseAnnexBNalUnits(payload, hevc), hevc, prefixNalUnits);
+            return PrepareAnnexBAccessUnit(payload, ParseAnnexBNalUnits(payload, hevc), hevc, out _, prefixNalUnits);
         }
 
         private static byte[] PrepareAnnexBAccessUnit(
             byte[] payload,
             IReadOnlyList<AnnexBNalUnit> units,
             bool hevc,
+            out bool audInserted,
             params byte[][] prefixNalUnits)
         {
+            audInserted = false;
             if (payload == null || units == null || units.Count == 0)
             {
                 return payload;
@@ -2125,6 +2139,8 @@ namespace TVHeadEnd
             {
                 return payload;
             }
+
+            audInserted = aud.Length > 0;
 
             var insertionOffset = hasLeadingAud ? units[0].Offset + units[0].Length : 0;
             var result = new byte[payload.Length + aud.Length + prefixLength];
@@ -3717,7 +3733,11 @@ namespace TVHeadEnd
                         Pid = item.Value?.Pid ?? 0,
                         Packets = _muxPacketCounts.TryGetValue(item.Key, out var packetCount) ? packetCount : 0,
                         Bytes = _muxPacketBytes.TryGetValue(item.Key, out var byteCount) ? byteCount : 0,
-                        RandomAccessFrames = _muxKeyFrameCounts.TryGetValue(item.Key, out var keyFrames) ? keyFrames : 0
+                        RandomAccessFrames = _muxKeyFrameCounts.TryGetValue(item.Key, out var keyFrames) ? keyFrames : 0,
+                        TimestampCorrections = item.Value?.TimestampCorrectionCount ?? 0,
+                        TimestampDiscontinuities = item.Value?.TimestampDiscontinuityCount ?? 0,
+                        TimestampAnomalyDrops = item.Value?.TimestampAnomalyDropCount ?? 0,
+                        AudInsertions = item.Value?.AudInsertionCount ?? 0
                     })
                     .ToList();
             }

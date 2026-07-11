@@ -43,7 +43,11 @@ export default function (view, params) {
                 setOptions(items);
                 status.textContent = `${items.length + 1} recording profile${items.length ? 's' : ''} loaded from TVHeadend.`;
             })
-            .catch(() => { status.textContent = 'Profiles could not be loaded; the saved selection is retained.'; })
+            .catch(response => {
+                status.textContent = response?.status === 403
+                    ? 'TVHeadend denied DVR profile access. Enable Basic recorder access and allow the required DVR configuration for the configured user.'
+                    : 'Profiles could not be loaded; the saved selection is retained.';
+            })
             .finally(() => { select.disabled = false; });
     }
 

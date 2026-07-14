@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using MediaBrowser.Model.Dto;
 using Microsoft.Extensions.Logging.Abstractions;
 using TVHeadEnd;
+using TVHeadEnd.HTSP;
 
 const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
 const BindingFlags PrivateStatic = BindingFlags.Static | BindingFlags.NonPublic;
@@ -15,6 +16,7 @@ var sharedHubs = (ConcurrentDictionary<string, HtspLiveStream>)sharedHubsField.G
 var removeSharedHub = typeof(HtspLiveStream).GetMethod("RemoveSharedHub", PrivateStatic)!;
 var releasePlayback = typeof(HtspLiveStream).GetMethod("ReleaseSharedPlaybackReference", PrivateInstance)!;
 var attachPlayback = typeof(HtspLiveStream).GetMethod("TryAttachPlaybackToProducer", PrivateInstance)!;
+var logQueueStatus = typeof(HtspLiveStream).GetMethod("LogQueueStatus", PrivateInstance)!;
 var channelId = Guid.NewGuid().ToString("N");
 using var staleHub = CreateStream(channelId);
 using var replacementHub = CreateStream(channelId);
@@ -64,6 +66,22 @@ using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
     stream.Close().GetAwaiter().GetResult();
 }
 
+using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
+{
+    var message = new HTSMessage();
+    message.putField("Idrops", new System.Numerics.BigInteger(1));
+    message.putField("Pdrops", new System.Numerics.BigInteger(2));
+    message.putField("Bdrops", new System.Numerics.BigInteger(3));
+    message.putField("packets", new System.Numerics.BigInteger(10));
+    message.putField("bytes", new System.Numerics.BigInteger(1000));
+    message.putField("delay", new System.Numerics.BigInteger(500));
+
+    logQueueStatus.Invoke(stream, new object[] { message });
+    Assert(GetInt(stream, "_awaitingCleanVideoRandomAccess") == 0, "Queue drops should be accounted without forcing a clean-keyframe wait.");
+    Assert(GetLong(stream, "_videoDamageEvents") == 1, "Queue damage was not counted.");
+    Assert(((string)GetField(stream, "_lastVideoDamageReason")).Contains("queue dropped frames"), "Queue damage reason was not retained.");
+}
+
 for (var i = 0; i < 100; i++)
 {
     using var stream = CreateStream(Guid.NewGuid().ToString("N"));
@@ -108,6 +126,11 @@ static HtspLiveStream CreateStream(string channelId)
 static int GetInt(HtspLiveStream stream, string fieldName)
 {
     return (int)typeof(HtspLiveStream).GetField(fieldName, PrivateInstance)!.GetValue(stream)!;
+}
+
+static long GetLong(HtspLiveStream stream, string fieldName)
+{
+    return (long)typeof(HtspLiveStream).GetField(fieldName, PrivateInstance)!.GetValue(stream)!;
 }
 
 static object GetField(HtspLiveStream stream, string fieldName)

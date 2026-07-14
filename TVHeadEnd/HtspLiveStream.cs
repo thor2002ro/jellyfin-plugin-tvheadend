@@ -123,10 +123,13 @@ namespace TVHeadEnd
         private long _lastQueueDelayUs;
         private long _frontendUnlockSinceUtcTicks;
         private long _videoDamageSinceUtcTicks;
+        private long _videoDamageEvents;
+        private long _damagedVideoDrops;
         private long _signalErrorWindowStartUtcTicks;
         private long _signalErrorWindowUncIncrease;
         private long _lastSignalRecoveryUtcTicks;
         private long _signalRecoveryAttemptWindowStartUtcTicks;
+        private string _lastVideoDamageReason;
         private SignalSnapshot _signalSnapshot = new SignalSnapshot();
         private string _sourceAdapter;
         private string _sourceService;
@@ -1772,6 +1775,7 @@ namespace TVHeadEnd
 
             if (ShouldDropDamagedVideo(streamInfo, randomAccess))
             {
+                Interlocked.Increment(ref _damagedVideoDrops);
                 return;
             }
 
@@ -1838,11 +1842,18 @@ namespace TVHeadEnd
             return true;
         }
 
+        private void RecordVideoDamage(string reason)
+        {
+            Interlocked.Increment(ref _videoDamageEvents);
+            Interlocked.Exchange(ref _videoDamageSinceUtcTicks, DateTime.UtcNow.Ticks);
+            _lastVideoDamageReason = reason;
+        }
+
         private void MarkVideoDamaged(string reason)
         {
             if (Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 1, 0) == 0)
             {
-                Interlocked.Exchange(ref _videoDamageSinceUtcTicks, DateTime.UtcNow.Ticks);
+                RecordVideoDamage(reason);
                 _logger.LogWarning(
                     "HTSP video marked damaged for channel {ChannelId}: {Reason}. Inter-frame video will be dropped until a verified IDR/IRAP arrives; audio and subtitles remain live",
                     _channelId,
@@ -3222,6 +3233,14 @@ namespace TVHeadEnd
 
             if (deltaIdrops > 0 || deltaPdrops > 0 || deltaBdrops > 0)
             {
+                RecordVideoDamage(
+                    "TVHeadend queue dropped frames I/P/B="
+                    + deltaIdrops.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + "/"
+                    + deltaPdrops.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + "/"
+                    + deltaBdrops.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + ".");
                 _logger.LogWarning(
                     "HTSP queue {SubscriptionId} dropped new frames I/P/B={DeltaIdrops}/{DeltaPdrops}/{DeltaBdrops}; totals={Idrops}/{Pdrops}/{Bdrops}, packets={Packets}, bytes={Bytes}, delay={Delay}us, requestedQueueDepth={QueueDepth}",
                     _subscriptionId,
@@ -3413,7 +3432,9 @@ namespace TVHeadEnd
                 + ", pendingBootstrapReaders=" + pendingBootstrapReaders
                 + ", reconnectAttempts=" + Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0)
                 + ", signalRecoveryAttempts=" + Interlocked.CompareExchange(ref _signalRecoveryAttempts, 0, 0)
-                + ", awaitingCleanVideo=" + (Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) != 0);
+                + ", awaitingCleanVideo=" + (Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) != 0)
+                + ", videoDamageEvents=" + Interlocked.Read(ref _videoDamageEvents)
+                + ", damagedVideoDrops=" + Interlocked.Read(ref _damagedVideoDrops);
         }
 
         private static string FormatSignalSummary(SignalSnapshot signal)
@@ -3697,6 +3718,7 @@ namespace TVHeadEnd
             }
 
             var lastPacketTicks = Interlocked.Read(ref _lastPlayableMuxPacketUtcTicks);
+            var videoDamageSinceTicks = Interlocked.Read(ref _videoDamageSinceUtcTicks);
             return new HtspProducerStatus
             {
                 ChannelId = _channelId,
@@ -3732,6 +3754,10 @@ namespace TVHeadEnd
                 ReconnectAttempts = Interlocked.CompareExchange(ref _liveReconnectAttempts, 0, 0),
                 SignalRecoveryAttempts = Interlocked.CompareExchange(ref _signalRecoveryAttempts, 0, 0),
                 AwaitingCleanVideo = Interlocked.CompareExchange(ref _awaitingCleanVideoRandomAccess, 0, 0) != 0,
+                VideoDamageEvents = Interlocked.Read(ref _videoDamageEvents),
+                DamagedVideoDrops = Interlocked.Read(ref _damagedVideoDrops),
+                VideoDamageAgeMs = videoDamageSinceTicks <= 0 ? null : Math.Max(0, (long)(DateTime.UtcNow - new DateTime(videoDamageSinceTicks, DateTimeKind.Utc)).TotalMilliseconds),
+                LastVideoDamageReason = _lastVideoDamageReason,
                 KeyframeStartupReady = _startupCacheKeyframeAligned,
                 StartupCacheBytes = Interlocked.Read(ref _startupCacheBytes),
                 Streams = streams

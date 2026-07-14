@@ -64,6 +64,10 @@ namespace TVHeadEnd
         public int ReconnectAttempts { get; set; }
         public int SignalRecoveryAttempts { get; set; }
         public bool AwaitingCleanVideo { get; set; }
+        public long VideoDamageEvents { get; set; }
+        public long DamagedVideoDrops { get; set; }
+        public long? VideoDamageAgeMs { get; set; }
+        public string LastVideoDamageReason { get; set; }
         public bool KeyframeStartupReady { get; set; }
         public long StartupCacheBytes { get; set; }
         public IReadOnlyList<HtspStreamStatus> Streams { get; set; }

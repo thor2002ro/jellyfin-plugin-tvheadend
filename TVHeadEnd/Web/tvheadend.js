@@ -176,6 +176,7 @@ export default function (view, params) {
             const drops = Number(producer.QueueIDrops || 0) + Number(producer.QueuePDrops || 0) + Number(producer.QueueBDrops || 0);
             const lockClass = producer.HasLock ? 'tvhBadgeGood' : 'tvhBadgeBad';
             const stateClass = producer.State === 'streaming' ? 'tvhBadgeGood' : producer.State === 'recovering' ? 'tvhBadgeWarn' : '';
+            const damageReason = producer.LastVideoDamageReason ? ` · ${escapeHtml(producer.LastVideoDamageReason)}` : '';
             const streamRows = (producer.Streams || []).map(stream => `<tr>
                 <td>${stream.Index}</td><td>0x${Number(stream.Pid || 0).toString(16).toUpperCase()}</td>
                 <td>${escapeHtml(stream.Codec || 'unknown')}</td><td>${escapeHtml(stream.Language || '—')}</td>
@@ -195,6 +196,7 @@ export default function (view, params) {
                     ${signalMetric('SNR', producer.SnrPercent, producer.SnrDb, 'dB')}
                     ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`)}
                     ${metric('Queue drops I/P/B', `${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)}`)}
+                    ${metric('Video damage', `${formatNumber(producer.VideoDamageEvents)} events · ${formatNumber(producer.DamagedVideoDrops)} drops${producer.VideoDamageAgeMs == null ? '' : ` · ${formatAge(producer.VideoDamageAgeMs)}`}${damageReason}`)}
                     ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`)}
                     ${metric('Last mux packet', formatAge(producer.LastMuxPacketAgeMs))}
                     ${metric('Viewers / readers', `${producer.SharedPlaybackCount || 0} / ${producer.ActiveReaderCount || 0}`)}

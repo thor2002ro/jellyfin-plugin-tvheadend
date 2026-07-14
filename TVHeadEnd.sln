@@ -5,6 +5,8 @@ VisualStudioVersion = 15.0.26730.3
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TVHeadEnd", "TVHeadEnd\TVHeadEnd.csproj", "{71407B8C-5BEC-4FD2-8657-8454B39D033E}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TVHeadEnd.LifecycleChecks", "TVHeadEnd.LifecycleChecks\TVHeadEnd.LifecycleChecks.csproj", "{20492A90-EEF1-46F0-A727-1C3363CB39E7}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,6 +17,10 @@ Global
 		{71407B8C-5BEC-4FD2-8657-8454B39D033E}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{71407B8C-5BEC-4FD2-8657-8454B39D033E}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{71407B8C-5BEC-4FD2-8657-8454B39D033E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{20492A90-EEF1-46F0-A727-1C3363CB39E7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{20492A90-EEF1-46F0-A727-1C3363CB39E7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{20492A90-EEF1-46F0-A727-1C3363CB39E7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{20492A90-EEF1-46F0-A727-1C3363CB39E7}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

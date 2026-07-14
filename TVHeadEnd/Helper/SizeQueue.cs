@@ -28,24 +28,6 @@ namespace TVHeadEnd.Helper
             }
         }
 
-        public T Dequeue()
-        {
-            lock (_queue)
-            {
-                while (_queue.Count == 0)
-                {
-                    Monitor.Wait(_queue, _timeOut);
-                }
-                T item = _queue.Dequeue();
-                if (_queue.Count == _maxSize - 1)
-                {
-                    // wake up any blocked enqueue
-                    Monitor.PulseAll(_queue);
-                }
-                return item;
-            }
-        }
-
         public bool TryDequeue(out T item, CancellationToken cancellationToken, TimeSpan waitTimeout)
         {
             item = default(T);

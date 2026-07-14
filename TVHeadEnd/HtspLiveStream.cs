@@ -428,6 +428,8 @@ namespace TVHeadEnd
                 MediaSource.DefaultSubtitleStreamIndex = hub.MediaSource.DefaultSubtitleStreamIndex;
                 MediaSource.Bitrate = hub.MediaSource.Bitrate;
             }
+
+            hub.ScheduleOwnerIdleDisconnect(UniqueId, "Jellyfin opened playback without requesting its direct stream");
         }
 
         private static MediaStream CloneMediaStream(MediaStream source)
@@ -730,6 +732,7 @@ namespace TVHeadEnd
 
             lock (_broadcastLock)
             {
+                CancelOwnerIdleDisconnectLocked(playbackId);
                 if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
                 {
                     queue.Complete();

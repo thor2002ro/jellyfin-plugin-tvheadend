@@ -78,16 +78,14 @@ namespace TVHeadEnd
         private readonly object _muxPacketStatsLock = new object();
         private readonly object _signalStateLock = new object();
         private readonly object _connectionStateLock = new object();
-        private readonly object _clientAbortSync = new object();
         private readonly object _readerStateLock = new object();
         private readonly object _broadcastLock = new object();
         private readonly object _sharedReferenceLock = new object();
         private readonly object _producerOpenLock = new object();
+        private readonly object _playbackStateLock = new object();
         private readonly SemaphoreSlim _connectionSemaphore = new SemaphoreSlim(1, 1);
         private readonly CancellationTokenSource _lifetimeCancellationTokenSource = new CancellationTokenSource();
 
-        private CancellationTokenRegistration _clientAbortRegistration;
-        private CancellationTokenSource _readerIdleDisconnectCancellationTokenSource;
         private CancellationTokenSource _sharedHubIdleCloseCancellationTokenSource;
         private CancellationTokenSource _stallWatchdogCancellationTokenSource;
         private Task _stallWatchdogTask;
@@ -197,6 +195,11 @@ namespace TVHeadEnd
             }
         }
 
+        private static bool RemoveSharedHub(string channelId, HtspLiveStream hub)
+        {
+            return SharedHubsByChannelId.TryRemove(new KeyValuePair<string, HtspLiveStream>(channelId, hub));
+        }
+
         public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
         {
             MediaSource = mediaSource;
@@ -205,7 +208,7 @@ namespace TVHeadEnd
             _appHost = appHost;
             _httpContextAccessor = httpContextAccessor;
             _logger = loggerFactory.CreateLogger<HtspLiveStream>();
-            _stream = new BlockingByteStream(OnConsumerClosed);
+            _stream = new BlockingByteStream(null);
             UniqueId = Guid.NewGuid().ToString("N");
             OriginalStreamId = mediaSource?.Id;
             ConsumerCount = 1;
@@ -232,11 +235,15 @@ namespace TVHeadEnd
                 return;
             }
 
-            _sharedProducer = this;
-            AddSharedPlaybackReference(UniqueId);
+            if (!TryAttachPlaybackToProducer(this, registerAsSharedHub: false))
+            {
+                throw new ObjectDisposedException(nameof(HtspLiveStream));
+            }
+
             try
             {
                 await EnsureProducerOpenAsync(openCancellationToken).ConfigureAwait(false);
+                ThrowIfPlaybackClosed();
                 ConfigureOpenedMediaSourceFromHub(this);
                 _logger.LogInformation(
                     "HTSP standalone producer opened for channel {ChannelId}; upstream subscription {SubscriptionId}; playback {PlaybackId}",
@@ -327,16 +334,19 @@ namespace TVHeadEnd
                 {
                     if (!existingHub.IsSharedHubUsable)
                     {
-                        SharedHubsByChannelId.TryRemove(_channelId, out _);
+                        RemoveSharedHub(_channelId, existingHub);
                         continue;
                     }
 
-                    _sharedProducer = existingHub;
-                    existingHub.AddSharedPlaybackReference(UniqueId);
+                    if (!TryAttachPlaybackToProducer(existingHub, registerAsSharedHub: false))
+                    {
+                        continue;
+                    }
 
                     try
                     {
                         await existingHub.EnsureProducerOpenAsync(openCancellationToken).ConfigureAwait(false);
+                        ThrowIfPlaybackClosed();
                         ConfigureOpenedMediaSourceFromHub(existingHub);
 
                         _logger.LogInformation(
@@ -354,20 +364,15 @@ namespace TVHeadEnd
                     }
                 }
 
-                _registeredAsSharedHub = true;
-                _sharedProducer = this;
-                if (!SharedHubsByChannelId.TryAdd(_channelId, this))
+                if (!TryAttachPlaybackToProducer(this, registerAsSharedHub: true))
                 {
-                    _registeredAsSharedHub = false;
-                    _sharedProducer = null;
                     continue;
                 }
-
-                AddSharedPlaybackReference(UniqueId);
 
                 try
                 {
                     await EnsureProducerOpenAsync(openCancellationToken).ConfigureAwait(false);
+                    ThrowIfPlaybackClosed();
                     ConfigureOpenedMediaSourceFromHub(this);
                     _logger.LogInformation(
                         "HTSP shared channel hub opened for channel {ChannelId}; upstream subscription {SubscriptionId}; playback {PlaybackId}",
@@ -376,10 +381,16 @@ namespace TVHeadEnd
                         UniqueId);
                     return;
                 }
+                catch (OperationCanceledException) when (openCancellationToken.IsCancellationRequested || IsPlaybackClosed())
+                {
+                    ReleaseSharedPlaybackReference(UniqueId, "playback open was cancelled");
+                    await CloseProducerNow("playback open was cancelled", onlyIfUnused: true).ConfigureAwait(false);
+                    throw;
+                }
                 catch
                 {
                     ReleaseSharedPlaybackReference(UniqueId, "failed to open shared channel hub");
-                    SharedHubsByChannelId.TryRemove(_channelId, out _);
+                    RemoveSharedHub(_channelId, this);
                     _registeredAsSharedHub = false;
                     _sharedProducer = null;
                     await CloseProducerNow("failed to open shared channel hub").ConfigureAwait(false);
@@ -390,15 +401,18 @@ namespace TVHeadEnd
 
         private Task EnsureProducerOpenAsync(CancellationToken openCancellationToken)
         {
+            Task producerOpenTask;
             lock (_producerOpenLock)
             {
                 if (_producerOpenTask == null || (_producerOpenTask.IsCompleted && !_started && !_closing))
                 {
-                    _producerOpenTask = OpenProducerAsync(openCancellationToken);
+                    _producerOpenTask = OpenProducerAsync(_lifetimeCancellationTokenSource.Token);
                 }
 
-                return _producerOpenTask;
+                producerOpenTask = _producerOpenTask;
             }
+
+            return producerOpenTask.WaitAsync(openCancellationToken);
         }
 
         private void ConfigureOpenedMediaSourceFromHub(HtspLiveStream hub)
@@ -650,49 +664,66 @@ namespace TVHeadEnd
 
         public Task Close()
         {
-            if (Interlocked.Exchange(ref _playbackCloseStarted, 1) != 0)
+            lock (_playbackStateLock)
             {
+                if (_playbackCloseStarted != 0)
+                {
+                    return Task.CompletedTask;
+                }
+
+                _playbackCloseStarted = 1;
+                if (IsSharedProxy)
+                {
+                    CloseOwnedConsumerQueues(UniqueId);
+                    _sharedProducer.ReleaseSharedPlaybackReference(UniqueId, "shared playback instance closed");
+                    return Task.CompletedTask;
+                }
+
+                CloseOwnedConsumerQueues(UniqueId);
+                var remainingReferences = ReleaseSharedPlaybackReference(UniqueId, "shared playback instance closed");
+                if (remainingReferences > 0)
+                {
+                    _logger.LogInformation(
+                        "HTSP shared channel hub for channel {ChannelId} kept open after playback {PlaybackId} closed; {RemainingPlaybackCount} shared playback(s) remain",
+                        _channelId,
+                        UniqueId,
+                        remainingReferences);
+                }
+
                 return Task.CompletedTask;
             }
-
-            if (IsSharedProxy)
-            {
-                CloseOwnedConsumerQueues(UniqueId, "shared playback instance closed");
-                _sharedProducer.ReleaseSharedPlaybackReference(UniqueId, "shared playback instance closed");
-                return Task.CompletedTask;
-            }
-
-            CloseOwnedConsumerQueues(UniqueId, "shared playback instance closed");
-            var remainingReferences = ReleaseSharedPlaybackReference(UniqueId, "shared playback instance closed");
-            if (remainingReferences > 0)
-            {
-                _logger.LogInformation(
-                    "HTSP shared channel hub for channel {ChannelId} kept open after playback {PlaybackId} closed; {RemainingPlaybackCount} shared playback(s) remain",
-                    _channelId,
-                    UniqueId,
-                    remainingReferences);
-                return Task.CompletedTask;
-            }
-
-            ScheduleSharedHubIdleClose("last shared playback instance closed");
-            return Task.CompletedTask;
         }
 
-        private Task CloseProducerNow(string reason)
+        private Task<bool> CloseProducerNow(string reason, bool onlyIfUnused = false)
         {
-            if (Interlocked.Exchange(ref _closeStarted, 1) != 0)
+            if (onlyIfUnused)
             {
-                return Task.CompletedTask;
+                lock (_sharedReferenceLock)
+                {
+                    if (_sharedPlaybackReferences.Count > 0)
+                    {
+                        return Task.FromResult(false);
+                    }
+
+                    if (Interlocked.Exchange(ref _closeStarted, 1) != 0)
+                    {
+                        return Task.FromResult(true);
+                    }
+
+                    _closing = true;
+                }
+            }
+            else if (Interlocked.Exchange(ref _closeStarted, 1) != 0)
+            {
+                return Task.FromResult(true);
             }
 
             _closing = true;
             EnableStreamSharing = false;
             _lifetimeCancellationTokenSource.Cancel();
-            CancelReaderIdleDisconnect();
             CancelSharedHubIdleClose();
             CancelAllOwnerIdleDisconnects();
             CancelStallWatchdog();
-            DisposeClientAbortRegistration();
             CompleteAllConsumerQueues();
             _stream.Complete();
             CloseCurrentConnection(unsubscribe: true);
@@ -700,7 +731,7 @@ namespace TVHeadEnd
 
             if (_registeredAsSharedHub)
             {
-                SharedHubsByChannelId.TryRemove(_channelId, out _);
+                RemoveSharedHub(_channelId, this);
                 _registeredAsSharedHub = false;
             }
 
@@ -710,7 +741,7 @@ namespace TVHeadEnd
                 _subscriptionId,
                 reason);
 
-            return Task.CompletedTask;
+            return Task.FromResult(true);
         }
 
         public Stream GetStream()
@@ -720,8 +751,16 @@ namespace TVHeadEnd
             // HTSP hub.  Do not return the producer queue directly: every reader
             // needs its own bounded queue so one client cannot consume bytes that
             // another client needs or block every other client.
-            var hub = IsSharedProxy ? _sharedProducer : this;
-            return hub.CreateFanoutReader(UniqueId);
+            lock (_playbackStateLock)
+            {
+                if (_playbackCloseStarted != 0)
+                {
+                    return Stream.Null;
+                }
+
+                var hub = IsSharedProxy ? _sharedProducer : this;
+                return hub.CreateFanoutReader(UniqueId);
+            }
         }
 
         private Stream CreateFanoutReader(string playbackId)
@@ -733,7 +772,10 @@ namespace TVHeadEnd
             lock (_broadcastLock)
             {
                 CancelOwnerIdleDisconnectLocked(playbackId);
-                if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
+                if (_closing
+                    || _lifetimeCancellationTokenSource.IsCancellationRequested
+                    || _stream.IsCompleted
+                    || !TryAddSharedPlaybackReference(playbackId))
                 {
                     queue.Complete();
                 }
@@ -746,6 +788,7 @@ namespace TVHeadEnd
                     }
 
                     queues.Add(queue);
+                    OnStreamReaderOpened(readerId);
                     if (GetConfiguredKeyframeStartupEnabled() && _primaryVideoStreamIndex.HasValue && !_startupCacheKeyframeAligned)
                     {
                         _pendingBootstrapQueues.Add(queue);
@@ -764,7 +807,6 @@ namespace TVHeadEnd
                 }
             }
 
-            OnStreamReaderOpened(readerId);
             return new ConsumerReadStream(
                 queue,
                 hasRead => OnBroadcastReaderClosed(playbackId, queue, readerId, hasRead),
@@ -781,16 +823,7 @@ namespace TVHeadEnd
                 return;
             }
 
-            int activeReaders;
-            lock (_readerStateLock)
-            {
-                if (_activeStreamReaders > 0)
-                {
-                    _activeStreamReaders--;
-                }
-
-                activeReaders = _activeStreamReaders;
-            }
+            var activeReaders = Interlocked.CompareExchange(ref _activeStreamReaders, 0, 0);
 
             if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
             {
@@ -861,6 +894,11 @@ namespace TVHeadEnd
                 queue.Complete();
             }
 
+            if (removed)
+            {
+                OnStreamReaderRemoved();
+            }
+
             return removed;
         }
 
@@ -872,7 +910,7 @@ namespace TVHeadEnd
             }
         }
 
-        private void CloseOwnedConsumerQueues(string playbackId, string reason)
+        private void CloseOwnedConsumerQueues(string playbackId)
         {
             List<BlockingByteStream> queues = null;
             lock (_broadcastLock)
@@ -893,6 +931,7 @@ namespace TVHeadEnd
                 foreach (var queue in queues)
                 {
                     queue.Complete();
+                    OnStreamReaderRemoved();
                 }
             }
 
@@ -912,6 +951,7 @@ namespace TVHeadEnd
             foreach (var queue in queues)
             {
                 queue.Complete();
+                OnStreamReaderRemoved();
             }
         }
 
@@ -1081,10 +1121,15 @@ namespace TVHeadEnd
             }
         }
 
-        private void AddSharedPlaybackReference(string playbackId)
+        private bool TryAddSharedPlaybackReference(string playbackId)
         {
             lock (_sharedReferenceLock)
             {
+                if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
+                {
+                    return false;
+                }
+
                 var wasEmpty = _sharedPlaybackReferences.Count == 0;
                 _sharedPlaybackReferences.Add(playbackId);
                 CancelSharedHubIdleCloseLocked();
@@ -1092,21 +1137,69 @@ namespace TVHeadEnd
                 {
                     MarkPlayableMuxPacketReceived();
                 }
+
+                return true;
+            }
+        }
+
+        private bool TryAttachPlaybackToProducer(HtspLiveStream producer, bool registerAsSharedHub)
+        {
+            lock (_playbackStateLock)
+            {
+                if (_playbackCloseStarted != 0)
+                {
+                    throw new ObjectDisposedException(nameof(HtspLiveStream));
+                }
+
+                if (registerAsSharedHub && !SharedHubsByChannelId.TryAdd(_channelId, this))
+                {
+                    return false;
+                }
+
+                if (!producer.TryAddSharedPlaybackReference(UniqueId))
+                {
+                    if (registerAsSharedHub)
+                    {
+                        RemoveSharedHub(_channelId, this);
+                    }
+
+                    return false;
+                }
+
+                _sharedProducer = producer;
+                _registeredAsSharedHub = registerAsSharedHub;
+                return true;
+            }
+        }
+
+        private bool IsPlaybackClosed()
+        {
+            lock (_playbackStateLock)
+            {
+                return _playbackCloseStarted != 0;
+            }
+        }
+
+        private void ThrowIfPlaybackClosed()
+        {
+            if (IsPlaybackClosed())
+            {
+                throw new OperationCanceledException("Playback was closed while its producer was opening.");
             }
         }
 
         private int ReleaseSharedPlaybackReference(string playbackId, string reason)
         {
+            CancelOwnerIdleDisconnect(playbackId);
+
             var remaining = 0;
             var shouldScheduleClose = false;
             lock (_sharedReferenceLock)
             {
-                _sharedPlaybackReferences.Remove(playbackId);
+                var removed = _sharedPlaybackReferences.Remove(playbackId);
                 remaining = _sharedPlaybackReferences.Count;
-                shouldScheduleClose = remaining == 0;
+                shouldScheduleClose = removed && remaining == 0;
             }
-
-            CancelOwnerIdleDisconnect(playbackId);
 
             if (shouldScheduleClose && !IsSharedProxy)
             {
@@ -1144,8 +1237,16 @@ namespace TVHeadEnd
                 try
                 {
                     await Task.Delay(ReaderIdleCloseDelay, idleCts.Token).ConfigureAwait(false);
-                    if (!OwnerHasConsumerQueues(playbackId))
+                    lock (_broadcastLock)
                     {
+                        if (!_ownerIdleDisconnects.TryGetValue(playbackId, out var current)
+                            || !ReferenceEquals(current, idleCts)
+                            || OwnerHasConsumerQueues(playbackId))
+                        {
+                            return;
+                        }
+
+                        _ownerIdleDisconnects.Remove(playbackId);
                         _logger.LogInformation(
                             "HTSP shared playback {PlaybackId} for channel {ChannelId} became idle; releasing playback reference. Reason: {Reason}",
                             playbackId,
@@ -1245,7 +1346,7 @@ namespace TVHeadEnd
                         }
                     }
 
-                    await CloseProducerNow(reason).ConfigureAwait(false);
+                    await CloseProducerNow(reason, onlyIfUnused: true).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1298,7 +1399,6 @@ namespace TVHeadEnd
             {
                 _activeStreamReaders++;
                 activeReaders = _activeStreamReaders;
-                CancelReaderIdleDisconnectLocked();
             }
 
             _logger.LogDebug(
@@ -1308,114 +1408,15 @@ namespace TVHeadEnd
                 activeReaders);
         }
 
-        private void OnStreamReaderClosed(string readerId, bool consumedBytes)
+        private void OnStreamReaderRemoved()
         {
-            int activeReaders;
             lock (_readerStateLock)
             {
                 if (_activeStreamReaders > 0)
                 {
                     _activeStreamReaders--;
                 }
-
-                activeReaders = _activeStreamReaders;
             }
-
-            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
-            {
-                return;
-            }
-
-            if (!consumedBytes)
-            {
-                _logger.LogDebug(
-                    "HTSP direct stream reader {ReaderId} for channel {ChannelId} was disposed before consuming bytes; keeping Tvheadend subscription {SubscriptionId} open for Jellyfin/ffmpeg",
-                    readerId,
-                    _channelId,
-                    _subscriptionId);
-                return;
-            }
-
-            _logger.LogDebug(
-                "HTSP direct stream reader {ReaderId} closed for channel {ChannelId}; active reader count is {ActiveReaderCount}",
-                readerId,
-                _channelId,
-                activeReaders);
-
-            if (activeReaders <= 0)
-            {
-                ScheduleReaderIdleDisconnect("Jellyfin disposed the direct stream reader after consuming data");
-            }
-        }
-
-        private void ScheduleReaderIdleDisconnect(string reason)
-        {
-            CancellationTokenSource idleCts;
-            lock (_readerStateLock)
-            {
-                if (_activeStreamReaders > 0 || _closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
-                {
-                    return;
-                }
-
-                CancelReaderIdleDisconnectLocked();
-                idleCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellationTokenSource.Token);
-                _readerIdleDisconnectCancellationTokenSource = idleCts;
-            }
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(ReaderIdleCloseDelay, idleCts.Token).ConfigureAwait(false);
-
-                    lock (_readerStateLock)
-                    {
-                        if (!ReferenceEquals(_readerIdleDisconnectCancellationTokenSource, idleCts) || _activeStreamReaders > 0)
-                        {
-                            return;
-                        }
-                    }
-
-                    OnConsumerClosed(reason);
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                finally
-                {
-                    lock (_readerStateLock)
-                    {
-                        if (ReferenceEquals(_readerIdleDisconnectCancellationTokenSource, idleCts))
-                        {
-                            _readerIdleDisconnectCancellationTokenSource = null;
-                        }
-                    }
-
-                    idleCts.Dispose();
-                }
-            });
-        }
-
-        private void CancelReaderIdleDisconnect()
-        {
-            lock (_readerStateLock)
-            {
-                CancelReaderIdleDisconnectLocked();
-            }
-        }
-
-        private void CancelReaderIdleDisconnectLocked()
-        {
-            try
-            {
-                _readerIdleDisconnectCancellationTokenSource?.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-
-            _readerIdleDisconnectCancellationTokenSource = null;
         }
 
         private void EnsureStallWatchdogStarted()
@@ -1529,57 +1530,6 @@ namespace TVHeadEnd
             finally
             {
                 cts?.Dispose();
-            }
-        }
-
-        private void RegisterClientAbortCallback()
-        {
-            try
-            {
-                var context = _httpContextAccessor?.HttpContext;
-                if (context == null || !context.RequestAborted.CanBeCanceled)
-                {
-                    return;
-                }
-
-                lock (_clientAbortSync)
-                {
-                    _clientAbortRegistration.Dispose();
-                    _clientAbortRegistration = context.RequestAborted.Register(
-                        state => ((HtspLiveStream)state).OnClientRequestAborted(),
-                        this);
-                }
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Unable to register HTSP direct-stream client abort callback for channel {ChannelId}", _channelId);
-            }
-        }
-
-        private void OnClientRequestAborted()
-        {
-            OnConsumerClosed("Jellyfin streaming HTTP request was aborted");
-        }
-
-        private void OnConsumerClosed(string reason)
-        {
-            if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested)
-            {
-                return;
-            }
-
-            ReleaseSharedPlaybackReference(UniqueId, reason);
-        }
-
-        private void DisposeClientAbortRegistration()
-        {
-            lock (_clientAbortSync)
-            {
-                _clientAbortRegistration.Dispose();
-                _clientAbortRegistration = default;
             }
         }
 
@@ -3671,7 +3621,7 @@ namespace TVHeadEnd
             ActiveProducersByUniqueId.TryRemove(UniqueId, out _);
             if (_registeredAsSharedHub)
             {
-                SharedHubsByChannelId.TryRemove(_channelId, out _);
+                RemoveSharedHub(_channelId, this);
                 _registeredAsSharedHub = false;
             }
         }
@@ -3993,7 +3943,8 @@ namespace TVHeadEnd
         {
             Close().GetAwaiter().GetResult();
 
-            if (!IsSharedProxy && _registeredAsSharedHub && GetSharedPlaybackReferenceCount() > 0)
+            if (!IsSharedProxy
+                && !CloseProducerNow("live stream disposed", onlyIfUnused: true).GetAwaiter().GetResult())
             {
                 // Jellyfin may dispose the first playback object while other
                 // devices are still attached to the shared upstream channel hub.
@@ -4002,8 +3953,6 @@ namespace TVHeadEnd
                 return;
             }
 
-            DisposeClientAbortRegistration();
-            CancelReaderIdleDisconnect();
             CancelSharedHubIdleClose();
             CancelAllOwnerIdleDisconnects();
             _stream.Dispose();

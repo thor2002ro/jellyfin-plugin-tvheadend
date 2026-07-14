@@ -13,19 +13,6 @@ namespace TVHeadEnd.Helper
             _data = new List<byte>();
         }
 
-        public byte[] GetFromStart(int count)
-        {
-            lock (_data)
-            {
-                while (_data.Count < count)
-                {
-                    Monitor.Wait(_data);
-                }
-
-                return _data.GetRange(0, count).ToArray();
-            }
-        }
-
         public bool TryGetFromStart(int count, out byte[] result, CancellationToken cancellationToken, TimeSpan waitTimeout)
         {
             if (count < 0)
@@ -51,21 +38,6 @@ namespace TVHeadEnd.Helper
 
                 result = _data.GetRange(0, count).ToArray();
                 return true;
-            }
-        }
-
-        public byte[] extractFromStart(int count)
-        {
-            lock (_data)
-            {
-                while (_data.Count < count)
-                {
-                    Monitor.Wait(_data);
-                }
-
-                byte[] result = _data.GetRange(0, count).ToArray();
-                _data.RemoveRange(0, count);
-                return result;
             }
         }
 

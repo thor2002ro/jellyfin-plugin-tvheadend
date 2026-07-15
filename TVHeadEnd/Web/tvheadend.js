@@ -173,7 +173,10 @@ export default function (view, params) {
 
         container.setAttribute('aria-busy', 'false');
         container.innerHTML = producers.map(producer => {
-            const drops = Number(producer.QueueIDrops || 0) + Number(producer.QueuePDrops || 0) + Number(producer.QueueBDrops || 0);
+            const queueDrops = Number(producer.QueueIDrops || 0) + Number(producer.QueuePDrops || 0) + Number(producer.QueueBDrops || 0);
+            const muxDrops = (producer.Streams || []).reduce((total, stream) => total + Number(stream.TimestampAnomalyDrops || 0), 0);
+            const damagedVideoDrops = Number(producer.DamagedVideoDrops || 0);
+            const totalDrops = queueDrops + muxDrops + damagedVideoDrops;
             const lockClass = producer.HasLock ? 'tvhBadgeGood' : 'tvhBadgeBad';
             const stateClass = producer.State === 'streaming' ? 'tvhBadgeGood' : producer.State === 'recovering' ? 'tvhBadgeWarn' : '';
             const damageReason = producer.LastVideoDamageReason ? ` · ${escapeHtml(producer.LastVideoDamageReason)}` : '';
@@ -195,7 +198,7 @@ export default function (view, params) {
                     ${signalMetric('Signal', producer.SignalPercent, producer.SignalDbm, 'dBm')}
                     ${signalMetric('SNR', producer.SnrPercent, producer.SnrDb, 'dB')}
                     ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`)}
-                    ${metric('Queue drops I/P/B', `${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)}`)}
+                    ${metric('Drops', `${formatNumber(totalDrops)} total · queue ${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)} · mux ${formatNumber(muxDrops)} · video ${formatNumber(damagedVideoDrops)}`)}
                     ${metric('Video damage', `${formatNumber(producer.VideoDamageEvents)} events · ${formatNumber(producer.DamagedVideoDrops)} drops${producer.VideoDamageAgeMs == null ? '' : ` · ${formatAge(producer.VideoDamageAgeMs)}`}${damageReason}`)}
                     ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`)}
                     ${metric('Last mux packet', formatAge(producer.LastMuxPacketAgeMs))}

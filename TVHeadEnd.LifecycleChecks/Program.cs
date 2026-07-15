@@ -116,6 +116,9 @@ for (var i = 0; i < 100; i++)
     Assert(GetPlaybackReferenceCount(hub) == 0, "Concurrent open attached playback after close.");
 }
 
+AssertMuxerDropsInvalidDtsOnly();
+AssertMuxerDropsDtsAfterPts();
+
 Console.WriteLine("Lifecycle checks passed.");
 
 static HtspLiveStream CreateStream(string channelId)
@@ -154,4 +157,42 @@ static void Assert(bool condition, string message)
     {
         throw new InvalidOperationException(message);
     }
+}
+
+static void AssertMuxerDropsInvalidDtsOnly()
+{
+    var stream = WriteMuxerPacket(pts: null, dts: 90_000);
+    Assert((long)GetMuxerStreamField(stream, "TimestampCorrectionCount") == 1, "DTS-only PES timestamp was not corrected.");
+}
+
+static void AssertMuxerDropsDtsAfterPts()
+{
+    var stream = WriteMuxerPacket(pts: 90_000, dts: 180_000);
+    Assert((long)GetMuxerStreamField(stream, "TimestampCorrectionCount") == 1, "DTS after PTS was not corrected.");
+}
+
+static object WriteMuxerPacket(long? pts, long? dts)
+{
+    var muxerType = typeof(HtspLiveStream).Assembly.GetType("TVHeadEnd.HtspTransportStreamMuxer")!;
+    var streamInfoType = muxerType.GetNestedType("StreamInfo", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    var muxer = Activator.CreateInstance(muxerType)!;
+    var stream = Activator.CreateInstance(streamInfoType)!;
+    streamInfoType.GetProperty("Index")!.SetValue(stream, 0);
+    streamInfoType.GetProperty("Codec")!.SetValue(stream, "H264");
+
+    var streams = Array.CreateInstance(streamInfoType, 1);
+    streams.SetValue(stream, 0);
+    muxerType.GetMethod("SetTimestampsAre90Khz")!.Invoke(muxer, new object[] { true });
+    muxerType.GetMethod("SetStreams")!.Invoke(muxer, new object[] { streams, false });
+
+    muxerType.GetMethod("WritePacket")!.Invoke(
+        muxer,
+        new object[] { 0, new byte[] { 0x00, 0x00, 0x01, 0x09, 0xF0 }, pts, dts, false, false, false });
+
+    return muxerType.GetMethod("GetStreamInfo")!.Invoke(muxer, new object[] { 0 })!;
+}
+
+static object GetMuxerStreamField(object stream, string fieldName)
+{
+    return stream.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(stream)!;
 }

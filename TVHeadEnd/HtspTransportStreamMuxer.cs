@@ -256,6 +256,8 @@ namespace TVHeadEnd
                 _wroteTables = false;
             }
 
+            NormalizePesTimestamps(stream, ref pts, ref dts);
+
             var sourceClock = To90KhzTimestamp(dts ?? pts);
             var timestampDecision = EvaluateTimestamp(stream, sourceClock);
             if (timestampDecision == TimestampDecision.Drop)
@@ -313,6 +315,38 @@ namespace TVHeadEnd
             var pcr = stream.Pid == _pcrPid ? effectiveClock : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr, randomAccess);
             return output.ToArray();
+        }
+
+        private void NormalizePesTimestamps(StreamInfo stream, ref long? pts, ref long? dts)
+        {
+            if (!dts.HasValue)
+            {
+                return;
+            }
+
+            var corrected = false;
+            if (!pts.HasValue)
+            {
+                dts = null;
+                corrected = true;
+            }
+            else
+            {
+                var dts90Khz = To90KhzTimestamp(dts);
+                var pts90Khz = To90KhzTimestamp(pts);
+                if (dts90Khz.HasValue
+                    && pts90Khz.HasValue
+                    && GetTimestampDelta(dts90Khz.Value, pts90Khz.Value) < 0)
+                {
+                    dts = null;
+                    corrected = true;
+                }
+            }
+
+            if (corrected && stream != null)
+            {
+                stream.TimestampCorrectionCount++;
+            }
         }
 
         private TimestampDecision EvaluateTimestamp(StreamInfo stream, long? clock)

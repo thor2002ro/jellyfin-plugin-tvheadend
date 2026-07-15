@@ -36,6 +36,7 @@ namespace TVHeadEnd.Configuration
         public int HTSPSignalRecoveryCooldownSeconds { get; set; }
         public bool HTSPEnableStreamSharing { get; set; }
         public bool HTSPKeyframeStartupEnabled { get; set; }
+        public int HTSPInitialTuneBufferMs { get; set; }
         public bool HTSPHealthLoggingEnabled { get; set; }
         public int HTSPHealthLogIntervalSeconds { get; set; }
         public bool HTSPSignalHealthLoggingEnabled { get; set; }
@@ -71,6 +72,7 @@ namespace TVHeadEnd.Configuration
             HTSPSignalRecoveryCooldownSeconds = 15;
             HTSPEnableStreamSharing = true;
             HTSPKeyframeStartupEnabled = true;
+            HTSPInitialTuneBufferMs = 0;
             HTSPHealthLoggingEnabled = true;
             HTSPHealthLogIntervalSeconds = 30;
             HTSPSignalHealthLoggingEnabled = true;

@@ -80,15 +80,18 @@ export default function (view, params) {
         return `${(ms / 1000).toFixed(1)} s`;
     }
 
-    function metric(label, value) {
-        return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span></div>`;
+    function metric(label, value, help) {
+        const title = help ? ` title="${escapeHtml(help)}" aria-label="${escapeHtml(`${label}: ${value}. ${help}`)}"` : '';
+        return `<div class="tvhMetric"${title}><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span></div>`;
     }
 
-    function signalMetric(label, percent, absolute, unit) {
+    function signalMetric(label, percent, absolute, unit, help) {
         const numericPercent = percent == null ? null : Math.max(0, Math.min(100, Number(percent)));
         const meter = numericPercent == null ? '' : `<div class="tvhMeter" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${numericPercent.toFixed(1)}"><span class="tvhMeterFill" style="width:${numericPercent.toFixed(1)}%"></span></div>`;
         const absoluteValue = absolute == null ? '' : ` (${Number(absolute).toFixed(1)} ${unit})`;
-        return `<div class="tvhMetric"><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(formatPercent(percent) + absoluteValue)}</span>${meter}</div>`;
+        const value = formatPercent(percent) + absoluteValue;
+        const title = help ? ` title="${escapeHtml(help)}" aria-label="${escapeHtml(`${label}: ${value}. ${help}`)}"` : '';
+        return `<div class="tvhMetric"${title}><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span>${meter}</div>`;
     }
 
     function setRefreshState(page, busy) {
@@ -185,7 +188,7 @@ export default function (view, params) {
                 <td>${escapeHtml(stream.Codec || 'unknown')}</td><td>${escapeHtml(stream.Language || '—')}</td>
                 <td>${escapeHtml(stream.Title || '—')}</td><td>${formatNumber(stream.Packets)}</td>
                 <td>${formatBytes(stream.Bytes)}</td><td>${formatNumber(stream.RandomAccessFrames)}</td>
-                <td>TS ${formatNumber(stream.TimestampCorrections)} · resets ${formatNumber(stream.TimestampDiscontinuities)} · drops ${formatNumber(stream.TimestampAnomalyDrops)} · AUD ${formatNumber(stream.AudInsertions)}</td>
+                <td title="TS repairs are timestamp fixes. Resets are detected timeline jumps. Drops are mux packets rejected because their timestamps were unsafe. AUD is the number of H.264/H.265 access unit delimiters inserted.">TS ${formatNumber(stream.TimestampCorrections)} · resets ${formatNumber(stream.TimestampDiscontinuities)} · drops ${formatNumber(stream.TimestampAnomalyDrops)} · AUD ${formatNumber(stream.AudInsertions)}</td>
             </tr>`).join('');
 
             return `<section class="tvhProducer">
@@ -193,19 +196,19 @@ export default function (view, params) {
                     <div class="tvhBadgeGroup"><span class="tvhBadge ${stateClass}">${escapeHtml(producer.State || 'unknown')}</span><span class="tvhBadge ${lockClass}">${producer.HasLock ? 'LOCK' : 'NO LOCK'}</span>${producer.AwaitingCleanVideo ? '<span class="tvhBadge tvhBadgeWarn">waiting for clean video</span>' : ''}</div>
                 </div>
                 <div class="tvhStatusSummary">
-                    ${metric('Adapter', producer.Adapter || '—')}
-                    ${metric('Network / mux', [producer.Network, producer.Mux].filter(Boolean).join(' · ') || '—')}
-                    ${signalMetric('Signal', producer.SignalPercent, producer.SignalDbm, 'dBm')}
-                    ${signalMetric('SNR', producer.SnrPercent, producer.SnrDb, 'dB')}
-                    ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`)}
-                    ${metric('Drops', `${formatNumber(totalDrops)} total · queue ${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)} · mux ${formatNumber(muxDrops)} · video ${formatNumber(damagedVideoDrops)}`)}
-                    ${metric('Video damage', `${formatNumber(producer.VideoDamageEvents)} events · ${formatNumber(producer.DamagedVideoDrops)} drops${producer.VideoDamageAgeMs == null ? '' : ` · ${formatAge(producer.VideoDamageAgeMs)}`}${damageReason}`)}
-                    ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`)}
-                    ${metric('Last mux packet', formatAge(producer.LastMuxPacketAgeMs))}
-                    ${metric('Viewers / readers', `${producer.SharedPlaybackCount || 0} / ${producer.ActiveReaderCount || 0}`)}
-                    ${metric('Reconnects', `${producer.ReconnectAttempts || 0} normal · ${producer.SignalRecoveryAttempts || 0} signal`)}
-                    ${metric('Startup cache', `${producer.KeyframeStartupReady ? 'ready' : 'waiting'} · ${formatBytes(producer.StartupCacheBytes)}`)}
-                    ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${escapeHtml(producer.ChannelId || '')}`)}
+                    ${metric('Adapter', producer.Adapter || '—', 'TV tuner adapter reported by TVHeadend.')}
+                    ${metric('Network / mux', [producer.Network, producer.Mux].filter(Boolean).join(' · ') || '—', 'Broadcast network and multiplex currently feeding this stream.')}
+                    ${signalMetric('Signal', producer.SignalPercent, producer.SignalDbm, 'dBm', 'Tuner signal strength. Higher is better.')}
+                    ${signalMetric('SNR', producer.SnrPercent, producer.SnrDb, 'dB', 'Signal-to-noise ratio. Higher means a cleaner signal.')}
+                    ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`, 'Bit errors and uncorrected blocks from the tuner. Lower is better; UNC growth usually means damaged input.')}
+                    ${metric('Drops', `${formatNumber(totalDrops)} total · queue ${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)} · mux ${formatNumber(muxDrops)} · video ${formatNumber(damagedVideoDrops)}`, 'Dropped packets or frames. Queue is TVHeadend I/P/B frame drops, mux is plugin timestamp-safety drops, video is damaged inter-frame video withheld until a clean keyframe.')}
+                    ${metric('Video damage', `${formatNumber(producer.VideoDamageEvents)} events · ${formatNumber(producer.DamagedVideoDrops)} drops${producer.VideoDamageAgeMs == null ? '' : ` · ${formatAge(producer.VideoDamageAgeMs)}`}${damageReason}`, 'Times the plugin detected unsafe video and withheld frames until a clean random-access frame arrived.')}
+                    ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`, 'TVHeadend subscription queue depth currently reported for this live stream.')}
+                    ${metric('Last mux packet', formatAge(producer.LastMuxPacketAgeMs), 'Time since the plugin last received a playable mux packet. Large values can mean a stalled stream.')}
+                    ${metric('Viewers / readers', `${producer.SharedPlaybackCount || 0} / ${producer.ActiveReaderCount || 0}`, 'Shared playback sessions and active HTTP readers attached to this producer.')}
+                    ${metric('Reconnects', `${producer.ReconnectAttempts || 0} normal · ${producer.SignalRecoveryAttempts || 0} signal`, 'Normal reconnects plus reconnects triggered by tuner signal recovery.')}
+                    ${metric('Startup cache', `${producer.KeyframeStartupReady ? 'ready' : 'waiting'} · ${formatBytes(producer.StartupCacheBytes)}`, 'Buffered startup data used so new viewers can begin on a clean keyframe.')}
+                    ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${producer.ChannelId || ''}`, 'TVHeadend subscription id and Jellyfin channel id for this producer.')}
                 </div>
                 <details data-subscription-id="${Number(producer.SubscriptionId || 0)}"><summary>Stream statistics (${(producer.Streams || []).length})</summary>
                     <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(producer.Service || `channel ${producer.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet, keyframe, and repair statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th><th scope="col">Repairs</th></tr></thead><tbody>${streamRows}</tbody></table></div>
@@ -282,6 +285,7 @@ export default function (view, params) {
             page.querySelector('#selStreamingMethod').value = getStreamingMethod(config);
             page.querySelector('#chkForceDeinterlace').checked = config.ForceDeinterlace === true;
             page.querySelector('#txtHTSPQueueDepth').value = Number.isFinite(config.HTSPQueueDepth) ? config.HTSPQueueDepth : 2000000;
+            page.querySelector('#txtHTSPInitialTuneBufferMs').value = Number.isFinite(config.HTSPInitialTuneBufferMs) ? config.HTSPInitialTuneBufferMs : 0;
             page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(config.HTSPStallTimeoutSeconds) ? config.HTSPStallTimeoutSeconds : 15;
             page.querySelector('#chkHTSPFilterControlStreams').checked = config.HTSPFilterControlStreams === true;
             page.querySelector('#chkHTSPSignalRecoveryEnabled').checked = config.HTSPSignalRecoveryEnabled !== false;
@@ -329,6 +333,7 @@ export default function (view, params) {
             config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
             config.HTSPQueueDepth = intValue(form.querySelector('#txtHTSPQueueDepth'), 2000000, 0, 20000000);
+            config.HTSPInitialTuneBufferMs = intValue(form.querySelector('#txtHTSPInitialTuneBufferMs'), 0, 0, 3000);
             config.HTSPStallTimeoutSeconds = intValue(form.querySelector('#txtHTSPStallTimeoutSeconds'), 15, 0, 120);
             config.HTSPFilterControlStreams = form.querySelector('#chkHTSPFilterControlStreams').checked;
             config.HTSPSignalRecoveryEnabled = form.querySelector('#chkHTSPSignalRecoveryEnabled').checked;

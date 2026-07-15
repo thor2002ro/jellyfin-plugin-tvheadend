@@ -114,6 +114,7 @@ namespace TVHeadEnd
         private DateTime _lastMuxPacketStatsLogUtc = DateTime.MinValue;
         private DateTime _producerOpenedUtc = DateTime.MinValue;
         private long _startupCacheBytes;
+        private long _startupCacheStartedUtcTicks;
         private long _lastPlayableMuxPacketUtcTicks;
         private long _lastQueueIdrops;
         private long _lastQueuePdrops;
@@ -792,7 +793,7 @@ namespace TVHeadEnd
 
                     queues.Add(queue);
                     OnStreamReaderOpened(readerId);
-                    if (GetConfiguredKeyframeStartupEnabled() && _primaryVideoStreamIndex.HasValue && !_startupCacheKeyframeAligned)
+                    if (GetConfiguredKeyframeStartupEnabled() && _primaryVideoStreamIndex.HasValue && !IsStartupCacheReadyLocked())
                     {
                         _pendingBootstrapQueues.Add(queue);
                         _logger.LogDebug(
@@ -970,8 +971,9 @@ namespace TVHeadEnd
 
             lock (_broadcastLock)
             {
-                var cacheWasReady = _startupCacheKeyframeAligned;
+                var cacheWasReady = IsStartupCacheReadyLocked();
                 cacheReady = AddStartupCacheChunkLocked(chunk, randomAccess, forceBootstrapReady, out cacheOverflowed);
+                cacheReady = IsStartupCacheReadyLocked();
                 cacheBecameReady = !cacheWasReady && cacheReady;
                 cacheBytes = _startupCacheBytes;
                 var allQueues = _consumerQueuesByOwner.Values.SelectMany(i => i).ToList();
@@ -1042,28 +1044,14 @@ namespace TVHeadEnd
 
             if (!GetConfiguredKeyframeStartupEnabled())
             {
-                _startupCache.Enqueue(chunk);
-                _startupCacheBytes += chunk.Length;
-                while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
-                {
-                    var removed = _startupCache.Dequeue();
-                    _startupCacheBytes -= removed.Length;
-                }
-
+                AddStartupCacheChunkAndTrimLocked(chunk);
                 _startupCacheKeyframeAligned = true;
                 return true;
             }
 
             if (!_primaryVideoStreamIndex.HasValue || forceBootstrapReady)
             {
-                _startupCache.Enqueue(chunk);
-                _startupCacheBytes += chunk.Length;
-                while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
-                {
-                    var removed = _startupCache.Dequeue();
-                    _startupCacheBytes -= removed.Length;
-                }
-
+                AddStartupCacheChunkAndTrimLocked(chunk);
                 _startupCacheKeyframeAligned = true;
                 return true;
             }
@@ -1072,6 +1060,7 @@ namespace TVHeadEnd
             {
                 _startupCache.Clear();
                 _startupCacheBytes = 0;
+                _startupCacheStartedUtcTicks = 0;
                 _startupCacheKeyframeAligned = true;
                 _startupCacheOverflowLogged = false;
             }
@@ -1085,14 +1074,43 @@ namespace TVHeadEnd
             {
                 _startupCache.Clear();
                 _startupCacheBytes = 0;
+                _startupCacheStartedUtcTicks = 0;
                 _startupCacheKeyframeAligned = false;
                 cacheOverflowed = true;
                 return false;
             }
 
+            AddStartupCacheChunkAndTrimLocked(chunk);
+            return true;
+        }
+
+        private void AddStartupCacheChunkAndTrimLocked(byte[] chunk)
+        {
             _startupCache.Enqueue(chunk);
             _startupCacheBytes += chunk.Length;
-            return true;
+            if (_startupCacheStartedUtcTicks == 0)
+            {
+                _startupCacheStartedUtcTicks = DateTime.UtcNow.Ticks;
+            }
+
+            while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
+            {
+                var removed = _startupCache.Dequeue();
+                _startupCacheBytes -= removed.Length;
+            }
+        }
+
+        private bool IsInitialTuneBufferReadyLocked()
+        {
+            var bufferMs = GetConfiguredInitialTuneBufferMs();
+            return bufferMs <= 0
+                || _startupCacheStartedUtcTicks <= 0
+                || DateTime.UtcNow - new DateTime(_startupCacheStartedUtcTicks, DateTimeKind.Utc) >= TimeSpan.FromMilliseconds(bufferMs);
+        }
+
+        private bool IsStartupCacheReadyLocked()
+        {
+            return _startupCacheKeyframeAligned && IsInitialTuneBufferReadyLocked();
         }
 
         private void ResetStartupCacheForNewSubscription(bool clearParameterSets)
@@ -1101,6 +1119,7 @@ namespace TVHeadEnd
             {
                 _startupCache.Clear();
                 _startupCacheBytes = 0;
+                _startupCacheStartedUtcTicks = 0;
                 _startupCacheKeyframeAligned = false;
                 _startupCacheOverflowLogged = false;
 
@@ -3657,6 +3676,11 @@ namespace TVHeadEnd
             return Plugin.Instance?.Configuration?.HTSPKeyframeStartupEnabled ?? true;
         }
 
+        private static int GetConfiguredInitialTuneBufferMs()
+        {
+            return Math.Max(0, Math.Min(3000, Plugin.Instance?.Configuration?.HTSPInitialTuneBufferMs ?? 0));
+        }
+
         private static bool GetConfiguredHealthLoggingEnabled()
         {
             return Plugin.Instance?.Configuration?.HTSPHealthLoggingEnabled ?? true;
@@ -3719,6 +3743,14 @@ namespace TVHeadEnd
 
             var lastPacketTicks = Interlocked.Read(ref _lastPlayableMuxPacketUtcTicks);
             var videoDamageSinceTicks = Interlocked.Read(ref _videoDamageSinceUtcTicks);
+            bool startupReady;
+            long startupCacheBytes;
+            lock (_broadcastLock)
+            {
+                startupReady = IsStartupCacheReadyLocked();
+                startupCacheBytes = _startupCacheBytes;
+            }
+
             return new HtspProducerStatus
             {
                 ChannelId = _channelId,
@@ -3758,8 +3790,8 @@ namespace TVHeadEnd
                 DamagedVideoDrops = Interlocked.Read(ref _damagedVideoDrops),
                 VideoDamageAgeMs = videoDamageSinceTicks <= 0 ? null : Math.Max(0, (long)(DateTime.UtcNow - new DateTime(videoDamageSinceTicks, DateTimeKind.Utc)).TotalMilliseconds),
                 LastVideoDamageReason = _lastVideoDamageReason,
-                KeyframeStartupReady = _startupCacheKeyframeAligned,
-                StartupCacheBytes = Interlocked.Read(ref _startupCacheBytes),
+                KeyframeStartupReady = startupReady,
+                StartupCacheBytes = startupCacheBytes,
                 Streams = streams
             };
         }

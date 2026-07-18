@@ -1819,18 +1819,8 @@ namespace TVHeadEnd
                 preparedPayload,
                 pts,
                 dts,
-                out var sourceDiscontinuity,
                 forceProgramTables: randomAccess,
                 randomAccess: randomAccess);
-
-            if (sourceDiscontinuity)
-            {
-                ResetStartupCacheForNewSubscription(clearParameterSets: false);
-                _logger.LogWarning(
-                    "HTSP timestamp epoch change confirmed on channel {ChannelId}, stream {StreamIndex}; reset the MPEG-TS timeline, continuity counters, PAT/PMT, and startup cache",
-                    _channelId,
-                    streamIndex);
-            }
 
             if (chunk.Length > 0)
             {
@@ -2438,13 +2428,11 @@ namespace TVHeadEnd
                 _muxPacketCounts.TryGetValue(i, out var packetCount);
                 _muxPacketBytes.TryGetValue(i, out var byteCount);
                 _muxKeyFrameCounts.TryGetValue(i, out var keyFrameCount);
-                var timestampFixes = streamInfo?.TimestampCorrectionCount ?? 0;
                 var timestampDiscontinuities = streamInfo?.TimestampDiscontinuityCount ?? 0;
                 return DescribeMuxPacketStream(i, streamInfo)
                     + ": packets=" + packetCount
                     + ", bytes=" + byteCount
                     + (keyFrameCount > 0 ? ", randomAccess=" + keyFrameCount : string.Empty)
-                    + (timestampFixes > 0 ? ", timestampFixes=" + timestampFixes : string.Empty)
                     + (timestampDiscontinuities > 0 ? ", timestampDiscontinuities=" + timestampDiscontinuities : string.Empty);
             }));
         }
@@ -3733,7 +3721,6 @@ namespace TVHeadEnd
                         Packets = _muxPacketCounts.TryGetValue(item.Key, out var packetCount) ? packetCount : 0,
                         Bytes = _muxPacketBytes.TryGetValue(item.Key, out var byteCount) ? byteCount : 0,
                         RandomAccessFrames = _muxKeyFrameCounts.TryGetValue(item.Key, out var keyFrames) ? keyFrames : 0,
-                        TimestampCorrections = item.Value?.TimestampCorrectionCount ?? 0,
                         TimestampDiscontinuities = item.Value?.TimestampDiscontinuityCount ?? 0,
                         TimestampAnomalyDrops = item.Value?.TimestampAnomalyDropCount ?? 0,
                         AudInsertions = item.Value?.AudInsertionCount ?? 0

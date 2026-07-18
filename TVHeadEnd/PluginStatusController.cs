@@ -23,7 +23,6 @@ namespace TVHeadEnd
         public long Packets { get; set; }
         public long Bytes { get; set; }
         public long RandomAccessFrames { get; set; }
-        public long TimestampCorrections { get; set; }
         public long TimestampDiscontinuities { get; set; }
         public long TimestampAnomalyDrops { get; set; }
         public long AudInsertions { get; set; }

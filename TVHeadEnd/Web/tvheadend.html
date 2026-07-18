@@ -36,7 +36,7 @@
         #TVHclientConfigurationPage .tvhStatusSummary > * { min-width: 0; }
         #TVHclientConfigurationPage .tvhCard,
         #TVHclientConfigurationPage .tvhMetric,
-        #TVHclientConfigurationPage .tvhProducer,
+        #TVHclientConfigurationPage .tvhRunningChannel,
         #TVHclientConfigurationPage .tvhEmpty {
             background: var(--tvh-surface);
             border: 1px solid var(--tvh-border);
@@ -52,7 +52,7 @@
             overflow: clip;
         }
         #TVHclientConfigurationPage .tvhSection > summary,
-        #TVHclientConfigurationPage .tvhProducer details > summary {
+        #TVHclientConfigurationPage .tvhRunningChannel details > summary {
             cursor: pointer;
             overflow-wrap: anywhere;
             -webkit-tap-highlight-color: transparent;
@@ -65,9 +65,9 @@
             background: var(--tvh-surface-strong);
         }
         #TVHclientConfigurationPage .tvhSection > summary:hover,
-        #TVHclientConfigurationPage .tvhProducer details > summary:hover { filter: brightness(1.08); }
+        #TVHclientConfigurationPage .tvhRunningChannel details > summary:hover { filter: brightness(1.08); }
         #TVHclientConfigurationPage .tvhSection > summary:focus-visible,
-        #TVHclientConfigurationPage .tvhProducer details > summary:focus-visible,
+        #TVHclientConfigurationPage .tvhRunningChannel details > summary:focus-visible,
         #TVHclientConfigurationPage #btnRefreshStatus:focus-visible,
         #TVHclientConfigurationPage .tvhTableWrap:focus-visible {
             outline: 2px solid var(--tvh-focus);
@@ -121,13 +121,13 @@
             opacity: .72;
             transition: width .25s ease;
         }
-        #TVHclientConfigurationPage .tvhProducer {
+        #TVHclientConfigurationPage .tvhRunningChannel {
             padding: 1em;
             border-radius: var(--tvh-radius);
             margin-bottom: 1em;
             min-width: 0;
         }
-        #TVHclientConfigurationPage .tvhProducerTitle {
+        #TVHclientConfigurationPage .tvhRunningChannelTitle {
             display: flex;
             flex-wrap: wrap;
             align-items: flex-start;
@@ -136,7 +136,7 @@
             margin-bottom: .8em;
             min-width: 0;
         }
-        #TVHclientConfigurationPage .tvhProducerTitle h3 {
+        #TVHclientConfigurationPage .tvhRunningChannelTitle h3 {
             margin: 0;
             min-width: 0;
             max-width: 100%;
@@ -216,12 +216,12 @@
         @media (max-width: 600px) {
             #TVHclientConfigurationPage .tvhSectionBody { padding: .82em; }
             #TVHclientConfigurationPage .tvhSection > summary { padding: .9em .82em; }
-            #TVHclientConfigurationPage .tvhProducer { padding: .82em; }
+            #TVHclientConfigurationPage .tvhRunningChannel { padding: .82em; }
             #TVHclientConfigurationPage .tvhStatusHeader { align-items: stretch; }
             #TVHclientConfigurationPage .tvhStatusHeader > div:first-child { flex: 1 1 100%; }
             #TVHclientConfigurationPage .tvhInlineButtons,
             #TVHclientConfigurationPage #btnRefreshStatus { width: 100%; }
-            #TVHclientConfigurationPage .tvhProducerTitle { display: block; }
+            #TVHclientConfigurationPage .tvhRunningChannelTitle { display: block; }
             #TVHclientConfigurationPage .tvhBadgeGroup { justify-content: flex-start; margin-top: .55em; }
             #TVHclientConfigurationPage .tvhStatusSummary { grid-template-columns: 1fr 1fr; }
         }
@@ -270,9 +270,9 @@
                         <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPEnableStreamSharing" /><span>Share one upstream subscription between viewers of the same channel</span></label><div class="fieldDescription checkboxFieldDescription">Reduces tuner use and TVHeadend bandwidth. Each Jellyfin reader still receives an independent buffered stream.</div></div>
                         <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPKeyframeStartupEnabled" /><span>Start new readers at a verified video keyframe</span></label><div class="fieldDescription checkboxFieldDescription">Recommended. Prevents late readers from starting on P/B frames without SPS/PPS/VPS.</div></div>
                         <div class="tvhGrid">
-                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="20000000" step="100000" id="txtHTSPQueueDepth" label="TVHeadend queue depth (bytes)" /><div class="fieldDescription">Default: 2,000,000. Set 0 to use TVHeadend's default.</div></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="20" step="0.01" id="txtHTSPQueueDepth" label="TVHeadend queue depth (MiB)" /><div class="fieldDescription">Default: 10 MiB. Set 0 to use TVHeadend's server default.</div></div>
                             <div class="inputContainer"><input is="emby-input" type="number" min="0" max="3000" step="5" id="txtHTSPInitialTuneBufferMs" label="Initial tune buffer (ms)" /><div class="fieldDescription">Default: 0. Holds startup briefly so the cache can collect clean headers/keyframes before playback begins.</div></div>
-                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="120" step="1" id="txtHTSPStallTimeoutSeconds" label="Silent-stream watchdog (seconds)" /><div class="fieldDescription">Reconnect when the producer receives no playable packets. Set 0 to disable.</div></div>
+                            <div class="inputContainer"><input is="emby-input" type="number" min="0" max="120" step="1" id="txtHTSPStallTimeoutSeconds" label="Silent-stream watchdog (seconds)" /><div class="fieldDescription">Reconnect when the channel stream receives no playable packets. Set 0 to disable.</div></div>
                         </div>
                         <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPFilterControlStreams" /><span>Filter CA/control/data streams upstream</span></label><div class="fieldDescription checkboxFieldDescription">Optional HTSP v12+ optimization. Asks TVHeadend not to send CA/ECM/private control or data stream indexes that the plugin would discard locally. Video, audio, and subtitles are never filtered; normally leave this disabled.</div></div>
                     </div>
@@ -315,7 +315,10 @@
                     </div>
                 </details>
 
-                <button is="emby-button" type="submit" class="raised button-submit block" title="Save all TVHeadend plugin settings shown on this page."><span>Save settings</span></button>
+                <div class="tvhInlineButtons">
+                    <button is="emby-button" type="submit" class="raised button-submit" title="Save all TVHeadend plugin settings shown on this page."><span>Save settings</span></button>
+                    <button is="emby-button" type="button" id="btnResetDefaults" class="raised" title="Reset TVHeadend plugin settings to their default values, keeping hostname, username, and password."><span>Reset to defaults</span></button>
+                </div>
             </form>
 
         </div>

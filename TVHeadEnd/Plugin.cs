@@ -27,6 +27,24 @@ namespace TVHeadEnd
             }
         }
 
+        public PluginConfiguration ResetConfigurationToDefaults()
+        {
+            var current = Configuration;
+            var configuration = PluginConfiguration.CreateDefault();
+            if (!string.IsNullOrWhiteSpace(current?.TVH_ServerName))
+            {
+                configuration.TVH_ServerName = current.TVH_ServerName;
+            }
+
+            configuration.Username = current?.Username ?? string.Empty;
+            configuration.Password = current?.Password ?? string.Empty;
+            configuration.RecordingStreamSecret = string.IsNullOrWhiteSpace(current?.RecordingStreamSecret)
+                ? Convert.ToHexString(RandomNumberGenerator.GetBytes(32))
+                : current.RecordingStreamSecret;
+            SaveConfiguration(configuration);
+            return configuration;
+        }
+
         public IEnumerable<PluginPageInfo> GetPages()
         {
             return new[]

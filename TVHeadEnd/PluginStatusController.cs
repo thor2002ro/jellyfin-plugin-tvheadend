@@ -28,7 +28,7 @@ namespace TVHeadEnd
         public long AudInsertions { get; set; }
     }
 
-    public sealed class HtspProducerStatus
+    public sealed class HtspRunningChannelStatus
     {
         public string ChannelId { get; set; }
         public string PlaybackId { get; set; }
@@ -81,8 +81,28 @@ namespace TVHeadEnd
         public bool Connected { get; set; }
         public string ServerVersion { get; set; }
         public int? HtspProtocolVersion { get; set; }
-        public int ActiveProducerCount { get; set; }
-        public IReadOnlyList<HtspProducerStatus> Producers { get; set; }
+        public int RunningChannelCount { get; set; }
+        public IReadOnlyList<HtspRunningChannelStatus> RunningChannels { get; set; }
+        public int ActiveProducerCount => RunningChannelCount;
+        public IReadOnlyList<HtspRunningChannelStatus> Producers => RunningChannels;
+    }
+
+    [ApiController]
+    [Authorize(Policy = "RequiresElevation")]
+    [Route("TVHeadEnd/Configuration")]
+    public sealed class PluginConfigurationController : ControllerBase
+    {
+        [HttpPost("ResetDefaults")]
+        public ActionResult ResetDefaults()
+        {
+            var plugin = Plugin.Instance;
+            if (plugin == null)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError);
+            }
+
+            return Ok(plugin.ResetConfigurationToDefaults());
+        }
     }
 
     [ApiController]
@@ -101,7 +121,7 @@ namespace TVHeadEnd
         public ActionResult<PluginRuntimeStatus> GetStatus()
         {
             var configuration = Plugin.Instance?.Configuration;
-            var producers = HtspLiveStream.GetActiveProducerStatuses();
+            var runningChannels = HtspLiveStream.GetRunningChannelStatuses();
             var connection = _connectionHandler.GetConnectionStatus();
             return Ok(new PluginRuntimeStatus
             {
@@ -114,8 +134,8 @@ namespace TVHeadEnd
                 Connected = connection.Connected,
                 ServerVersion = connection.ServerVersion,
                 HtspProtocolVersion = connection.ProtocolVersion,
-                ActiveProducerCount = producers.Count,
-                Producers = producers
+                RunningChannelCount = runningChannels.Count,
+                RunningChannels = runningChannels
             });
         }
     }

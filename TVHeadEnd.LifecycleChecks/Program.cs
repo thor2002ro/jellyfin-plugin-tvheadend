@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using MediaBrowser.Model.Dto;
 using Microsoft.Extensions.Logging.Abstractions;
 using TVHeadEnd;
+using TVHeadEnd.Configuration;
 using TVHeadEnd.HTSP;
 
 const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
@@ -118,6 +119,9 @@ for (var i = 0; i < 100; i++)
 
 AssertMuxerDoesNotRewriteDuplicateVideoDts();
 AssertMuxerMarksConfirmedSourceClockJump();
+AssertStartupCacheKeepsInitialBufferClockAcrossKeyframes();
+AssertDefaultQueueDepthIsCentralized();
+AssertRuntimeStatusKeepsRunningChannelCompatibilityAliases();
 
 Console.WriteLine("Lifecycle checks passed.");
 
@@ -180,6 +184,41 @@ static void AssertMuxerMarksConfirmedSourceClockJump()
     Assert(pending.Length == 0, "Unconfirmed source-clock jump was not withheld.");
     Assert(recovered.Length > 0, "Confirmed source-clock jump did not resume muxing.");
     Assert((long)GetMuxerStreamField(stream, "TimestampDiscontinuityCount") == 1, "Confirmed source-clock jump did not emit a discontinuity.");
+}
+
+static void AssertStartupCacheKeepsInitialBufferClockAcrossKeyframes()
+{
+    using var stream = CreateStream(Guid.NewGuid().ToString("N"));
+    var addChunk = typeof(HtspLiveStream).GetMethod("AddStartupCacheChunkLocked", PrivateInstance)!;
+    var chunk = new byte[188];
+    chunk[0] = 0x47;
+    SetField(stream, "_primaryVideoStreamIndex", 0);
+    SetField(stream, "_startupCacheStartedUtcTicks", 12345L);
+
+    var args = new object[] { chunk, true, false, false };
+    addChunk.Invoke(stream, args);
+
+    Assert(GetLong(stream, "_startupCacheStartedUtcTicks") == 12345L, "A later keyframe restarted the initial tune buffer clock.");
+}
+
+static void AssertDefaultQueueDepthIsCentralized()
+{
+    var configuration = new PluginConfiguration();
+    Assert(configuration.HTSPQueueDepth == PluginConfiguration.DefaultHTSPQueueDepth, "Default HTSP queue depth no longer matches the centralized default.");
+    Assert(PluginConfiguration.CreateDefault().HTSPQueueDepth == configuration.HTSPQueueDepth, "Reset defaults no longer match fresh configuration defaults.");
+}
+
+static void AssertRuntimeStatusKeepsRunningChannelCompatibilityAliases()
+{
+    var channels = new[] { new HtspRunningChannelStatus { ChannelId = "1" } };
+    var status = new PluginRuntimeStatus
+    {
+        RunningChannelCount = channels.Length,
+        RunningChannels = channels
+    };
+
+    Assert(status.ActiveProducerCount == status.RunningChannelCount, "Legacy active-producer count alias no longer mirrors running channels.");
+    Assert(ReferenceEquals(status.Producers, status.RunningChannels), "Legacy producers alias no longer mirrors running channels.");
 }
 
 static (object Muxer, object Stream) CreateH264Muxer()

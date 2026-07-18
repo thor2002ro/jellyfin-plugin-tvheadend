@@ -8,6 +8,8 @@ namespace TVHeadEnd.Configuration
     /// </summary>
     public class PluginConfiguration : BasePluginConfiguration
     {
+        public const int DefaultHTSPQueueDepth = 10 * 1024 * 1024;
+
         public string TVH_ServerName { get; set; }
 		public string TVH_TimeZoneId { get; set; }
 		public string RecordingStreamSecret { get; set; }
@@ -44,6 +46,16 @@ namespace TVHeadEnd.Configuration
 
         public PluginConfiguration()
         {
+            ApplyDefaults();
+        }
+
+        public static PluginConfiguration CreateDefault()
+        {
+            return new PluginConfiguration();
+        }
+
+        private void ApplyDefaults()
+        {
             TVH_ServerName = "localhost";
             TVH_TimeZoneId = "";
             RecordingStreamSecret = "";
@@ -61,7 +73,7 @@ namespace TVHeadEnd.Configuration
             HideRecordingsChannel = false;
             StreamingMethod = StreamingMethods.Htsp;
             ForceDeinterlace = false;
-            HTSPQueueDepth = 2000000;
+            HTSPQueueDepth = DefaultHTSPQueueDepth;
             HTSPStallTimeoutSeconds = 15;
             HTSPFilterControlStreams = false;
             HTSPSignalRecoveryEnabled = true;

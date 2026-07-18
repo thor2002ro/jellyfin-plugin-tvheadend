@@ -29,26 +29,23 @@ namespace TVHeadEnd
             }
         }
 
-        /// <summary>
-        /// Gets the instance.
-        /// </summary>
-        /// <value>The instance.</value>
-        public static Plugin Instance { get; private set; } = null!;
+        public PluginConfiguration ResetConfigurationToDefaults()
+        {
+            var current = Configuration;
+            var configuration = PluginConfiguration.CreateDefault();
+            if (!string.IsNullOrWhiteSpace(current?.TVH_ServerName))
+            {
+                configuration.TVH_ServerName = current.TVH_ServerName;
+            }
 
-        /// <summary>
-        /// Gets the name of the plugin.
-        /// </summary>
-        /// <value>The name.</value>
-        public override string Name => "TVHeadend";
-
-        /// <summary>
-        /// Gets the description.
-        /// </summary>
-        /// <value>The description.</value>
-        public override string Description => "Provides live TV using TVHeadend as the source.";
-
-        /// <inheritdoc />
-        public override Guid Id => _pluginId;
+            configuration.Username = current?.Username ?? string.Empty;
+            configuration.Password = current?.Password ?? string.Empty;
+            configuration.RecordingStreamSecret = string.IsNullOrWhiteSpace(current?.RecordingStreamSecret)
+                ? Convert.ToHexString(RandomNumberGenerator.GetBytes(32))
+                : current.RecordingStreamSecret;
+            SaveConfiguration(configuration);
+            return configuration;
+        }
 
         public IEnumerable<PluginPageInfo> GetPages()
         {

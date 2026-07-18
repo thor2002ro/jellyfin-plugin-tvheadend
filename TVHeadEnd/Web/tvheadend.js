@@ -5,6 +5,9 @@
 export default function (view, params) {
     let statusTimer = null;
     let statusRequestInFlight = null;
+    const bytesPerMiB = 1024 * 1024;
+    const defaultQueueDepthBytes = 10 * bytesPerMiB;
+    const maxQueueDepthMiB = 20;
 
     function getStreamingMethod(config) {
         return config.StreamingMethod || 'Htsp';
@@ -16,8 +19,66 @@ export default function (view, params) {
         return Math.max(min, Math.min(max, value));
     }
 
+    function queueDepthBytesToMiB(bytes) {
+        const value = Math.max(0, Math.min(maxQueueDepthMiB * bytesPerMiB, Number(bytes || 0)));
+        return (value / bytesPerMiB).toFixed(2).replace(/\.?0+$/, '');
+    }
+
+    function loadQueueDepth(element, bytes) {
+        const value = Number.isFinite(bytes) ? bytes : defaultQueueDepthBytes;
+        element.dataset.bytes = String(value);
+        element.value = queueDepthBytesToMiB(value);
+    }
+
+    function saveQueueDepth(element) {
+        if (element.value === queueDepthBytesToMiB(Number(element.dataset.bytes))) {
+            return Number(element.dataset.bytes);
+        }
+
+        const parsed = parseFloat(element.value);
+        const mib = Number.isFinite(parsed) ? Math.max(0, Math.min(maxQueueDepthMiB, parsed)) : defaultQueueDepthBytes / bytesPerMiB;
+        return Math.round(mib * bytesPerMiB);
+    }
+
     function priorityValue(value) {
         return [0, 1, 2, 3, 4, 6].includes(Number(value)) ? Number(value) : 2;
+    }
+
+    function loadConfig(page, config) {
+        const values = config || {};
+        page.querySelector('#txtTVH_ServerName').value = values.TVH_ServerName || '';
+        loadTimeZones(page.querySelector('#txtTVH_TimeZoneId'), page.querySelector('#tvhTimeZones'), values.TVH_TimeZoneId || '');
+        page.querySelector('#txtHTTP_Port').value = Number.isFinite(values.HTTP_Port) ? values.HTTP_Port : 9981;
+        page.querySelector('#chkUseHttps').checked = values.UseHttps === true;
+        page.querySelector('#txtHTSP_Port').value = Number.isFinite(values.HTSP_Port) ? values.HTSP_Port : 9982;
+        page.querySelector('#txtWebRoot').value = values.WebRoot || '/';
+        page.querySelector('#txtUserName').value = values.Username || '';
+        page.querySelector('#txtPassword').value = values.Password || '';
+        page.querySelector('#txtPriority').value = priorityValue(values.Priority);
+        loadProfiles(page, values.Profile || '');
+        page.querySelector('#txtPrePadding').value = Number.isFinite(values.Pre_Padding) ? values.Pre_Padding : 0;
+        page.querySelector('#txtPostPadding').value = Number.isFinite(values.Post_Padding) ? values.Post_Padding : 0;
+        page.querySelector('#selChannelType').value = values.ChannelType || 'Ignore';
+        page.querySelector('#chkHideRecordingsChannel').checked = values.HideRecordingsChannel === true;
+        page.querySelector('#selStreamingMethod').value = getStreamingMethod(values);
+        page.querySelector('#chkForceDeinterlace').checked = values.ForceDeinterlace === true;
+        loadQueueDepth(page.querySelector('#txtHTSPQueueDepth'), values.HTSPQueueDepth);
+        page.querySelector('#txtHTSPInitialTuneBufferMs').value = Number.isFinite(values.HTSPInitialTuneBufferMs) ? values.HTSPInitialTuneBufferMs : 0;
+        page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(values.HTSPStallTimeoutSeconds) ? values.HTSPStallTimeoutSeconds : 15;
+        page.querySelector('#chkHTSPFilterControlStreams').checked = values.HTSPFilterControlStreams === true;
+        page.querySelector('#chkHTSPSignalRecoveryEnabled').checked = values.HTSPSignalRecoveryEnabled !== false;
+        page.querySelector('#txtHTSPSignalLockLossSeconds').value = Number.isFinite(values.HTSPSignalLockLossSeconds) ? values.HTSPSignalLockLossSeconds : 3;
+        page.querySelector('#txtHTSPSignalUncBurstThreshold').value = Number.isFinite(values.HTSPSignalUncBurstThreshold) ? values.HTSPSignalUncBurstThreshold : 5;
+        page.querySelector('#txtHTSPSignalIdrWaitSeconds').value = Number.isFinite(values.HTSPSignalIdrWaitSeconds) ? values.HTSPSignalIdrWaitSeconds : 3;
+        page.querySelector('#txtHTSPSignalRecoveryMaxReconnects').value = Number.isFinite(values.HTSPSignalRecoveryMaxReconnects) ? values.HTSPSignalRecoveryMaxReconnects : 2;
+        page.querySelector('#txtHTSPSignalRecoveryCooldownSeconds').value = Number.isFinite(values.HTSPSignalRecoveryCooldownSeconds) ? values.HTSPSignalRecoveryCooldownSeconds : 15;
+        page.querySelector('#chkHTSPEnableStreamSharing').checked = values.HTSPEnableStreamSharing !== false;
+        page.querySelector('#chkHTSPKeyframeStartupEnabled').checked = values.HTSPKeyframeStartupEnabled !== false;
+        page.querySelector('#chkHTSPHealthLoggingEnabled').checked = values.HTSPHealthLoggingEnabled !== false;
+        page.querySelector('#txtHTSPHealthLogIntervalSeconds').value = Number.isFinite(values.HTSPHealthLogIntervalSeconds) ? values.HTSPHealthLogIntervalSeconds : 30;
+        page.querySelector('#chkHTSPSignalHealthLoggingEnabled').checked = values.HTSPSignalHealthLoggingEnabled !== false;
+        page.querySelector('#chkHTSPDetailedDiagnostics').checked = values.HTSPDetailedDiagnostics === true;
+        updateDependentState(page);
     }
 
     function loadProfiles(page, selectedProfile) {
@@ -94,6 +155,41 @@ export default function (view, params) {
         return `<div class="tvhMetric"${title}><span class="tvhMetricLabel">${escapeHtml(label)}</span><span class="tvhMetricValue">${escapeHtml(value)}</span>${meter}</div>`;
     }
 
+    function sumStreamField(channel, field) {
+        return (channel.Streams || []).reduce((total, stream) => total + Number(stream[field] || 0), 0);
+    }
+
+    function dropSummary(channel) {
+        const queueI = Number(channel.QueueIDrops || 0);
+        const queueP = Number(channel.QueuePDrops || 0);
+        const queueB = Number(channel.QueueBDrops || 0);
+        const queue = queueI + queueP + queueB;
+        const mux = sumStreamField(channel, 'TimestampAnomalyDrops');
+        const video = Number(channel.DamagedVideoDrops || 0);
+
+        return {
+            value: `${formatNumber(queue + mux + video)} total · queue ${formatNumber(queueI)}/${formatNumber(queueP)}/${formatNumber(queueB)} · mux ${formatNumber(mux)} · video ${formatNumber(video)}`,
+            help: 'Dropped packets or frames. Queue is TVHeadend I/P/B frame drops, mux is plugin timestamp-safety drops, video is damaged inter-frame video withheld until a clean keyframe.'
+        };
+    }
+
+    function videoDamageSummary(channel) {
+        const age = channel.VideoDamageAgeMs == null ? '' : ` · ${formatAge(channel.VideoDamageAgeMs)}`;
+        const reason = channel.LastVideoDamageReason ? ` · ${channel.LastVideoDamageReason}` : '';
+
+        return {
+            value: `${formatNumber(channel.VideoDamageEvents)} events · ${formatNumber(channel.DamagedVideoDrops)} drops${age}${reason}`,
+            help: 'Times the plugin detected unsafe video and withheld frames until a clean random-access frame arrived.'
+        };
+    }
+
+    function reconnectSummary(channel) {
+        return {
+            value: `${formatNumber(channel.ReconnectAttempts || 0)} normal · ${formatNumber(channel.SignalRecoveryAttempts || 0)} signal`,
+            help: 'Normal reconnects plus reconnects triggered by tuner signal recovery.'
+        };
+    }
+
     function setRefreshState(page, busy) {
         const button = page.querySelector('#btnRefreshStatus');
         const label = button ? button.querySelector('span') : null;
@@ -140,6 +236,12 @@ export default function (view, params) {
             saveButton.title = 'Save all TVHeadend plugin settings shown on this page.';
             saveButton.setAttribute('aria-label', 'Save TVHeadend plugin settings');
         }
+
+        const resetButton = page.querySelector('#btnResetDefaults');
+        if (resetButton) {
+            resetButton.title = 'Reset TVHeadend plugin settings to their default values, keeping hostname, username, and password.';
+            resetButton.setAttribute('aria-label', 'Reset TVHeadend plugin settings to defaults, keeping hostname, username, and password');
+        }
     }
 
     function updateDependentState(page) {
@@ -155,7 +257,7 @@ export default function (view, params) {
     }
 
     function renderStatus(page, status) {
-        const producers = Array.isArray(status.Producers) ? status.Producers : [];
+        const runningChannels = Array.isArray(status.RunningChannels) ? status.RunningChannels : Array.isArray(status.Producers) ? status.Producers : [];
         const serverStatus = status.Connected
             ? `${status.Server || 'not configured'} · Connected · ${status.ServerVersion || 'unknown version'} · HTSP ${status.HtspProtocolVersion == null ? 'unknown' : status.HtspProtocolVersion}`
             : `${status.Server || 'not configured'} · Disconnected`;
@@ -164,26 +266,24 @@ export default function (view, params) {
             metric('Plugin version', status.PluginVersion || 'unknown') +
             metric('TVHeadend server', serverStatus) +
             metric('Streaming method', status.StreamingMethod || 'legacy/default') +
-            metric('Active producers', String(status.ActiveProducerCount || 0));
+            metric('Running Channels', String(status.RunningChannelCount ?? status.ActiveProducerCount ?? 0));
 
         const container = page.querySelector('#activeTuners');
         const expandedSubscriptions = new Set(Array.from(container.querySelectorAll('details[open][data-subscription-id]'), details => details.dataset.subscriptionId));
-        if (!producers.length) {
+        if (!runningChannels.length) {
             container.innerHTML = '<div class="tvhEmpty">No active HTSP tuner subscriptions. Start a live channel to populate runtime signal and stream statistics.</div>';
             container.setAttribute('aria-busy', 'false');
             return;
         }
 
         container.setAttribute('aria-busy', 'false');
-        container.innerHTML = producers.map(producer => {
-            const queueDrops = Number(producer.QueueIDrops || 0) + Number(producer.QueuePDrops || 0) + Number(producer.QueueBDrops || 0);
-            const muxDrops = (producer.Streams || []).reduce((total, stream) => total + Number(stream.TimestampAnomalyDrops || 0), 0);
-            const damagedVideoDrops = Number(producer.DamagedVideoDrops || 0);
-            const totalDrops = queueDrops + muxDrops + damagedVideoDrops;
-            const lockClass = producer.HasLock ? 'tvhBadgeGood' : 'tvhBadgeBad';
-            const stateClass = producer.State === 'streaming' ? 'tvhBadgeGood' : producer.State === 'recovering' ? 'tvhBadgeWarn' : '';
-            const damageReason = producer.LastVideoDamageReason ? ` · ${escapeHtml(producer.LastVideoDamageReason)}` : '';
-            const streamRows = (producer.Streams || []).map(stream => `<tr>
+        container.innerHTML = runningChannels.map(channel => {
+            const drops = dropSummary(channel);
+            const videoDamage = videoDamageSummary(channel);
+            const reconnects = reconnectSummary(channel);
+            const lockClass = channel.HasLock ? 'tvhBadgeGood' : 'tvhBadgeBad';
+            const stateClass = channel.State === 'streaming' ? 'tvhBadgeGood' : channel.State === 'recovering' ? 'tvhBadgeWarn' : '';
+            const streamRows = (channel.Streams || []).map(stream => `<tr>
                 <td>${stream.Index}</td><td>0x${Number(stream.Pid || 0).toString(16).toUpperCase()}</td>
                 <td>${escapeHtml(stream.Codec || 'unknown')}</td><td>${escapeHtml(stream.Language || '—')}</td>
                 <td>${escapeHtml(stream.Title || '—')}</td><td>${formatNumber(stream.Packets)}</td>
@@ -191,27 +291,27 @@ export default function (view, params) {
                 <td title="Resets are detected timeline jumps. Drops are mux packets rejected because their timestamps were unsafe. AUD is the number of H.264/H.265 access unit delimiters inserted.">resets ${formatNumber(stream.TimestampDiscontinuities)} · drops ${formatNumber(stream.TimestampAnomalyDrops)} · AUD ${formatNumber(stream.AudInsertions)}</td>
             </tr>`).join('');
 
-            return `<section class="tvhProducer">
-                <div class="tvhProducerTitle"><h3>${escapeHtml(producer.Service || `Channel ${producer.ChannelId}`)}</h3>
-                    <div class="tvhBadgeGroup"><span class="tvhBadge ${stateClass}">${escapeHtml(producer.State || 'unknown')}</span><span class="tvhBadge ${lockClass}">${producer.HasLock ? 'LOCK' : 'NO LOCK'}</span>${producer.AwaitingCleanVideo ? '<span class="tvhBadge tvhBadgeWarn">waiting for clean video</span>' : ''}</div>
+            return `<section class="tvhRunningChannel">
+                <div class="tvhRunningChannelTitle"><h3>${escapeHtml(channel.Service || `Channel ${channel.ChannelId}`)}</h3>
+                    <div class="tvhBadgeGroup"><span class="tvhBadge ${stateClass}">${escapeHtml(channel.State || 'unknown')}</span><span class="tvhBadge ${lockClass}">${channel.HasLock ? 'LOCK' : 'NO LOCK'}</span>${channel.AwaitingCleanVideo ? '<span class="tvhBadge tvhBadgeWarn">waiting for clean video</span>' : ''}</div>
                 </div>
                 <div class="tvhStatusSummary">
-                    ${metric('Adapter', producer.Adapter || '—', 'TV tuner adapter reported by TVHeadend.')}
-                    ${metric('Network / mux', [producer.Network, producer.Mux].filter(Boolean).join(' · ') || '—', 'Broadcast network and multiplex currently feeding this stream.')}
-                    ${signalMetric('Signal', producer.SignalPercent, producer.SignalDbm, 'dBm', 'Tuner signal strength. Higher is better.')}
-                    ${signalMetric('SNR', producer.SnrPercent, producer.SnrDb, 'dB', 'Signal-to-noise ratio. Higher means a cleaner signal.')}
-                    ${metric('BER / UNC', `${formatNumber(producer.Ber)} / ${formatNumber(producer.Unc)}`, 'Bit errors and uncorrected blocks from the tuner. Lower is better; UNC growth usually means damaged input.')}
-                    ${metric('Drops', `${formatNumber(totalDrops)} total · queue ${formatNumber(producer.QueueIDrops)}/${formatNumber(producer.QueuePDrops)}/${formatNumber(producer.QueueBDrops)} · mux ${formatNumber(muxDrops)} · video ${formatNumber(damagedVideoDrops)}`, 'Dropped packets or frames. Queue is TVHeadend I/P/B frame drops, mux is plugin timestamp-safety drops, video is damaged inter-frame video withheld until a clean keyframe.')}
-                    ${metric('Video damage', `${formatNumber(producer.VideoDamageEvents)} events · ${formatNumber(producer.DamagedVideoDrops)} drops${producer.VideoDamageAgeMs == null ? '' : ` · ${formatAge(producer.VideoDamageAgeMs)}`}${damageReason}`, 'Times the plugin detected unsafe video and withheld frames until a clean random-access frame arrived.')}
-                    ${metric('Queue', `${formatNumber(producer.QueuePackets)} packets · ${formatBytes(producer.QueueBytes)}`, 'TVHeadend subscription queue depth currently reported for this live stream.')}
-                    ${metric('Last mux packet', formatAge(producer.LastMuxPacketAgeMs), 'Time since the plugin last received a playable mux packet. Large values can mean a stalled stream.')}
-                    ${metric('Viewers / readers', `${producer.SharedPlaybackCount || 0} / ${producer.ActiveReaderCount || 0}`, 'Shared playback sessions and active HTTP readers attached to this producer.')}
-                    ${metric('Reconnects', `${producer.ReconnectAttempts || 0} normal · ${producer.SignalRecoveryAttempts || 0} signal`, 'Normal reconnects plus reconnects triggered by tuner signal recovery.')}
-                    ${metric('Startup cache', `${producer.KeyframeStartupReady ? 'ready' : 'waiting'} · ${formatBytes(producer.StartupCacheBytes)}`, 'Buffered startup data used so new viewers can begin on a clean keyframe.')}
-                    ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${producer.ChannelId || ''}`, 'TVHeadend subscription id and Jellyfin channel id for this producer.')}
+                    ${metric('Adapter', channel.Adapter || '—', 'TV tuner adapter reported by TVHeadend.')}
+                    ${metric('Network / mux', [channel.Network, channel.Mux].filter(Boolean).join(' · ') || '—', 'Broadcast network and multiplex currently feeding this stream.')}
+                    ${signalMetric('Signal', channel.SignalPercent, channel.SignalDbm, 'dBm', 'Tuner signal strength. Higher is better.')}
+                    ${signalMetric('SNR', channel.SnrPercent, channel.SnrDb, 'dB', 'Signal-to-noise ratio. Higher means a cleaner signal.')}
+                    ${metric('BER / UNC', `${formatNumber(channel.Ber)} / ${formatNumber(channel.Unc)}`, 'Bit errors and uncorrected blocks from the tuner. Lower is better; UNC growth usually means damaged input.')}
+                    ${metric('Drops', drops.value, drops.help)}
+                    ${metric('Video damage', videoDamage.value, videoDamage.help)}
+                    ${metric('Queue', `${formatNumber(channel.QueuePackets)} packets · ${formatBytes(channel.QueueBytes)}`, 'TVHeadend subscription queue depth currently reported for this live stream.')}
+                    ${metric('Last mux packet', formatAge(channel.LastMuxPacketAgeMs), 'Time since the plugin last received a playable mux packet. Large values can mean a stalled stream.')}
+                    ${metric('Viewers / readers', `${channel.SharedPlaybackCount || 0} / ${channel.ActiveReaderCount || 0}`, 'Shared playback sessions and active HTTP readers attached to this running channel.')}
+                    ${metric('Reconnects', reconnects.value, reconnects.help)}
+                    ${metric('Startup cache', `${channel.KeyframeStartupReady ? 'ready' : 'waiting'} · ${formatBytes(channel.StartupCacheBytes)}`, 'Buffered startup data used so new viewers can begin on a clean keyframe.')}
+                    ${metric('HTSP id', `#${channel.SubscriptionId || 0} · ${channel.ChannelId || ''}`, 'Client-assigned HTSP subscription id. It increments on reconnect; it is not the active subscription count.')}
                 </div>
-                <details data-subscription-id="${Number(producer.SubscriptionId || 0)}"><summary>Stream statistics (${(producer.Streams || []).length})</summary>
-                    <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(producer.Service || `channel ${producer.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet, keyframe, and event statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th><th scope="col">Events</th></tr></thead><tbody>${streamRows}</tbody></table></div>
+                <details data-subscription-id="${Number(channel.SubscriptionId || 0)}"><summary>Stream statistics (${(channel.Streams || []).length})</summary>
+                    <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(channel.Service || `channel ${channel.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet, keyframe, and event statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th><th scope="col">Events</th></tr></thead><tbody>${streamRows}</tbody></table></div>
                 </details>
             </section>`;
         }).join('');
@@ -268,39 +368,7 @@ export default function (view, params) {
         Dashboard.showLoadingMsg();
         const page = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
-            page.querySelector('#txtTVH_ServerName').value = config.TVH_ServerName || '';
-            loadTimeZones(page.querySelector('#txtTVH_TimeZoneId'), page.querySelector('#tvhTimeZones'), config.TVH_TimeZoneId || '');
-            page.querySelector('#txtHTTP_Port').value = config.HTTP_Port || 9981;
-            page.querySelector('#chkUseHttps').checked = config.UseHttps === true;
-            page.querySelector('#txtHTSP_Port').value = config.HTSP_Port || 9982;
-            page.querySelector('#txtWebRoot').value = config.WebRoot || '/';
-            page.querySelector('#txtUserName').value = config.Username || '';
-            page.querySelector('#txtPassword').value = config.Password || '';
-            page.querySelector('#txtPriority').value = priorityValue(config.Priority);
-            loadProfiles(page, config.Profile || '');
-            page.querySelector('#txtPrePadding').value = Number.isFinite(config.Pre_Padding) ? config.Pre_Padding : 0;
-            page.querySelector('#txtPostPadding').value = Number.isFinite(config.Post_Padding) ? config.Post_Padding : 0;
-            page.querySelector('#selChannelType').value = config.ChannelType || 'Ignore';
-            page.querySelector('#chkHideRecordingsChannel').checked = config.HideRecordingsChannel === true;
-            page.querySelector('#selStreamingMethod').value = getStreamingMethod(config);
-            page.querySelector('#chkForceDeinterlace').checked = config.ForceDeinterlace === true;
-            page.querySelector('#txtHTSPQueueDepth').value = Number.isFinite(config.HTSPQueueDepth) ? config.HTSPQueueDepth : 2000000;
-            page.querySelector('#txtHTSPInitialTuneBufferMs').value = Number.isFinite(config.HTSPInitialTuneBufferMs) ? config.HTSPInitialTuneBufferMs : 0;
-            page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(config.HTSPStallTimeoutSeconds) ? config.HTSPStallTimeoutSeconds : 15;
-            page.querySelector('#chkHTSPFilterControlStreams').checked = config.HTSPFilterControlStreams === true;
-            page.querySelector('#chkHTSPSignalRecoveryEnabled').checked = config.HTSPSignalRecoveryEnabled !== false;
-            page.querySelector('#txtHTSPSignalLockLossSeconds').value = Number.isFinite(config.HTSPSignalLockLossSeconds) ? config.HTSPSignalLockLossSeconds : 3;
-            page.querySelector('#txtHTSPSignalUncBurstThreshold').value = Number.isFinite(config.HTSPSignalUncBurstThreshold) ? config.HTSPSignalUncBurstThreshold : 5;
-            page.querySelector('#txtHTSPSignalIdrWaitSeconds').value = Number.isFinite(config.HTSPSignalIdrWaitSeconds) ? config.HTSPSignalIdrWaitSeconds : 3;
-            page.querySelector('#txtHTSPSignalRecoveryMaxReconnects').value = Number.isFinite(config.HTSPSignalRecoveryMaxReconnects) ? config.HTSPSignalRecoveryMaxReconnects : 2;
-            page.querySelector('#txtHTSPSignalRecoveryCooldownSeconds').value = Number.isFinite(config.HTSPSignalRecoveryCooldownSeconds) ? config.HTSPSignalRecoveryCooldownSeconds : 15;
-            page.querySelector('#chkHTSPEnableStreamSharing').checked = config.HTSPEnableStreamSharing !== false;
-            page.querySelector('#chkHTSPKeyframeStartupEnabled').checked = config.HTSPKeyframeStartupEnabled !== false;
-            page.querySelector('#chkHTSPHealthLoggingEnabled').checked = config.HTSPHealthLoggingEnabled !== false;
-            page.querySelector('#txtHTSPHealthLogIntervalSeconds').value = Number.isFinite(config.HTSPHealthLogIntervalSeconds) ? config.HTSPHealthLogIntervalSeconds : 30;
-            page.querySelector('#chkHTSPSignalHealthLoggingEnabled').checked = config.HTSPSignalHealthLoggingEnabled !== false;
-            page.querySelector('#chkHTSPDetailedDiagnostics').checked = config.HTSPDetailedDiagnostics === true;
-            updateDependentState(page);
+            loadConfig(page, config);
             Dashboard.hideLoadingMsg();
             startStatusPolling(page);
         });
@@ -310,6 +378,18 @@ export default function (view, params) {
     view.querySelector('#btnRefreshStatus').addEventListener('click', () => loadStatus(view, true));
     view.querySelector('#chkHTSPSignalRecoveryEnabled').addEventListener('change', () => updateDependentState(view));
     view.querySelector('#chkHTSPHealthLoggingEnabled').addEventListener('change', () => updateDependentState(view));
+    view.querySelector('#btnResetDefaults').addEventListener('click', function () {
+        if (!window.confirm('Reset TVHeadend plugin settings to defaults? Hostname, username, and password will be kept.')) return;
+        Dashboard.showLoadingMsg();
+        ApiClient.ajax({
+            type: 'POST',
+            url: ApiClient.getUrl('TVHeadEnd/Configuration/ResetDefaults'),
+            dataType: 'json'
+        }).then(config => {
+            loadConfig(view, config);
+            loadStatus(view, false);
+        }).finally(() => Dashboard.hideLoadingMsg());
+    });
 
     view.querySelector('.TVHclientConfigurationForm').addEventListener('submit', function (e) {
         e.preventDefault();
@@ -332,7 +412,7 @@ export default function (view, params) {
             config.HideRecordingsChannel = form.querySelector('#chkHideRecordingsChannel').checked;
             config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
-            config.HTSPQueueDepth = intValue(form.querySelector('#txtHTSPQueueDepth'), 2000000, 0, 20000000);
+            config.HTSPQueueDepth = saveQueueDepth(form.querySelector('#txtHTSPQueueDepth'));
             config.HTSPInitialTuneBufferMs = intValue(form.querySelector('#txtHTSPInitialTuneBufferMs'), 0, 0, 3000);
             config.HTSPStallTimeoutSeconds = intValue(form.querySelector('#txtHTSPStallTimeoutSeconds'), 15, 0, 120);
             config.HTSPFilterControlStreams = form.querySelector('#chkHTSPFilterControlStreams').checked;

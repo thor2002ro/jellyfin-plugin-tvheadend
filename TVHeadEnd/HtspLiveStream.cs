@@ -43,16 +43,17 @@ namespace TVHeadEnd
     {
         private const int MaxOpenAttempts = 3;
         private const int MaxLiveReconnectAttempts = 5;
+        private const int MiB = 1024 * 1024;
         private const long StartupCacheMaxBytes = 32L * 1024L * 1024L;
         private static readonly byte[] H264AccessUnitDelimiter = { 0x00, 0x00, 0x00, 0x01, 0x09, 0xF0 };
         private const int MinStallWatchdogSeconds = 5;
         private const int MaxStallWatchdogSeconds = 120;
-        private const int MaxHtspQueueDepth = 20000000;
+        private const int MaxHtspQueueDepth = 20 * MiB;
         private const int SignalErrorWindowSeconds = 5;
         private const int SignalRecoveryAttemptWindowSeconds = 60;
 
         private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
-        private static readonly ConcurrentDictionary<string, HtspLiveStream> ActiveProducersByUniqueId = new ConcurrentDictionary<string, HtspLiveStream>();
+        private static readonly ConcurrentDictionary<string, HtspLiveStream> RunningChannelsByUniqueId = new ConcurrentDictionary<string, HtspLiveStream>();
 
         private static readonly TimeSpan SubscribeResponseTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
@@ -291,7 +292,7 @@ namespace TVHeadEnd
 
                     ConfigureOpenedMediaSource();
                     _producerOpenedUtc = DateTime.UtcNow;
-                    ActiveProducersByUniqueId[UniqueId] = this;
+                    RunningChannelsByUniqueId[UniqueId] = this;
                     EnsureStallWatchdogStarted();
                     return;
                 }
@@ -731,7 +732,7 @@ namespace TVHeadEnd
             CompleteAllConsumerQueues();
             _stream.Complete();
             CloseCurrentConnection(unsubscribe: true);
-            ActiveProducersByUniqueId.TryRemove(UniqueId, out _);
+            RunningChannelsByUniqueId.TryRemove(UniqueId, out _);
 
             if (_registeredAsSharedHub)
             {
@@ -972,7 +973,7 @@ namespace TVHeadEnd
             lock (_broadcastLock)
             {
                 var cacheWasReady = IsStartupCacheReadyLocked();
-                cacheReady = AddStartupCacheChunkLocked(chunk, randomAccess, forceBootstrapReady, out cacheOverflowed);
+                AddStartupCacheChunkLocked(chunk, randomAccess, forceBootstrapReady, out cacheOverflowed);
                 cacheReady = IsStartupCacheReadyLocked();
                 cacheBecameReady = !cacheWasReady && cacheReady;
                 cacheBytes = _startupCacheBytes;
@@ -1060,7 +1061,6 @@ namespace TVHeadEnd
             {
                 _startupCache.Clear();
                 _startupCacheBytes = 0;
-                _startupCacheStartedUtcTicks = 0;
                 _startupCacheKeyframeAligned = true;
                 _startupCacheOverflowLogged = false;
             }
@@ -3646,7 +3646,7 @@ namespace TVHeadEnd
             CompleteAllConsumerQueues();
             _stream.Complete(ex);
             CloseCurrentConnection(unsubscribe: true);
-            ActiveProducersByUniqueId.TryRemove(UniqueId, out _);
+            RunningChannelsByUniqueId.TryRemove(UniqueId, out _);
             if (_registeredAsSharedHub)
             {
                 RemoveSharedHub(_channelId, this);
@@ -3689,16 +3689,16 @@ namespace TVHeadEnd
             return Plugin.Instance?.Configuration?.HTSPDetailedDiagnostics ?? false;
         }
 
-        public static IReadOnlyList<HtspProducerStatus> GetActiveProducerStatuses()
+        public static IReadOnlyList<HtspRunningChannelStatus> GetRunningChannelStatuses()
         {
-            return ActiveProducersByUniqueId.Values
+            return RunningChannelsByUniqueId.Values
                 .Distinct()
-                .Select(producer => producer.CreateProducerStatus())
+                .Select(channel => channel.CreateRunningChannelStatus())
                 .OrderBy(status => status.Service ?? status.ChannelId, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
 
-        private HtspProducerStatus CreateProducerStatus()
+        private HtspRunningChannelStatus CreateRunningChannelStatus()
         {
             SignalSnapshot signal;
             lock (_signalStateLock)
@@ -3738,7 +3738,7 @@ namespace TVHeadEnd
                 startupCacheBytes = _startupCacheBytes;
             }
 
-            return new HtspProducerStatus
+            return new HtspRunningChannelStatus
             {
                 ChannelId = _channelId,
                 PlaybackId = UniqueId,

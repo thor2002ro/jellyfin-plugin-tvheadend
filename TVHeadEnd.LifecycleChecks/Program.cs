@@ -116,8 +116,8 @@ for (var i = 0; i < 100; i++)
     Assert(GetPlaybackReferenceCount(hub) == 0, "Concurrent open attached playback after close.");
 }
 
-AssertMuxerDropsInvalidDtsOnly();
-AssertMuxerDropsDtsAfterPts();
+AssertMuxerDoesNotRewriteDuplicateVideoDts();
+AssertMuxerMarksConfirmedSourceClockJump();
 
 Console.WriteLine("Lifecycle checks passed.");
 
@@ -159,37 +159,109 @@ static void Assert(bool condition, string message)
     }
 }
 
-static void AssertMuxerDropsInvalidDtsOnly()
+static void AssertMuxerDoesNotRewriteDuplicateVideoDts()
 {
-    var stream = WriteMuxerPacket(pts: null, dts: 90_000);
-    Assert((long)GetMuxerStreamField(stream, "TimestampCorrectionCount") == 1, "DTS-only PES timestamp was not corrected.");
+    var (muxer, _) = CreateH264Muxer();
+    WriteH264Packet(muxer, pts: 90_010, dts: 90_000);
+    var chunk = WriteH264Packet(muxer, pts: 90_010, dts: 90_000);
+    var timestamps = ReadVideoPesTimestamps(chunk);
+
+    Assert(timestamps.Dts == 0 && timestamps.Pts == 10, "Duplicate video DTS was rewritten.");
 }
 
-static void AssertMuxerDropsDtsAfterPts()
+static void AssertMuxerMarksConfirmedSourceClockJump()
 {
-    var stream = WriteMuxerPacket(pts: 90_000, dts: 180_000);
-    Assert((long)GetMuxerStreamField(stream, "TimestampCorrectionCount") == 1, "DTS after PTS was not corrected.");
+    var (muxer, stream) = CreateH264Muxer();
+    WriteH264Packet(muxer, pts: 110_000, dts: 100_000);
+
+    var pending = WriteH264Packet(muxer, pts: 1_110_000, dts: 1_100_000);
+    var recovered = WriteH264Packet(muxer, pts: 1_111_000, dts: 1_101_000);
+
+    Assert(pending.Length == 0, "Unconfirmed source-clock jump was not withheld.");
+    Assert(recovered.Length > 0, "Confirmed source-clock jump did not resume muxing.");
+    Assert((long)GetMuxerStreamField(stream, "TimestampDiscontinuityCount") == 1, "Confirmed source-clock jump did not emit a discontinuity.");
 }
 
-static object WriteMuxerPacket(long? pts, long? dts)
+static (object Muxer, object Stream) CreateH264Muxer()
+{
+    var (muxer, streams) = CreateMuxer("H264");
+    return (muxer, streams[0]);
+}
+
+static (object Muxer, object[] Streams) CreateMuxer(params string[] codecs)
 {
     var muxerType = typeof(HtspLiveStream).Assembly.GetType("TVHeadEnd.HtspTransportStreamMuxer")!;
     var streamInfoType = muxerType.GetNestedType("StreamInfo", BindingFlags.Instance | BindingFlags.NonPublic)!;
     var muxer = Activator.CreateInstance(muxerType)!;
-    var stream = Activator.CreateInstance(streamInfoType)!;
-    streamInfoType.GetProperty("Index")!.SetValue(stream, 0);
-    streamInfoType.GetProperty("Codec")!.SetValue(stream, "H264");
+    var streams = new object[codecs.Length];
+    var streamArray = Array.CreateInstance(streamInfoType, codecs.Length);
+    for (var i = 0; i < codecs.Length; i++)
+    {
+        var stream = Activator.CreateInstance(streamInfoType)!;
+        streamInfoType.GetProperty("Index")!.SetValue(stream, i);
+        streamInfoType.GetProperty("Codec")!.SetValue(stream, codecs[i]);
+        streams[i] = stream;
+        streamArray.SetValue(stream, i);
+    }
 
-    var streams = Array.CreateInstance(streamInfoType, 1);
-    streams.SetValue(stream, 0);
     muxerType.GetMethod("SetTimestampsAre90Khz")!.Invoke(muxer, new object[] { true });
-    muxerType.GetMethod("SetStreams")!.Invoke(muxer, new object[] { streams, false });
+    muxerType.GetMethod("SetStreams")!.Invoke(muxer, new object[] { streamArray, false });
 
-    muxerType.GetMethod("WritePacket")!.Invoke(
+    return (muxer, streams);
+}
+
+static byte[] WriteH264Packet(object muxer, long? pts, long? dts)
+{
+    return WritePacket(muxer, 0, new byte[] { 0x00, 0x00, 0x01, 0x09, 0xF0 }, pts, dts);
+}
+
+static byte[] WritePacket(object muxer, int streamIndex, byte[] payload, long? pts, long? dts)
+{
+    return (byte[])muxer.GetType().GetMethod("WritePacket")!.Invoke(
         muxer,
-        new object[] { 0, new byte[] { 0x00, 0x00, 0x01, 0x09, 0xF0 }, pts, dts, false, false, false });
+        new object[] { streamIndex, payload, pts, dts, false, false })!;
+}
 
-    return muxerType.GetMethod("GetStreamInfo")!.Invoke(muxer, new object[] { 0 })!;
+static (long Pts, long Dts) ReadVideoPesTimestamps(byte[] transportStream) => ReadPesTimestamps(transportStream, 0x101);
+
+static (long Pts, long Dts) ReadPesTimestamps(byte[] transportStream, int pidToFind)
+{
+    for (var packetOffset = 0; packetOffset + 188 <= transportStream.Length; packetOffset += 188)
+    {
+        var packet = transportStream.AsSpan(packetOffset, 188);
+        var pid = ((packet[1] & 0x1F) << 8) | packet[2];
+        var adaptationControl = (packet[3] >> 4) & 0x03;
+        if (pid != pidToFind || (packet[1] & 0x40) == 0 || (adaptationControl & 0x01) == 0)
+        {
+            continue;
+        }
+
+        var payloadOffset = 4;
+        if ((adaptationControl & 0x02) != 0)
+        {
+            payloadOffset += 1 + packet[payloadOffset];
+        }
+
+        if (payloadOffset + 19 <= packet.Length
+            && packet[payloadOffset] == 0x00
+            && packet[payloadOffset + 1] == 0x00
+            && packet[payloadOffset + 2] == 0x01
+            && (packet[payloadOffset + 7] & 0xC0) == 0xC0)
+        {
+            return (ReadPesTimestamp(packet, payloadOffset + 9), ReadPesTimestamp(packet, payloadOffset + 14));
+        }
+    }
+
+    throw new InvalidOperationException("Video PES with PTS and DTS was not found.");
+}
+
+static long ReadPesTimestamp(ReadOnlySpan<byte> data, int offset)
+{
+    return ((long)((data[offset] >> 1) & 0x07) << 30)
+        | ((long)data[offset + 1] << 22)
+        | ((long)((data[offset + 2] >> 1) & 0x7F) << 15)
+        | ((long)data[offset + 3] << 7)
+        | ((long)(data[offset + 4] & 0xFE) >> 1);
 }
 
 static object GetMuxerStreamField(object stream, string fieldName)

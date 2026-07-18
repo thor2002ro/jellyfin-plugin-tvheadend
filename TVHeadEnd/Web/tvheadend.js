@@ -188,7 +188,7 @@ export default function (view, params) {
                 <td>${escapeHtml(stream.Codec || 'unknown')}</td><td>${escapeHtml(stream.Language || '—')}</td>
                 <td>${escapeHtml(stream.Title || '—')}</td><td>${formatNumber(stream.Packets)}</td>
                 <td>${formatBytes(stream.Bytes)}</td><td>${formatNumber(stream.RandomAccessFrames)}</td>
-                <td title="TS repairs are timestamp fixes. Resets are detected timeline jumps. Drops are mux packets rejected because their timestamps were unsafe. AUD is the number of H.264/H.265 access unit delimiters inserted.">TS ${formatNumber(stream.TimestampCorrections)} · resets ${formatNumber(stream.TimestampDiscontinuities)} · drops ${formatNumber(stream.TimestampAnomalyDrops)} · AUD ${formatNumber(stream.AudInsertions)}</td>
+                <td title="Resets are detected timeline jumps. Drops are mux packets rejected because their timestamps were unsafe. AUD is the number of H.264/H.265 access unit delimiters inserted.">resets ${formatNumber(stream.TimestampDiscontinuities)} · drops ${formatNumber(stream.TimestampAnomalyDrops)} · AUD ${formatNumber(stream.AudInsertions)}</td>
             </tr>`).join('');
 
             return `<section class="tvhProducer">
@@ -211,7 +211,7 @@ export default function (view, params) {
                     ${metric('Subscription', `#${producer.SubscriptionId || 0} · ${producer.ChannelId || ''}`, 'TVHeadend subscription id and Jellyfin channel id for this producer.')}
                 </div>
                 <details data-subscription-id="${Number(producer.SubscriptionId || 0)}"><summary>Stream statistics (${(producer.Streams || []).length})</summary>
-                    <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(producer.Service || `channel ${producer.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet, keyframe, and repair statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th><th scope="col">Repairs</th></tr></thead><tbody>${streamRows}</tbody></table></div>
+                    <div class="tvhTableWrap" tabindex="0" role="region" aria-label="Stream statistics for ${escapeHtml(producer.Service || `channel ${producer.ChannelId}`)}"><table class="tvhTable"><caption class="tvhSrOnly">Per-stream packet, keyframe, and event statistics</caption><thead><tr><th scope="col">Index</th><th scope="col">PID</th><th scope="col">Codec</th><th scope="col">Language</th><th scope="col">Title</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Keyframes</th><th scope="col">Events</th></tr></thead><tbody>${streamRows}</tbody></table></div>
                 </details>
             </section>`;
         }).join('');

@@ -12,7 +12,6 @@ namespace TVHeadEnd
         private const int PacketSize = 188;
         private const int PmtPid = 0x100;
         private const int FirstElementaryPid = 0x101;
-        private const long MaxAudioTimestampRegression90Khz = 9000; // 100 ms
         private const long TimestampBackwardDiscontinuity90Khz = 90000; // 1 second
         private const long TimestampForwardDiscontinuity90Khz = 900000; // 10 seconds
         private const long TimestampWrap90Khz = 1L << 33;
@@ -104,22 +103,16 @@ namespace TVHeadEnd
                     && previousStreams.TryGetValue(stream.Index, out var previous)
                     && string.Equals(NormalizeCodec(previous.Codec), NormalizeCodec(stream.Codec), StringComparison.Ordinal))
                 {
-                    stream.LastPts90Khz = previous.LastPts90Khz;
-                    stream.LastDts90Khz = previous.LastDts90Khz;
                     stream.LastSourceClock90Khz = previous.LastSourceClock90Khz;
                     stream.PendingSourceClock90Khz = previous.PendingSourceClock90Khz;
-                    stream.TimestampCorrectionCount = previous.TimestampCorrectionCount;
                     stream.TimestampDiscontinuityCount = previous.TimestampDiscontinuityCount;
                     stream.TimestampAnomalyDropCount = previous.TimestampAnomalyDropCount;
                     stream.AudInsertionCount = previous.AudInsertionCount;
                 }
                 else
                 {
-                    stream.LastPts90Khz = null;
-                    stream.LastDts90Khz = null;
                     stream.LastSourceClock90Khz = null;
                     stream.PendingSourceClock90Khz = null;
-                    stream.TimestampCorrectionCount = 0;
                     stream.TimestampDiscontinuityCount = 0;
                     stream.TimestampAnomalyDropCount = 0;
                     stream.AudInsertionCount = 0;
@@ -241,11 +234,9 @@ namespace TVHeadEnd
             byte[] payload,
             long? pts,
             long? dts,
-            out bool sourceDiscontinuity,
             bool forceProgramTables = false,
             bool randomAccess = false)
         {
-            sourceDiscontinuity = false;
             if (!_streams.TryGetValue(streamIndex, out var stream) || payload == null || payload.Length == 0)
             {
                 return Array.Empty<byte>();
@@ -255,8 +246,6 @@ namespace TVHeadEnd
             {
                 _wroteTables = false;
             }
-
-            NormalizePesTimestamps(stream, ref pts, ref dts);
 
             var sourceClock = To90KhzTimestamp(dts ?? pts);
             var timestampDecision = EvaluateTimestamp(stream, sourceClock);
@@ -268,10 +257,8 @@ namespace TVHeadEnd
 
             if (timestampDecision == TimestampDecision.Reset)
             {
-                sourceDiscontinuity = true;
                 stream.TimestampDiscontinuityCount++;
                 MarkSourceDiscontinuity();
-                stream.LastSourceClock90Khz = sourceClock;
             }
 
             var tsDts = ToTsTimestamp(dts);
@@ -295,8 +282,6 @@ namespace TVHeadEnd
                 tsPts = _lastMuxClock.Value;
             }
 
-            NormalizeAudioTimestamps(stream, ref tsPts, ref tsDts);
-
             var effectiveClock = tsDts ?? tsPts;
             if (effectiveClock.HasValue)
             {
@@ -315,38 +300,6 @@ namespace TVHeadEnd
             var pcr = stream.Pid == _pcrPid ? effectiveClock : null;
             WriteTsPackets(output, stream.Pid, true, pes, pcr, randomAccess);
             return output.ToArray();
-        }
-
-        private void NormalizePesTimestamps(StreamInfo stream, ref long? pts, ref long? dts)
-        {
-            if (!dts.HasValue)
-            {
-                return;
-            }
-
-            var corrected = false;
-            if (!pts.HasValue)
-            {
-                dts = null;
-                corrected = true;
-            }
-            else
-            {
-                var dts90Khz = To90KhzTimestamp(dts);
-                var pts90Khz = To90KhzTimestamp(pts);
-                if (dts90Khz.HasValue
-                    && pts90Khz.HasValue
-                    && GetTimestampDelta(dts90Khz.Value, pts90Khz.Value) < 0)
-                {
-                    dts = null;
-                    corrected = true;
-                }
-            }
-
-            if (corrected && stream != null)
-            {
-                stream.TimestampCorrectionCount++;
-            }
         }
 
         private TimestampDecision EvaluateTimestamp(StreamInfo stream, long? clock)
@@ -413,53 +366,9 @@ namespace TVHeadEnd
             _lastMuxClock = null;
             foreach (var stream in _streams.Values)
             {
-                stream.LastPts90Khz = null;
-                stream.LastDts90Khz = null;
                 stream.LastSourceClock90Khz = null;
                 stream.PendingSourceClock90Khz = null;
             }
-        }
-
-        private static void NormalizeAudioTimestamps(StreamInfo stream, ref long? pts, ref long? dts)
-        {
-            if (stream == null || stream.Kind != ElementaryStreamKind.Audio)
-            {
-                return;
-            }
-
-            var corrected = false;
-            pts = ClampSmallTimestampRegression(pts, ref stream.LastPts90Khz, ref corrected);
-            dts = ClampSmallTimestampRegression(dts, ref stream.LastDts90Khz, ref corrected);
-
-            if (corrected)
-            {
-                stream.TimestampCorrectionCount++;
-            }
-        }
-
-        private static long? ClampSmallTimestampRegression(long? timestamp, ref long? previousTimestamp, ref bool corrected)
-        {
-            if (!timestamp.HasValue)
-            {
-                return null;
-            }
-
-            var value = timestamp.Value;
-            if (previousTimestamp.HasValue && value <= previousTimestamp.Value)
-            {
-                var regression = previousTimestamp.Value - value;
-                if (regression <= MaxAudioTimestampRegression90Khz)
-                {
-                    // FFmpeg performs the same minimal repair at the output muxer.
-                    // Do it at the HTSP->TS boundary so the decoded/transcoded audio
-                    // timeline is already monotonic and avoids libfdk_aac warnings.
-                    value = previousTimestamp.Value + 1;
-                    corrected = true;
-                }
-            }
-
-            previousTimestamp = value;
-            return value;
         }
 
         private bool TryConfigureStream(StreamInfo stream)
@@ -1313,15 +1222,9 @@ namespace TVHeadEnd
 
             internal string StreamTypeDescription { get; set; }
 
-            internal long? LastPts90Khz;
-
-            internal long? LastDts90Khz;
-
             internal long? LastSourceClock90Khz;
 
             internal long? PendingSourceClock90Khz;
-
-            internal long TimestampCorrectionCount;
 
             internal long TimestampDiscontinuityCount;
 

@@ -1,6 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,9 +25,21 @@ namespace TVHeadEnd
         private readonly object _lock = new Object();
         private static readonly TimeSpan InitialLoadTimeout = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ImageCacheRetention = TimeSpan.FromDays(90);
+        private const long MaximumImageBytes = 20L * 1024L * 1024L;
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<HTSConnectionHandler> _logger;
+        private readonly HttpClient _httpClient;
+        private readonly IImageEncoder _imageEncoder;
+        private readonly ConcurrentDictionary<string, Lazy<Task<string>>> _imageDownloads = new();
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _channelImageLocks = new();
+        private readonly ConcurrentDictionary<string, string> _channelImageSources = new();
+        private readonly SemaphoreSlim _imageDownloadSlots = new(4);
+        private readonly CancellationTokenSource _disposeCancellation = new();
+        private int _imageRefreshGeneration;
+        private int _imageRefreshUnavailableGeneration = -1;
+        private int _disposed;
 
         private TaskCompletionSource<bool> _initialLoad = CreateInitialLoadCompletion();
         private volatile Boolean _connected = false;
@@ -49,12 +67,16 @@ namespace TVHeadEnd
 
         private Dictionary<string, string> _headers = new Dictionary<string, string>();
 
-        public HTSConnectionHandler(ILoggerFactory loggerFactory)
+        public HTSConnectionHandler(
+            ILoggerFactory loggerFactory,
+            IHttpClientFactory httpClientFactory,
+            IImageEncoder imageEncoder)
         {
             _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger<HTSConnectionHandler>();
+            _httpClient = httpClientFactory.CreateClient();
+            _imageEncoder = imageEncoder;
 
-            //System.Diagnostics.StackTrace t = new System.Diagnostics.StackTrace();
             _logger.LogDebug("[TVHclient] HTSConnectionHandler");
 
             _channelDataHelper = new ChannelDataHelper(loggerFactory.CreateLogger<ChannelDataHelper>());
@@ -170,41 +192,613 @@ namespace TVHeadEnd
             _configured = true;
         }
 
-        public string GetChannelImageUrl(string channelId)
+        public void BeginImageRefresh(IEnumerable<string> activeChannelCacheKeys)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var activeKeys = activeChannelCacheKeys.ToHashSet(StringComparer.Ordinal);
+            lock (_channelImageSources)
+            {
+                foreach (var cacheKey in _channelImageSources.Keys)
+                {
+                    if (!activeKeys.Contains(cacheKey))
+                    {
+                        _channelImageSources.TryRemove(cacheKey, out _);
+                        _channelImageLocks.TryRemove(cacheKey, out _);
+                    }
+                }
+            }
+
+            foreach (var download in _imageDownloads)
+            {
+                if (download.Value.IsValueCreated && download.Value.Value.IsCompleted)
+                {
+                    _imageDownloads.TryRemove(download);
+                }
+            }
+
+            Interlocked.Increment(ref _imageRefreshGeneration);
+            var cacheDirectory = GetImageCacheDirectory();
+            var activePrefixes = activeKeys
+                .Select(GetImageFilePrefix)
+                .ToHashSet(StringComparer.Ordinal);
+            try
+            {
+                if (Directory.Exists(cacheDirectory))
+                {
+                    foreach (var path in Directory.EnumerateFiles(cacheDirectory, "*.tmp"))
+                    {
+                        if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddDays(-1))
+                        {
+                            File.Delete(path);
+                        }
+                    }
+
+                    foreach (var path in EnumerateCachedImages(cacheDirectory, string.Empty))
+                    {
+                        var sourcePath = Path.Combine(
+                            cacheDirectory,
+                            Path.GetFileNameWithoutExtension(path) + ".source");
+                        if (!File.Exists(sourcePath)
+                            && File.GetLastWriteTimeUtc(path) < DateTime.UtcNow - ImageCacheRetention)
+                        {
+                            File.Delete(path);
+                        }
+                    }
+
+                    foreach (var sourcePath in Directory.EnumerateFiles(cacheDirectory, "*.source"))
+                    {
+                        var filePrefix = Path.GetFileNameWithoutExtension(sourcePath);
+                        if (activePrefixes.Contains(filePrefix))
+                        {
+                            continue;
+                        }
+
+                        var images = EnumerateCachedImages(cacheDirectory, filePrefix).ToArray();
+                        if (images.Length == 0
+                            || images.All(path => File.GetLastWriteTimeUtc(path) < DateTime.UtcNow - ImageCacheRetention))
+                        {
+                            foreach (var path in images)
+                            {
+                                File.Delete(path);
+                            }
+
+                            File.Delete(sourcePath);
+                        }
+                    }
+                }
+            }
+            catch (IOException ex)
+            {
+                _logger.LogWarning(ex, "[TVHclient] Could not prune stale cached images");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, "[TVHclient] Could not prune stale cached images");
+            }
+        }
+
+        private string ResolveImageUrl(string imageUrl)
         {
             init();
+            return ResolveImageUrl(_httpBaseUrl, imageUrl);
+        }
 
-            _logger.LogDebug("[TVHclient] HTSConnectionHandler.GetChannelImage: channelId: {id}", channelId);
-
-            String channelIcon = _channelDataHelper.GetChannelIcon4ChannelId(channelId);
-
-            if (string.IsNullOrEmpty(channelIcon))
+        private static string ResolveImageUrl(string httpBaseUrl, string imageUrl)
+        {
+            if (string.IsNullOrWhiteSpace(imageUrl))
             {
                 return null;
             }
 
-            if (channelIcon.StartsWith("http"))
+            imageUrl = imageUrl.Trim();
+            if (Uri.TryCreate(imageUrl, UriKind.Absolute, out var absoluteUri))
             {
-                return _channelDataHelper.GetChannelIcon4ChannelId(channelId);
+                return absoluteUri.Scheme == Uri.UriSchemeHttp || absoluteUri.Scheme == Uri.UriSchemeHttps
+                    ? absoluteUri.AbsoluteUri
+                    : null;
             }
-            else
+
+            return httpBaseUrl + "/" + imageUrl.TrimStart('/');
+        }
+
+        public async Task<(string ImagePath, string ImageUrl)> CacheImageAsync(
+            string imageUrl,
+            string cacheKey,
+            CancellationToken cancellationToken)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var resolvedUrl = ResolveImageUrl(imageUrl);
+            if (!Uri.TryCreate(resolvedUrl, UriKind.Absolute, out var imageUri)
+                || !Uri.TryCreate(_httpBaseUrl, UriKind.Absolute, out var baseUri)
+                || !SameOrigin(baseUri, imageUri))
             {
-                return GetHttpBaseUrl() + "/" + channelIcon.TrimStart('/');
+                if (cacheKey is not null)
+                {
+                    InvalidateCachedChannelImage(cacheKey);
+                }
+
+                return (null, resolvedUrl);
+            }
+
+            cacheKey ??= resolvedUrl;
+            var cacheDirectory = GetImageCacheDirectory();
+            var cachedPath = FindCachedImage(cacheDirectory, cacheKey);
+            var sourceFingerprint = GetImageFilePrefix(resolvedUrl);
+            var hasStableCacheKey = !string.Equals(cacheKey, resolvedUrl, StringComparison.Ordinal);
+            if (hasStableCacheKey)
+            {
+                // Publish the newest guide value before inspecting the cache. Older
+                // in-flight downloads must not commit after a channel reverts.
+                lock (_channelImageSources)
+                {
+                    _channelImageSources[cacheKey] = sourceFingerprint;
+                }
+            }
+            else if (cachedPath != null)
+            {
+                TouchCachedImage(cachedPath);
+                return (cachedPath, null);
+            }
+
+            var generation = Volatile.Read(ref _imageRefreshGeneration);
+            var operationKey = cacheKey + "\0" + (hasStableCacheKey ? sourceFingerprint : string.Empty);
+            var download = _imageDownloads.GetOrAdd(
+                operationKey,
+                _ => new Lazy<Task<string>>(
+                    () => RefreshImageAsync(
+                        imageUri,
+                        cacheDirectory,
+                        cacheKey,
+                        hasStableCacheKey ? sourceFingerprint : null,
+                        generation),
+                    LazyThreadSafetyMode.ExecutionAndPublication));
+
+            var refreshedPath = await download.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return (refreshedPath ?? cachedPath, null);
+        }
+
+        private async Task<string> RefreshImageAsync(
+            Uri imageUri,
+            string cacheDirectory,
+            string cacheKey,
+            string sourceFingerprint,
+            int generation)
+        {
+            var slotAcquired = false;
+            SemaphoreSlim channelLock = null;
+            var channelLockAcquired = false;
+            try
+            {
+                await _imageDownloadSlots.WaitAsync(_disposeCancellation.Token).ConfigureAwait(false);
+                slotAcquired = true;
+                if (Volatile.Read(ref _imageRefreshUnavailableGeneration) == generation)
+                {
+                    return FindCachedImage(cacheDirectory, cacheKey);
+                }
+
+                if (sourceFingerprint != null)
+                {
+                    channelLock = _channelImageLocks.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
+                    await channelLock.WaitAsync(_disposeCancellation.Token).ConfigureAwait(false);
+                    channelLockAcquired = true;
+                    if (!_channelImageSources.TryGetValue(cacheKey, out var currentSource)
+                        || !string.Equals(currentSource, sourceFingerprint, StringComparison.Ordinal))
+                    {
+                        return FindCachedImage(cacheDirectory, cacheKey);
+                    }
+
+                    var sourcePath = Path.Combine(cacheDirectory, GetImageFilePrefix(cacheKey) + ".source");
+                    var existingPath = FindCachedChannelImage(
+                        cacheDirectory,
+                        cacheKey,
+                        sourcePath,
+                        sourceFingerprint);
+                    if (existingPath is not null)
+                    {
+                        return existingPath;
+                    }
+                }
+
+                var path = await DownloadImageAsync(
+                    _httpClient,
+                    imageUri,
+                    _headers,
+                    cacheDirectory,
+                    cacheKey,
+                    ValidateImage,
+                    sourceFingerprint is null
+                        ? null
+                        : () => _channelImageSources.TryGetValue(cacheKey, out var latest)
+                            && string.Equals(latest, sourceFingerprint, StringComparison.Ordinal),
+                    sourceFingerprint is null ? null : _channelImageSources,
+                    sourceFingerprint,
+                    _disposeCancellation.Token).ConfigureAwait(false);
+
+                return path;
+            }
+            catch (Exception ex)
+            {
+                if (ShouldStopImageRefresh(ex))
+                {
+                    if (Volatile.Read(ref _imageRefreshGeneration) == generation)
+                    {
+                        Interlocked.Exchange(ref _imageRefreshUnavailableGeneration, generation);
+                        if (Volatile.Read(ref _imageRefreshGeneration) != generation)
+                        {
+                            Interlocked.CompareExchange(ref _imageRefreshUnavailableGeneration, -1, generation);
+                        }
+                    }
+                }
+
+                if (ex is not OperationCanceledException || Volatile.Read(ref _disposed) == 0)
+                {
+                    _logger.LogWarning(ex, "[TVHclient] Could not refresh cached image {ImageUrl}", imageUri);
+                }
+
+                return FindCachedImage(cacheDirectory, cacheKey);
+            }
+            finally
+            {
+                if (channelLockAcquired)
+                {
+                    channelLock.Release();
+                }
+
+                if (slotAcquired)
+                {
+                    _imageDownloadSlots.Release();
+                }
+            }
+        }
+
+        internal void PruneChannelImages(
+            IEnumerable<string> currentPaths,
+            IEnumerable<string> unusedCacheKeys)
+        {
+            try
+            {
+                foreach (var currentPath in currentPaths.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    PruneSupersededChannelImage(currentPath);
+                }
+
+                var cacheDirectory = GetImageCacheDirectory();
+                if (Directory.Exists(cacheDirectory))
+                {
+                    foreach (var cacheKey in unusedCacheKeys.Distinct(StringComparer.Ordinal))
+                    {
+                        foreach (var path in EnumerateCachedImages(cacheDirectory, GetImageFilePrefix(cacheKey)))
+                        {
+                            File.Delete(path);
+                        }
+                    }
+                }
+            }
+            catch (IOException ex)
+            {
+                _logger.LogWarning(ex, "[TVHclient] Could not prune superseded channel images");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, "[TVHclient] Could not prune superseded channel images");
+            }
+        }
+
+        internal bool IsCachedChannelImage(string cacheKey, string path)
+        {
+            var cacheDirectory = GetImageCacheDirectory();
+            return !string.IsNullOrEmpty(path)
+                && string.Equals(
+                    Path.GetDirectoryName(path),
+                    cacheDirectory,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)
+                && string.Equals(
+                    Path.GetFileNameWithoutExtension(path),
+                    GetImageFilePrefix(cacheKey),
+                    StringComparison.Ordinal);
+        }
+
+        private void InvalidateCachedChannelImage(string cacheKey)
+        {
+            var cacheDirectory = GetImageCacheDirectory();
+            var filePrefix = GetImageFilePrefix(cacheKey);
+            try
+            {
+                lock (_channelImageSources)
+                {
+                    _channelImageSources.TryRemove(cacheKey, out _);
+                    if (Directory.Exists(cacheDirectory))
+                    {
+                        File.Delete(Path.Combine(cacheDirectory, filePrefix + ".source"));
+                    }
+                }
+            }
+            catch (IOException ex)
+            {
+                _logger.LogWarning(ex, "[TVHclient] Could not invalidate cached channel image");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, "[TVHclient] Could not invalidate cached channel image");
+            }
+
+            _channelImageLocks.TryRemove(cacheKey, out _);
+        }
+
+        private static void PruneSupersededChannelImage(string currentPath)
+        {
+            var cacheDirectory = Path.GetDirectoryName(currentPath);
+            var filePrefix = Path.GetFileNameWithoutExtension(currentPath);
+            foreach (var path in EnumerateCachedImages(cacheDirectory, filePrefix))
+            {
+                if (!string.Equals(path, currentPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    File.Delete(path);
+                }
+            }
+        }
+
+        private static bool ShouldStopImageRefresh(Exception exception)
+        {
+            if (exception is OperationCanceledException)
+            {
+                return true;
+            }
+
+            if (exception is not HttpRequestException requestException)
+            {
+                return false;
+            }
+
+            return !requestException.StatusCode.HasValue
+                || requestException.StatusCode is System.Net.HttpStatusCode.Unauthorized
+                    or System.Net.HttpStatusCode.Forbidden
+                || (int)requestException.StatusCode.Value >= 500;
+        }
+
+        private static string GetImageCacheDirectory()
+        {
+            return Plugin.Instance.ImageCachePath;
+        }
+
+        private static bool SameOrigin(Uri left, Uri right)
+        {
+            return string.Equals(left.Scheme, right.Scheme, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(left.Host, right.Host, StringComparison.OrdinalIgnoreCase)
+                && left.Port == right.Port;
+        }
+
+        private static bool SourceMatches(
+            string sourcePath,
+            string sourceFingerprint,
+            string extension)
+        {
+            try
+            {
+                return File.Exists(sourcePath)
+                    && string.Equals(
+                        File.ReadAllText(sourcePath),
+                        sourceFingerprint + extension,
+                        StringComparison.Ordinal);
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        private static async Task<string> DownloadImageAsync(
+            HttpClient httpClient,
+            Uri imageUri,
+            IReadOnlyDictionary<string, string> headers,
+            string cacheDirectory,
+            string cacheKey,
+            Action<string> validateImage,
+            Func<bool> canCommit,
+            object commitLock,
+            string sourceFingerprint,
+            CancellationToken cancellationToken)
+        {
+            Directory.CreateDirectory(cacheDirectory);
+            using var request = new HttpRequestMessage(HttpMethod.Get, imageUri);
+            foreach (var header in headers)
+            {
+                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            using var response = await httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                timeout.Token).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                return FindCachedImage(cacheDirectory, cacheKey);
+            }
+
+            response.EnsureSuccessStatusCode();
+
+            if (response.Content.Headers.ContentLength > MaximumImageBytes)
+            {
+                throw new InvalidDataException("TVHeadend image exceeds the 20 MiB cache limit.");
+            }
+
+            await response.Content.LoadIntoBufferAsync(MaximumImageBytes, timeout.Token).ConfigureAwait(false);
+            var data = await response.Content.ReadAsByteArrayAsync(timeout.Token).ConfigureAwait(false);
+            var filePrefix = GetImageFilePrefix(cacheKey);
+            var extension = GetImageExtension(data);
+            var cachedPath = FindCachedImage(cacheDirectory, cacheKey);
+
+            var temporaryPath = Path.Combine(
+                cacheDirectory,
+                filePrefix + "." + Guid.NewGuid().ToString("N") + ".tmp");
+
+            try
+            {
+                await File.WriteAllBytesAsync(temporaryPath, data, timeout.Token).ConfigureAwait(false);
+                validateImage(temporaryPath);
+                if (canCommit is not null && !canCommit())
+                {
+                    return cachedPath;
+                }
+
+                var path = Path.Combine(cacheDirectory, filePrefix + extension);
+                if (commitLock is null)
+                {
+                    File.Move(temporaryPath, path, true);
+                }
+                else
+                {
+                    lock (commitLock)
+                    {
+                        if (!canCommit())
+                        {
+                            return cachedPath;
+                        }
+
+                        File.Move(temporaryPath, path, true);
+                        File.WriteAllText(
+                            Path.Combine(cacheDirectory, filePrefix + ".source"),
+                            sourceFingerprint + extension);
+                    }
+                }
+
+                if (canCommit is null)
+                {
+                    foreach (var stalePath in EnumerateCachedImages(cacheDirectory, filePrefix))
+                    {
+                        if (!string.Equals(stalePath, path, StringComparison.OrdinalIgnoreCase))
+                        {
+                            File.Delete(stalePath);
+                        }
+                    }
+                }
+
+                return path;
+            }
+            finally
+            {
+                File.Delete(temporaryPath);
+            }
+        }
+
+        private void ValidateImage(string path)
+        {
+            var dimensions = _imageEncoder.GetImageSize(path);
+            if (dimensions.Width <= 0 || dimensions.Height <= 0)
+            {
+                throw new InvalidDataException("TVHeadend response is not a valid image.");
+            }
+        }
+
+        private static string GetImageExtension(ReadOnlySpan<byte> header)
+        {
+            if (header.Length >= 8 && header[..8].SequenceEqual(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }))
+            {
+                return ".png";
+            }
+
+            if (header.Length >= 3 && header[..3].SequenceEqual(new byte[] { 0xFF, 0xD8, 0xFF }))
+            {
+                return ".jpg";
+            }
+
+            if (header.Length >= 4 && header[..4].SequenceEqual("GIF8"u8))
+            {
+                return ".gif";
+            }
+
+            if (header.Length >= 12 && header[..4].SequenceEqual("RIFF"u8) && header[8..12].SequenceEqual("WEBP"u8))
+            {
+                return ".webp";
+            }
+
+            if (header.Length >= 12
+                && header[4..8].SequenceEqual("ftyp"u8)
+                && (header[8..12].SequenceEqual("avif"u8) || header[8..12].SequenceEqual("avis"u8)))
+            {
+                return ".avif";
+            }
+
+            if (header.Length >= 2 && header[..2].SequenceEqual("BM"u8))
+            {
+                return ".bmp";
+            }
+
+            if (header.Length >= 4 && header[..4].SequenceEqual(new byte[] { 0x00, 0x00, 0x01, 0x00 }))
+            {
+                return ".ico";
+            }
+
+            var text = Encoding.UTF8.GetString(header[..Math.Min(header.Length, 512)]);
+            if (text.Contains("<svg", StringComparison.OrdinalIgnoreCase))
+            {
+                return ".svg";
+            }
+
+            throw new InvalidDataException("TVHeadend response is not a supported image.");
+        }
+
+        private static string FindCachedImage(string cacheDirectory, string cacheKey)
+        {
+            return Directory.Exists(cacheDirectory)
+                ? EnumerateCachedImages(cacheDirectory, GetImageFilePrefix(cacheKey)).FirstOrDefault()
+                : null;
+        }
+
+        private static string FindCachedChannelImage(
+            string cacheDirectory,
+            string cacheKey,
+            string sourcePath,
+            string sourceFingerprint)
+        {
+            return Directory.Exists(cacheDirectory)
+                ? EnumerateCachedImages(cacheDirectory, GetImageFilePrefix(cacheKey))
+                    .FirstOrDefault(path => SourceMatches(
+                        sourcePath,
+                        sourceFingerprint,
+                        Path.GetExtension(path)))
+                : null;
+        }
+
+        private static IEnumerable<string> EnumerateCachedImages(string cacheDirectory, string filePrefix)
+        {
+            return Directory.EnumerateFiles(cacheDirectory, filePrefix + "*")
+                .Where(path => Path.GetExtension(path) is ".avif" or ".bmp" or ".gif" or ".ico" or ".jpg" or ".png" or ".svg" or ".webp");
+        }
+
+        private static string GetImageFilePrefix(string cacheKey)
+        {
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cacheKey))).ToLowerInvariant();
+        }
+
+        private static void TouchCachedImage(string path)
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddDays(-1))
+                {
+                    File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
             }
         }
 
         public Dictionary<string, string> GetHeaders()
         {
+            init();
             return new Dictionary<string, string>(_headers);
         }
-
-        //private static Stream ImageToPNGStream(Image image)
-        //{
-        //    Stream stream = new System.IO.MemoryStream();
-        //    image.Save(stream, ImageFormat.Png);
-        //    stream.Position = 0;
-        //    return stream;
-        //}
 
         private void ensureConnection(CancellationToken cancellationToken = default)
         {
@@ -420,7 +1014,6 @@ namespace TVHeadEnd
                     case "tagAdd":
                     case "tagUpdate":
                     case "tagDelete":
-                        //_logger.LogCritical("[TVHclient] tad add/update/delete {resp}", response.ToString());
                         break;
 
                     case "channelAdd":
@@ -454,37 +1047,11 @@ namespace TVHeadEnd
                         // should not happen as we don't subscribe for this events.
                         break;
 
-                    //case "subscriptionStart":
-                    //case "subscriptionGrace":
-                    //case "subscriptionStop":
-                    //case "subscriptionSkip":
-                    //case "subscriptionSpeed":
-                    //case "subscriptionStatus":
-                    //    _logger.LogCritical("[TVHclient] subscription events {resp}", response.ToString());
-                    //    break;
-
-                    //case "queueStatus":
-                    //    _logger.LogCritical("[TVHclient] queueStatus event {resp}", response.ToString());
-                    //    break;
-
-                    //case "signalStatus":
-                    //    _logger.LogCritical("[TVHclient] signalStatus event {resp}", response.ToString());
-                    //    break;
-
-                    //case "timeshiftStatus":
-                    //    _logger.LogCritical("[TVHclient] timeshiftStatus event {resp}", response.ToString());
-                    //    break;
-
-                    //case "muxpkt": // streaming data
-                    //    _logger.LogCritical("[TVHclient] muxpkt event {resp}", response.ToString());
-                    //    break;
-
                     case "initialSyncCompleted":
                         Volatile.Read(ref _initialLoad).TrySetResult(true);
                         break;
 
                     default:
-                        //_logger.LogCritical("[TVHclient] Method '{method}' not handled in LiveTvService.cs", response.Method);
                         break;
                 }
             }
@@ -492,6 +1059,11 @@ namespace TVHeadEnd
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
             lock (_lock)
             {
                 _htsConnection?.Dispose();
@@ -500,6 +1072,25 @@ namespace TVHeadEnd
                 ResetInitialLoad();
             }
 
+            _disposeCancellation.Cancel();
+            try
+            {
+                Task.WhenAll(_imageDownloads.Values
+                    .Where(download => download.IsValueCreated)
+                    .Select(download => download.Value)).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            _httpClient.Dispose();
+            foreach (var channelLock in _channelImageLocks.Values)
+            {
+                channelLock.Dispose();
+            }
+
+            _imageDownloadSlots.Dispose();
+            _disposeCancellation.Dispose();
             GC.SuppressFinalize(this);
         }
     }

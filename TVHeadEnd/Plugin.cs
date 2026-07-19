@@ -6,6 +6,7 @@ using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 using TVHeadEnd.Configuration;
 using System.IO;
+using System.Reflection;
 using System.Security.Cryptography;
 using MediaBrowser.Model.Drawing;
 
@@ -16,6 +17,8 @@ namespace TVHeadEnd
     /// </summary>
     public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     {
+        private string _imageCachePath;
+
         public Plugin(IApplicationPaths applicationPaths, IXmlSerializer xmlSerializer)
             : base(applicationPaths, xmlSerializer)
         {
@@ -88,6 +91,28 @@ namespace TVHeadEnd
         public override Guid Id
         {
             get { return _id; }
+        }
+
+        public string ImageCachePath
+        {
+            get
+            {
+                if (_imageCachePath != null)
+                {
+                    return _imageCachePath;
+                }
+
+                var configurationFilePath = GetType()
+                    .GetProperty("ConfigurationFilePath", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?.GetValue(this) as string;
+                var root = string.IsNullOrWhiteSpace(configurationFilePath)
+                    ? null
+                    : Path.GetDirectoryName(configurationFilePath);
+                root ??= Path.GetDirectoryName(GetType().Assembly.Location);
+                root ??= DataFolderPath;
+                _imageCachePath = Path.Combine(root, "tvheadend-images");
+                return _imageCachePath;
+            }
         }
 
         /// <summary>

@@ -14,7 +14,6 @@ namespace TVHeadEnd.DataHelper
     {
         private readonly ILogger<ChannelDataHelper> _logger;
         private readonly Dictionary<long, HTSMessage> _data;
-        private readonly Dictionary<string, string> _piconData;
         private string _channelType4Other = "Ignore";
 
         public ChannelDataHelper(ILogger<ChannelDataHelper> logger)
@@ -22,7 +21,6 @@ namespace TVHeadEnd.DataHelper
             _logger = logger;
 
             _data = new Dictionary<long, HTSMessage>();
-            _piconData = new Dictionary<string, string>();
         }
 
         public void SetChannelType4Other(string channelType4Other)
@@ -35,7 +33,6 @@ namespace TVHeadEnd.DataHelper
             lock (_data)
             {
                 _data.Clear();
-                _piconData.Clear();
             }
         }
 
@@ -77,14 +74,6 @@ namespace TVHeadEnd.DataHelper
                 {
                     _logger.LogError(ex, "[TVHclient] ChannelDataHelper.Add: exception caught. HTSMessage: {m} ", message);
                 }
-            }
-        }
-
-        public string GetChannelIcon4ChannelId(string channelId)
-        {
-            lock (_data)
-            {
-                return _piconData.TryGetValue(channelId, out string result) ? result : null;
             }
         }
 
@@ -146,20 +135,7 @@ namespace TVHeadEnd.DataHelper
 
                             if (m.containsField("channelIcon"))
                             {
-                                string channelIcon = m.getString("channelIcon");
-                                Uri uriResult;
-                                bool uriCheckResult = Uri.TryCreate(channelIcon, UriKind.Absolute, out uriResult)
-                                    && (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps);
-                                if (uriCheckResult)
-                                {
-                                    ci.ImageUrl = channelIcon;
-                                    _piconData.Remove(ci.Id);
-                                }
-                                else
-                                {
-                                    ci.HasImage = true;
-                                    _piconData[ci.Id] = channelIcon;
-                                }
+                                ci.ImageUrl = m.getString("channelIcon");
                             }
                             if (m.containsField("channelName"))
                             {

@@ -187,8 +187,6 @@ namespace TVHeadEnd.DataHelper
                         }
 
                         ri.HasImage = false;
-                        // public string ImagePath { get; set; }
-                        // public string ImageUrl { get; set; }
 
                         if (m.TryGetString("state", out var state))
                         {

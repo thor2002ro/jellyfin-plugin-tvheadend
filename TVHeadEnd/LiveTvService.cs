@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Controller.MediaEncoding;
@@ -32,19 +35,28 @@ namespace TVHeadEnd
         private readonly ILoggerFactory _loggerFactory;
         private readonly IServerApplicationHost _appHost;
         private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly ILibraryManager _libraryManager;
         private readonly HTSConnectionHandler _htsConnectionHandler;
         private readonly AccessTicketHandler _channelTicketHandler;
         private readonly AccessTicketHandler _recordingTicketHandler;
+        // ponytail: guide refreshes are rare; serialize them so cache files and Jellyfin metadata stay in one order.
+        private readonly SemaphoreSlim _channelRefreshLock = new(1, 1);
 
         private readonly ILogger<LiveTvService> _logger;
         public DateTime _lastRecordingChange = DateTime.MinValue;
 
-        public LiveTvService(ILoggerFactory loggerFactory, IMediaEncoder mediaEncoder, HTSConnectionHandler connectionHandler, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
+        public LiveTvService(
+            ILoggerFactory loggerFactory,
+            IMediaEncoder mediaEncoder,
+            HTSConnectionHandler connectionHandler,
+            IServerApplicationHost appHost,
+            IHttpContextAccessor httpContextAccessor,
+            ILibraryManager libraryManager)
         {
-            //System.Diagnostics.StackTrace t = new System.Diagnostics.StackTrace();
             _loggerFactory = loggerFactory;
             _appHost = appHost;
             _httpContextAccessor = httpContextAccessor;
+            _libraryManager = libraryManager;
             _logger = loggerFactory.CreateLogger<LiveTvService>();
             _logger.LogDebug("LiveTvService()");
 
@@ -246,34 +258,124 @@ namespace TVHeadEnd
 
         public async Task<IEnumerable<ChannelInfo>> GetChannelsAsync(CancellationToken cancellationToken)
         {
-            int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
-            if (timeOut == -1 || cancellationToken.IsCancellationRequested)
-            {
-                _logger.LogError("LiveTvService.GetChannelsAsync: call cancelled or timed out - returning empty list");
-                return new List<ChannelInfo>();
-            }
-
-            IEnumerable<ChannelInfo> channels;
+            await _channelRefreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                channels = await _htsConnectionHandler.BuildChannelInfos(cancellationToken).WaitAsync(_timeout, cancellationToken);
-            }
-            catch (TimeoutException)
-            {
-                return [];
-            }
-
-            var list = channels.ToList();
-
-            foreach (var channel in list)
-            {
-                if (string.IsNullOrEmpty(channel.ImageUrl))
+                int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
+                if (timeOut == -1 || cancellationToken.IsCancellationRequested)
                 {
-                    channel.ImageUrl = _htsConnectionHandler.GetChannelImageUrl(channel.Id);
+                    _logger.LogError("LiveTvService.GetChannelsAsync: call cancelled or timed out - returning empty list");
+                    return new List<ChannelInfo>();
                 }
+
+                IEnumerable<ChannelInfo> channels;
+                try
+                {
+                    channels = await _htsConnectionHandler.BuildChannelInfos(cancellationToken).WaitAsync(_timeout, cancellationToken);
+                }
+                catch (TimeoutException)
+                {
+                    return [];
+                }
+
+                var list = channels.ToList();
+                _htsConnectionHandler.BeginImageRefresh(list.Select(channel => "channel:" + channel.Id));
+
+                var desiredImages = await Task.WhenAll(list.Select(async channel =>
+                {
+                    var image = await _htsConnectionHandler.CacheImageAsync(
+                        channel.ImageUrl,
+                        "channel:" + channel.Id,
+                        cancellationToken).ConfigureAwait(false);
+                    channel.ImagePath = image.ImagePath;
+                    channel.ImageUrl = image.ImageUrl;
+                    channel.HasImage = !string.IsNullOrEmpty(channel.ImagePath)
+                        || !string.IsNullOrEmpty(channel.ImageUrl);
+                    return new KeyValuePair<string, string>(
+                        channel.Id,
+                        channel.ImagePath ?? channel.ImageUrl);
+                })).ConfigureAwait(false);
+                await RefreshStoredChannelImagesAsync(
+                    desiredImages,
+                    cancellationToken).ConfigureAwait(false);
+                _htsConnectionHandler.PruneChannelImages(
+                    list.Where(channel => channel.ImagePath is not null).Select(channel => channel.ImagePath),
+                    list.Where(channel => channel.ImagePath is null).Select(channel => "channel:" + channel.Id));
+
+                return list;
+            }
+            finally
+            {
+                _channelRefreshLock.Release();
+            }
+        }
+
+        private async Task RefreshStoredChannelImagesAsync(
+            IEnumerable<KeyValuePair<string, string>> desiredImages,
+            CancellationToken cancellationToken)
+        {
+            var imagePaths = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var image in desiredImages)
+            {
+                imagePaths[image.Key] = image.Value;
             }
 
-            return list;
+            if (imagePaths.Count == 0)
+            {
+                return;
+            }
+
+            var items = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                IncludeItemTypes = [BaseItemKind.LiveTvChannel]
+            });
+
+            foreach (var item in items.OfType<LiveTvChannel>()
+                         .Where(item => string.Equals(item.ServiceName, Name, StringComparison.Ordinal)))
+            {
+                if (!imagePaths.TryGetValue(item.ExternalId, out var imagePath))
+                {
+                    continue;
+                }
+
+                var image = item.GetImageInfo(ImageType.Primary, 0);
+                if (string.IsNullOrEmpty(imagePath))
+                {
+                    if (image is not null
+                        && _htsConnectionHandler.IsCachedChannelImage("channel:" + item.ExternalId, image.Path))
+                    {
+                        item.RemoveImage(image);
+                        await item.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    continue;
+                }
+
+                if (!StoredImageNeedsRefresh(image, imagePath))
+                {
+                    continue;
+                }
+
+                item.SetImagePath(ImageType.Primary, imagePath);
+                await item.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        private static bool StoredImageNeedsRefresh(ItemImageInfo image, string imagePath)
+        {
+            var isRemote = Uri.TryCreate(imagePath, UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+            var pathMatches = image is not null
+                && string.Equals(
+                    image.Path,
+                    imagePath,
+                    isRemote
+                        ? StringComparison.Ordinal
+                        : OperatingSystem.IsWindows()
+                            ? StringComparison.OrdinalIgnoreCase
+                            : StringComparison.Ordinal);
+            return !pathMatches
+                || (!isRemote && image.DateModified != File.GetLastWriteTimeUtc(imagePath));
         }
 
         public async Task<MediaSourceInfo> GetChannelStream(string channelId, string mediaSourceId, CancellationToken cancellationToken)
@@ -651,12 +753,21 @@ namespace TVHeadEnd
                 _htsConnectionHandler.RemoveResponseHandler(sequence);
             }
 
-            foreach (var program in programs)
+            var programList = programs.ToList();
+            await Task.WhenAll(programList.Select(async program =>
             {
                 program.ChannelId = channelId;
-            }
+                var image = await _htsConnectionHandler.CacheImageAsync(
+                    program.ImageUrl,
+                    null,
+                    cancellationToken).ConfigureAwait(false);
+                program.ImagePath = image.ImagePath;
+                program.ImageUrl = image.ImageUrl;
+                program.HasImage = !string.IsNullOrEmpty(program.ImagePath)
+                    || !string.IsNullOrEmpty(program.ImageUrl);
+            })).ConfigureAwait(false);
 
-            return programs;
+            return programList;
         }
 
         public async Task<IEnumerable<SeriesTimerInfo>> GetSeriesTimersAsync(CancellationToken cancellationToken)

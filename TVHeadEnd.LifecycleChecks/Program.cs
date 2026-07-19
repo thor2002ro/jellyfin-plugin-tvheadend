@@ -1,9 +1,20 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Common.Configuration;
+using MediaBrowser.Controller.Drawing;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Drawing;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Serialization;
 using Microsoft.Extensions.Logging.Abstractions;
 using TVHeadEnd;
 using TVHeadEnd.Configuration;
@@ -122,6 +133,9 @@ AssertMuxerMarksConfirmedSourceClockJump();
 AssertStartupCacheKeepsInitialBufferClockAcrossKeyframes();
 AssertDefaultQueueDepthIsCentralized();
 AssertRuntimeStatusKeepsRunningChannelCompatibilityAliases();
+AssertImagesAreAuthenticatedAndRefreshedLocally();
+AssertStoredChannelMetadataIsReconciled();
+AssertPublicImageCacheFlow();
 
 Console.WriteLine("Lifecycle checks passed.");
 
@@ -221,6 +235,289 @@ static void AssertRuntimeStatusKeepsRunningChannelCompatibilityAliases()
     Assert(ReferenceEquals(status.Producers, status.RunningChannels), "Legacy producers alias no longer mirrors running channels.");
 }
 
+static void AssertImagesAreAuthenticatedAndRefreshedLocally()
+{
+    var resolve = typeof(HTSConnectionHandler).GetMethod(
+        "ResolveImageUrl",
+        PrivateStatic,
+        null,
+        new[] { typeof(string), typeof(string) },
+        null)!;
+
+    Assert(
+        (string)resolve.Invoke(null, new object[] { "http://tvh:9981/root", "imagecache/42" })!
+            == "http://tvh:9981/root/imagecache/42",
+        "Relative TVHeadend artwork was not made downloadable.");
+    Assert(
+        (string)resolve.Invoke(null, new object[] { "http://tvh:9981/root", "https://images.example/icon.png" })!
+            == "https://images.example/icon.png",
+        "Absolute guide artwork was rewritten.");
+    Assert(
+        resolve.Invoke(null, new object[] { "http://tvh:9981/root", "file:///secret.png" }) is null,
+        "Unsupported image URL scheme was sent to TVHeadend.");
+
+    var sameOrigin = typeof(HTSConnectionHandler).GetMethod("SameOrigin", PrivateStatic)!;
+    Assert(
+        (bool)sameOrigin.Invoke(null, new object[] { new Uri("http://tvh:9981/root"), new Uri("http://tvh:9981/image/42") })!,
+        "TVHeadend image was not recognized as same-origin.");
+    Assert(
+        !(bool)sameOrigin.Invoke(null, new object[] { new Uri("http://tvh:9981/root"), new Uri("https://images.example/icon.png") })!,
+        "TVHeadend credentials could leak to an external image host.");
+
+    var shouldStop = typeof(HTSConnectionHandler).GetMethod("ShouldStopImageRefresh", PrivateStatic)!;
+    Assert(
+        (bool)shouldStop.Invoke(null, new object[] { new HttpRequestException("Forbidden", null, HttpStatusCode.Forbidden) })!,
+        "Authentication failure did not stop the image refresh failure cascade.");
+    Assert(
+        !(bool)shouldStop.Invoke(null, new object[] { new HttpRequestException("Missing", null, HttpStatusCode.NotFound) })!,
+        "One missing image incorrectly stopped unrelated image downloads.");
+
+    var download = typeof(HTSConnectionHandler).GetMethod("DownloadImageAsync", PrivateStatic)!;
+    var cacheDirectory = Path.Combine(Path.GetTempPath(), "tvheadend-image-check-" + Guid.NewGuid().ToString("N"));
+    var handler = new ImageResponseHandler();
+    using var client = new HttpClient(handler);
+    var arguments = new object[]
+    {
+        client,
+        new Uri("http://tvh:9981/root/imagecache/42"),
+        new Dictionary<string, string> { ["Authorization"] = "Basic test" },
+        cacheDirectory,
+        "channel:42",
+        (Action<string>)(path =>
+        {
+            if (new FileInfo(path).Length < 20)
+            {
+                throw new InvalidDataException("Invalid test image.");
+            }
+        }),
+        (Func<bool>)(() => true),
+        null!,
+        null!,
+        CancellationToken.None
+    };
+
+    try
+    {
+        var firstPath = ((Task<string>)download.Invoke(null, arguments)!).GetAwaiter().GetResult();
+        var firstBytes = File.ReadAllBytes(firstPath);
+        var secondPath = ((Task<string>)download.Invoke(null, arguments)!).GetAwaiter().GetResult();
+        var secondBytes = File.ReadAllBytes(secondPath);
+        var changedFormatPath = ((Task<string>)download.Invoke(null, arguments)!).GetAwaiter().GetResult();
+        var changedFormatBytes = File.ReadAllBytes(changedFormatPath);
+        var rejectedCorruptImage = false;
+        try
+        {
+            ((Task<string>)download.Invoke(null, arguments)!).GetAwaiter().GetResult();
+        }
+        catch (InvalidDataException)
+        {
+            rejectedCorruptImage = true;
+        }
+
+        Assert(handler.SawAuthorization, "TVHeadend image request omitted authentication.");
+        Assert(firstPath == secondPath, "Refreshing an image changed its stable local path.");
+        Assert(!firstBytes.SequenceEqual(secondBytes), "Guide refresh did not replace changed image bytes.");
+        Assert(firstPath != changedFormatPath, "A valid channel image format change was rejected.");
+        Assert(rejectedCorruptImage, "A corrupt image with a valid signature was cached.");
+        Assert(
+            changedFormatBytes.SequenceEqual(File.ReadAllBytes(changedFormatPath)),
+            "A rejected corrupt image overwrote the last valid cached image.");
+        typeof(HTSConnectionHandler).GetMethod(
+            "PruneSupersededChannelImage",
+            PrivateStatic)!.Invoke(null, new object[] { changedFormatPath });
+        Assert(!File.Exists(secondPath), "A superseded channel image format was retained.");
+        Assert(File.Exists(changedFormatPath), "Pruning removed the current channel image.");
+    }
+    finally
+    {
+        Directory.Delete(cacheDirectory, true);
+    }
+}
+
+static void AssertStoredChannelMetadataIsReconciled()
+{
+    var path = Path.GetTempFileName();
+    try
+    {
+        var needsRefresh = typeof(LiveTvService).GetMethod(
+            "StoredImageNeedsRefresh",
+            PrivateStatic)!;
+        var image = new ItemImageInfo
+        {
+            Type = ImageType.Primary,
+            Path = path,
+            DateModified = File.GetLastWriteTimeUtc(path)
+        };
+
+        Assert(
+            !(bool)needsRefresh.Invoke(null, new object[] { image, path })!,
+            "Unchanged stored channel metadata was updated again.");
+        image.DateModified = image.DateModified.AddSeconds(-1);
+        Assert(
+            (bool)needsRefresh.Invoke(null, new object[] { image, path })!,
+            "A canceled or failed metadata update was not retried.");
+        image.DateModified = File.GetLastWriteTimeUtc(path);
+        image.Path += ".old";
+        Assert(
+            (bool)needsRefresh.Invoke(null, new object[] { image, path })!,
+            "A channel image format/path change was not reconciled.");
+        image.Path = "https://images.example/icon.png";
+        Assert(
+            !(bool)needsRefresh.Invoke(null, new object[] { image, image.Path })!,
+            "An unchanged external channel image was updated again.");
+        Assert(
+            (bool)needsRefresh.Invoke(null, new object[] { image, "https://images.example/new-icon.png" })!,
+            "A changed external channel image URL was not reconciled.");
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void AssertPublicImageCacheFlow()
+{
+    var root = Path.Combine(Path.GetTempPath(), "tvheadend-public-image-check-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        var applicationPaths = CreateProxy<IApplicationPaths>((method, _) =>
+            method.ReturnType == typeof(string) ? root : GetDefault(method.ReturnType));
+        var xmlSerializer = CreateProxy<IXmlSerializer>((method, arguments) =>
+            method.Name.StartsWith("Deserialize", StringComparison.Ordinal)
+                ? Activator.CreateInstance((Type)arguments[0])
+                : GetDefault(method.ReturnType));
+        var plugin = new Plugin(applicationPaths, xmlSerializer);
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            TVH_ServerName = "tvh",
+            Username = "user",
+            Password = "password"
+        });
+
+        var responseHandler = new ImageResponseHandler();
+        var httpClient = new HttpClient(responseHandler);
+        var imageEncoder = CreateProxy<IImageEncoder>((method, _) =>
+            method.Name == nameof(IImageEncoder.GetImageSize)
+                ? new ImageDimensions(1, 1)
+                : GetDefault(method.ReturnType));
+        using var handler = new HTSConnectionHandler(
+            NullLoggerFactory.Instance,
+            new TestHttpClientFactory(httpClient),
+            imageEncoder);
+
+        var imageDirectory = Path.Combine(plugin.DataFolderPath, "images");
+        Directory.CreateDirectory(imageDirectory);
+        var staleTemporaryPath = Path.Combine(imageDirectory, "stale.tmp");
+        var recentTemporaryPath = Path.Combine(imageDirectory, "recent.tmp");
+        File.WriteAllText(staleTemporaryPath, "stale");
+        File.WriteAllText(recentTemporaryPath, "recent");
+        File.SetLastWriteTimeUtc(staleTemporaryPath, DateTime.UtcNow.AddDays(-2));
+
+        handler.BeginImageRefresh(["channel:42"]);
+        Assert(!File.Exists(staleTemporaryPath), "A crash-abandoned image download was not pruned.");
+        Assert(File.Exists(recentTemporaryPath), "An active image download was pruned.");
+
+        var first = handler.CacheImageAsync(
+            "imagecache/42",
+            "channel:42",
+            CancellationToken.None).GetAwaiter().GetResult();
+        Assert(File.Exists(first.ImagePath), "The public cache flow did not create a local image.");
+        Assert(responseHandler.SawAuthorization, "The public cache flow omitted TVHeadend authentication.");
+
+        var requestCount = responseHandler.RequestCount;
+        handler.BeginImageRefresh(["channel:42"]);
+        var second = handler.CacheImageAsync(
+            "imagecache/42",
+            "channel:42",
+            CancellationToken.None).GetAwaiter().GetResult();
+        Assert(first.ImagePath == second.ImagePath, "An unchanged guide refresh changed the cached image path.");
+        Assert(responseHandler.RequestCount == requestCount, "An unchanged guide refresh fetched the TVHeadend image again.");
+
+        var missingResponse = new MissingImageResponseHandler();
+        using var missingHandler = new HTSConnectionHandler(
+            NullLoggerFactory.Instance,
+            new TestHttpClientFactory(new HttpClient(missingResponse)),
+            imageEncoder);
+        missingHandler.BeginImageRefresh(["channel:404"]);
+        var missing = missingHandler.CacheImageAsync(
+            "imagecache/404",
+            "channel:404",
+            CancellationToken.None).GetAwaiter().GetResult();
+        missingHandler.CacheImageAsync(
+            "imagecache/404",
+            "channel:404",
+            CancellationToken.None).GetAwaiter().GetResult();
+        Assert(missing.ImagePath is null, "A missing TVHeadend image produced a cache path.");
+        Assert(missingResponse.RequestCount == 1, "A missing image was fetched repeatedly in one guide refresh.");
+        missingHandler.BeginImageRefresh(["channel:404"]);
+        missingHandler.CacheImageAsync(
+            "imagecache/404",
+            "channel:404",
+            CancellationToken.None).GetAwaiter().GetResult();
+        Assert(missingResponse.RequestCount == 2, "A missing image was not retried on the next guide refresh.");
+
+        var blockingResponse = new BlockingImageResponseHandler();
+        using var blockingHandler = new HTSConnectionHandler(
+            NullLoggerFactory.Instance,
+            new TestHttpClientFactory(new HttpClient(blockingResponse)),
+            imageEncoder);
+        blockingHandler.BeginImageRefresh(["channel:99"]);
+        using var cancellation = new CancellationTokenSource();
+        var canceledRequest = blockingHandler.CacheImageAsync(
+            "imagecache/99",
+            "channel:99",
+            cancellation.Token);
+        blockingResponse.Started.GetAwaiter().GetResult();
+        cancellation.Cancel();
+        var canceled = false;
+        try
+        {
+            canceledRequest.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            canceled = true;
+        }
+
+        Assert(canceled, "Canceling a guide refresh did not release its caller.");
+        blockingResponse.Release();
+        var recovered = blockingHandler.CacheImageAsync(
+            "imagecache/99",
+            "channel:99",
+            CancellationToken.None).GetAwaiter().GetResult();
+        Assert(File.Exists(recovered.ImagePath), "A canceled caller prevented the shared cache download from completing.");
+        Assert(blockingResponse.RequestCount == 1, "Retrying after caller cancellation duplicated the TVHeadend download.");
+
+        blockingHandler.CacheImageAsync(
+            null,
+            "channel:99",
+            CancellationToken.None).GetAwaiter().GetResult();
+        Assert(File.Exists(recovered.ImagePath), "Invalidation deleted the last image before metadata reconciliation.");
+        typeof(HTSConnectionHandler).GetMethod(
+            "PruneChannelImages",
+            PrivateInstance)!.Invoke(
+                blockingHandler,
+                new object[] { Array.Empty<string>(), new[] { "channel:99" } });
+        Assert(!File.Exists(recovered.ImagePath), "A removed channel image was retained after reconciliation.");
+    }
+    finally
+    {
+        Directory.Delete(root, true);
+    }
+}
+
+static T CreateProxy<T>(Func<MethodInfo, object[], object> invoke)
+    where T : class
+{
+    var proxy = DispatchProxy.Create<T, InterfaceProxy>();
+    ((InterfaceProxy)(object)proxy).InvokeMethod = invoke;
+    return proxy;
+}
+
+static object GetDefault(Type type) =>
+    type == typeof(void) || !type.IsValueType ? null : Activator.CreateInstance(type);
+
 static (object Muxer, object Stream) CreateH264Muxer()
 {
     var (muxer, streams) = CreateMuxer("H264");
@@ -306,4 +603,95 @@ static long ReadPesTimestamp(ReadOnlySpan<byte> data, int offset)
 static object GetMuxerStreamField(object stream, string fieldName)
 {
     return stream.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(stream)!;
+}
+
+sealed class ImageResponseHandler : HttpMessageHandler
+{
+    private static readonly byte[] Png = Convert.FromBase64String(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
+    private static readonly byte[] Gif = Convert.FromBase64String(
+        "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==");
+    private int _requestCount;
+
+    public bool SawAuthorization { get; private set; }
+    public int RequestCount => Volatile.Read(ref _requestCount);
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        SawAuthorization |= string.Equals(
+            request.Headers.Authorization?.Scheme,
+            "Basic",
+            StringComparison.OrdinalIgnoreCase);
+        var requestCount = Interlocked.Increment(ref _requestCount);
+        var content = requestCount switch
+        {
+            1 => new ByteArrayContent(Png),
+            2 => new ByteArrayContent(Png.Append((byte)0).ToArray()),
+            3 => new ByteArrayContent(Gif),
+            _ => new ByteArrayContent(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })
+        };
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+    }
+}
+
+sealed class TestHttpClientFactory : IHttpClientFactory
+{
+    private readonly HttpClient _httpClient;
+
+    public TestHttpClientFactory(HttpClient httpClient)
+    {
+        _httpClient = httpClient;
+    }
+
+    public HttpClient CreateClient(string name) => _httpClient;
+}
+
+sealed class MissingImageResponseHandler : HttpMessageHandler
+{
+    private int _requestCount;
+
+    public int RequestCount => Volatile.Read(ref _requestCount);
+
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _requestCount);
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+    }
+}
+
+class InterfaceProxy : DispatchProxy
+{
+    public Func<MethodInfo, object[], object> InvokeMethod { get; set; }
+
+    protected override object Invoke(MethodInfo targetMethod, object[] args) =>
+        InvokeMethod(targetMethod, args);
+}
+
+sealed class BlockingImageResponseHandler : HttpMessageHandler
+{
+    private static readonly byte[] Png = Convert.FromBase64String(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
+    private readonly TaskCompletionSource<bool> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _requestCount;
+
+    public Task Started => _started.Task;
+    public int RequestCount => Volatile.Read(ref _requestCount);
+
+    public void Release() => _release.TrySetResult(true);
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _requestCount);
+        _started.TrySetResult(true);
+        await _release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(Png)
+        };
+    }
 }

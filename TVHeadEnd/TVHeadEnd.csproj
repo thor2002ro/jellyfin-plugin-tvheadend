@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <InformationalVersion>v$([System.DateTime]::Now.ToString('yyyyMMdd-HHmm'))</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
@@ -14,7 +14,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="10.*-*" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.*-*" />
   </ItemGroup>
 
 </Project>

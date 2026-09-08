@@ -27,13 +27,13 @@ Jellyfin plugin, with fork-specific changes.
 - Runtime status in the plugin settings page: connection state, active tuners,
   reader counts, signal metrics, queue health, drops, reconnects, startup cache
   state, and per-stream packet/event counters.
-- Jellyfin 10.11 / .NET 9 packaging metadata.
+- Jellyfin 12 / .NET 10 packaging metadata.
 
 ## Requirements
 
-- Jellyfin server compatible with plugin ABI `10.11.0.0`.
+- Jellyfin server compatible with plugin ABI `12.0.0.0`.
 - TVHeadend with HTTP and HTSP access enabled.
-- .NET 9 SDK to build from source.
+- .NET 10 SDK to build from source.
 
 ## Installation
 
@@ -62,7 +62,7 @@ still available when you want TVHeadend to provide the transport stream directly
 
 ## Building and Releasing
 
-The project targets `net9.0` and can be built with:
+The project targets `net10.0` and can be built with:
 
 ```powershell
 dotnet build

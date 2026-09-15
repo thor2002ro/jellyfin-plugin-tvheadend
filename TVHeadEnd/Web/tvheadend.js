@@ -41,7 +41,9 @@ export default function (view, params) {
     }
 
     function priorityValue(value) {
-        return [0, 1, 2, 3, 4, 6].includes(Number(value)) ? Number(value) : 2;
+        const priority = Number(value);
+        if (priority === 6) return 5;
+        return [0, 1, 2, 3, 4, 5].includes(priority) ? priority : 2;
     }
 
     function loadConfig(page, config) {

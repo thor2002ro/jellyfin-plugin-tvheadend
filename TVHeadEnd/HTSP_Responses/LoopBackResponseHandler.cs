@@ -3,13 +3,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using TVHeadEnd.HTSP;
 
-namespace TVHeadEnd.HTSP.Responses
+namespace TVHeadEnd.HTSP_Responses
 {
-    public class LoopBackResponseHandler : IHTSResponseHandler
+    public class LoopBackResponseHandler : HTSResponseHandler
     {
         private readonly TaskCompletionSource<HTSMessage> _response = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public void HandleResponse(HTSMessage response)
+        public void handleResponse(HTSMessage response)
         {
             _response.TrySetResult(response);
         }

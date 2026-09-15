@@ -93,7 +93,9 @@ using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
     logQueueStatus.Invoke(stream, new object[] { message });
     Assert(GetInt(stream, "_awaitingCleanVideoRandomAccess") == 0, "Queue drops should be accounted without forcing a clean-keyframe wait.");
     Assert(GetLong(stream, "_videoDamageEvents") == 1, "Queue damage was not counted.");
-    Assert(((string)GetField(stream, "_lastVideoDamageReason")).Contains("queue dropped frames"), "Queue damage reason was not retained.");
+    Assert(
+        ((string)GetField(stream, "_lastVideoDamageReason")).Contains("queue dropped frames", StringComparison.Ordinal),
+        "Queue damage reason was not retained.");
 }
 
 for (var i = 0; i < 100; i++)

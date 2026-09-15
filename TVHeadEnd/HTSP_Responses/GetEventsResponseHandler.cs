@@ -1,20 +1,20 @@
+using MediaBrowser.Controller.LiveTv;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using MediaBrowser.Controller.LiveTv;
-using Microsoft.Extensions.Logging;
+using TVHeadEnd.HTSP;
 
-namespace TVHeadEnd.HTSP.Responses
+namespace TVHeadEnd.HTSP_Responses
 {
-    public class GetEventsResponseHandler : IHTSResponseHandler
+    public class GetEventsResponseHandler : HTSResponseHandler
     {
         private readonly DateTime _initialDateTimeUTC = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-        private readonly DateTime _startDateTimeUtc;
-        private readonly DateTime _endDateTimeUtc;
+        private readonly DateTime _startDateTimeUtc, _endDateTimeUtc;
         private readonly ILogger<LiveTvService> _logger;
 
         private readonly List<ProgramInfo> _result;
@@ -30,108 +30,102 @@ namespace TVHeadEnd.HTSP.Responses
             _result = new List<ProgramInfo>();
         }
 
-        public void HandleResponse(HTSMessage response)
+        public void handleResponse(HTSMessage response)
         {
-            _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: received answer from TVH server: {Msg}", response.ToString());
+            _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: received answer from TVH server: {msg}", response.ToString());
 
-            if (response.ContainsField("events"))
+            if (response.containsField("events"))
             {
-                IList events = response.GetList("events");
+                IList events = response.getList("events");
                 foreach (HTSMessage currEventMessage in events)
                 {
                     ProgramInfo pi = new ProgramInfo();
 
-                    if (currEventMessage.ContainsField("start"))
+                    if (currEventMessage.containsField("start"))
                     {
-                        long currStartTimeUnix = currEventMessage.GetLong("start");
+                        long currStartTimeUnix = currEventMessage.getLong("start");
                         DateTime currentStartDateTimeUTC = _initialDateTimeUTC.AddSeconds(currStartTimeUnix).ToUniversalTime();
                         int compResult = DateTime.Compare(currentStartDateTimeUTC, _endDateTimeUtc);
                         if (compResult > 0)
                         {
-                            _logger.LogDebug(
-                                "[TVHclient] GetEventsResponseHandler.handleResponse: start value of event larger than query stop value - skipping\n"
-                                + "Query start UTC dateTime: {Start}\n"
-                                + "Query end UTC dateTime:   {End}\n"
-                                + "Event start UTC dateTime: {Currstart}\n{Msg}",
-                                _startDateTimeUtc,
-                                _endDateTimeUtc,
-                                currentStartDateTimeUTC,
-                                currEventMessage.ToString());
+                            _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: start value of event larger than query stop value - skipping\n"
+                                + "Query start UTC dateTime: {start}\n"
+                                + "Query end UTC dateTime:   {end}\n"
+                                + "Event start UTC dateTime: {currstart}\n{msg}",
+                                _startDateTimeUtc, _endDateTimeUtc, currentStartDateTimeUTC, currEventMessage.ToString());
                             continue;
                         }
-
                         pi.StartDate = currentStartDateTimeUTC;
                     }
                     else
                     {
-                        _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: no start value for event - skipping\n{Msg}", currEventMessage.ToString());
+                        _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: no start value for event - skipping\n{msg}", currEventMessage.ToString());
                         continue;
                     }
 
-                    if (currEventMessage.ContainsField("stop"))
+                    if (currEventMessage.containsField("stop"))
                     {
-                        long currEndTimeUnix = currEventMessage.GetLong("stop");
+                        long currEndTimeUnix = currEventMessage.getLong("stop");
                         DateTime currentEndDateTimeUTC = _initialDateTimeUTC.AddSeconds(currEndTimeUnix).ToUniversalTime();
                         int compResult = DateTime.Compare(currentEndDateTimeUTC, _startDateTimeUtc);
                         if (compResult < 0)
                         {
-                            _logger.LogDebug(
-                                "[TVHclient] GetEventsResponseHandler.handleResponse: stop value of event smaller than query start value - skipping\n"
-                                + "Query start UTC dateTime: {Start}\n"
-                                + "Query end UTC dateTime:   {End}\n"
-                                + "Event start UTC dateTime: {Currend}\n{Msg}",
-                                _startDateTimeUtc,
-                                _endDateTimeUtc,
-                                currentEndDateTimeUTC,
-                                currEventMessage.ToString());
+                            _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: stop value of event smaller than query start value - skipping\n"
+                                + "Query start UTC dateTime: {start}\n"
+                                + "Query end UTC dateTime:   {end}\n"
+                                + "Event start UTC dateTime: {currend}\n{msg}",
+                                _startDateTimeUtc, _endDateTimeUtc, currentEndDateTimeUTC, currEventMessage.ToString());
                             continue;
                         }
-
                         pi.EndDate = currentEndDateTimeUTC;
                     }
                     else
                     {
-                        _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: no stop value for event - skipping\n{Msg}", currEventMessage.ToString());
+                        _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: no stop value for event - skipping\n{msg}", currEventMessage.ToString());
                         continue;
                     }
 
-                    if (currEventMessage.ContainsField("channelId"))
+                    if (currEventMessage.containsField("channelId"))
                     {
                         pi.ChannelId = "" + currEventMessage.getLong("channelId");
                     }
 
-                    if (currEventMessage.ContainsField("eventId"))
+                    if (currEventMessage.containsField("eventId"))
                     {
                         pi.Id = "" + currEventMessage.getLong("eventId");
                     }
 
-                    if (currEventMessage.ContainsField("serieslinkUri"))
+                    if (currEventMessage.containsField("serieslinkUri"))
                     {
-                        pi.SeriesId = "" + currEventMessage.getLong("serieslinkId");
+                        pi.SeriesId = currEventMessage.getString("serieslinkUri");
                     }
 
-                    if (currEventMessage.ContainsField("episodeNumber"))
+                    if (currEventMessage.containsField("episodeNumber"))
                     {
-                        pi.EpisodeNumber = currEventMessage.GetInt("episodeNumber");
+                        pi.EpisodeNumber = currEventMessage.getInt("episodeNumber");
+                    }
+                    else if (currEventMessage.containsField("episodeId"))
+                    {
+                        pi.EpisodeNumber = currEventMessage.getInt("episodeId");
                     }
 
-                    if (currEventMessage.ContainsField("seasonNumber"))
+                    if (currEventMessage.containsField("seasonNumber"))
                     {
-                        pi.SeasonNumber = currEventMessage.GetInt("seasonNumber");
+                        pi.SeasonNumber = currEventMessage.getInt("seasonNumber");
+                    }
+                    else if (currEventMessage.containsField("seasonId"))
+                    {
+                        pi.SeasonNumber = currEventMessage.getInt("seasonId");
                     }
 
-                    if (currEventMessage.ContainsField("title"))
+                    if (currEventMessage.containsField("title"))
                     {
-                        pi.Name = currEventMessage.GetString("title");
+                        pi.Name = currEventMessage.getString("title");
                     }
 
-                    // Up to HTSP v31 the server collapses description/summary/subtitle into
-                    // "description" when the richer field is missing. From v32 on all three are
-                    // sent independently, so "description" can be absent even though the event
-                    // has a summary. Fall back so both layouts produce an overview.
-                    pi.Overview = currEventMessage.GetString("description", null)
-                        ?? currEventMessage.GetString("summary", null)
-                        ?? currEventMessage.GetString("subtitle", null);
+                    pi.Overview = currEventMessage.getString("description", null)
+                        ?? currEventMessage.getString("summary", null)
+                        ?? currEventMessage.getString("subtitle", null);
 
                     if (currEventMessage.containsField("summary"))
                     {
@@ -140,13 +134,13 @@ namespace TVHeadEnd.HTSP.Responses
 
                     if (currEventMessage.containsField("subtitle"))
                     {
-                        pi.EpisodeTitle = currEventMessage.GetString("subtitle");
+                        pi.EpisodeTitle = currEventMessage.getString("subtitle");
                         pi.IsSeries = true;
                     }
 
-                    if (currEventMessage.ContainsField("firstAired"))
+                    if (currEventMessage.containsField("firstAired"))
                     {
-                        long firstAiredUtcLong = currEventMessage.GetLong("firstAired");
+                        long firstAiredUtcLong = currEventMessage.getLong("firstAired");
                         pi.OriginalAirDate = _initialDateTimeUTC.AddSeconds(firstAiredUtcLong).ToUniversalTime();
                     }
 
@@ -174,23 +168,23 @@ namespace TVHeadEnd.HTSP.Responses
                         pi.ProductionYear = currEventMessage.getInt("copyrightYear");
                     }
 
-                    if (currEventMessage.ContainsField("image"))
+                    if (currEventMessage.containsField("image"))
                     {
                         pi.HasImage = true;
-                        pi.ImageUrl = string.Empty + currEventMessage.GetString("image");
+                        pi.ImageUrl = "" + currEventMessage.getString("image");
                     }
                     else
                     {
                         pi.HasImage = false;
                     }
 
-                    if (currEventMessage.ContainsField("contentType"))
+                    if (currEventMessage.containsField("contentType"))
                     {
                         List<string> genres = new List<string>();
 
-                        int contentType = currEventMessage.GetInt("contentType");
-                        // byte major = (byte)((contentTypeRaw & 0xF0) >> 4);
-                        // byte minor = (byte) (contentTypeRaw & 0xF);
+                        int contentType = currEventMessage.getInt("contentType");
+                        //byte major = (byte)((contentTypeRaw & 0xF0) >> 4);
+                        //byte minor = (byte) (contentTypeRaw & 0xF);
 
                         switch (contentType)
                         {
@@ -736,20 +730,19 @@ namespace TVHeadEnd.HTSP.Responses
                                 // unused values
                                 break;
                         }
-
                         pi.Genres = genres;
                     }
 
-                    // pi.IsSeries - bool
-                    // pi.CommunityRating  - float
-                    // pi.IsHD - bool
-                    // pi.IsPremiere - bool
-                    // pi.IsRepeat - bool
-                    // pi.ImagePath - string
-                    // pi.Audio - MediaBrowser.Model.LiveTv.ProgramAudio
-                    // pi.ProductionYear - int
+                    //pi.IsSeries - bool
+                    //pi.CommunityRating  - float
+                    //pi.IsHD - bool
+                    //pi.IsPremiere - bool
+                    //pi.IsRepeat - bool
+                    //pi.ImagePath - string
+                    //pi.Audio - MediaBrowser.Model.LiveTv.ProgramAudio
+                    //pi.ProductionYear - int
 
-                    _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: add event\n Message: {Msg}\n PiInfo: {Msg2}", currEventMessage.ToString(), CreatePiInfo(pi));
+                    _logger.LogDebug("[TVHclient] GetEventsResponseHandler.handleResponse: add event\n Message: {msg}\n PiInfo: {msg2}", currEventMessage.ToString(), createPiInfo(pi));
 
                     _result.Add(pi);
                 }
@@ -757,7 +750,7 @@ namespace TVHeadEnd.HTSP.Responses
             _events.TrySetResult(_result);
         }
 
-        private string CreatePiInfo(ProgramInfo pi)
+        private String createPiInfo(ProgramInfo pi)
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("\n<ProgramInfo>\n");
@@ -779,12 +772,11 @@ namespace TVHeadEnd.HTSP.Responses
             sb.Append("  IsSports:              " + pi.IsSports + "\n");
             sb.Append("  Genres:\n");
             List<string> genres = pi.Genres;
-            foreach (string currGenres in genres)
+            foreach(string currGenres in genres)
             {
-                sb.Append("  --> " + currGenres + "\n");
+              sb.Append("  --> " + currGenres + "\n");
             }
-
-            sb.Append('\n');
+            sb.Append("\n");
 
             return sb.ToString();
         }

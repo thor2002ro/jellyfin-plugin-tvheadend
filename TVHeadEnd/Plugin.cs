@@ -13,7 +13,7 @@ using MediaBrowser.Model.Drawing;
 namespace TVHeadEnd
 {
     /// <summary>
-    /// Class Plugin.
+    /// Class Plugin
     /// </summary>
     public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     {
@@ -121,4 +121,5 @@ namespace TVHeadEnd
         /// <value>The instance.</value>
         public static Plugin Instance { get; private set; }
     }
+
 }

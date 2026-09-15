@@ -36,15 +36,9 @@ public class AccessTicketHandler
 
     private readonly ConcurrentDictionary<string, Lazy<Task<Ticket>>> _ticketCache = new();
 
-    private volatile int _ticketIdSequence;
-
     internal AccessTicketHandler(
-        ILoggerFactory loggerFactory,
-        HTSConnectionHandler htsConnectionHandler,
-        TimeSpan requestTimeout,
-        int requestRetries,
-        TimeSpan ticketLifeSpan,
-        TicketType ticketType)
+        ILoggerFactory loggerFactory, HTSConnectionHandler htsConnectionHandler,
+        TimeSpan requestTimeout, int requestRetries, TimeSpan ticketLifeSpan, TicketType ticketType)
     {
         _logger = loggerFactory.CreateLogger<AccessTicketHandler>();
         _htsConnectionHandler = htsConnectionHandler;
@@ -57,7 +51,7 @@ public class AccessTicketHandler
         {
             TicketType.Channel => "channelId",
             TicketType.Recording => "dvrId",
-            _ => throw new ArgumentException("undefined ticketType", nameof(ticketType))
+            _ => throw new ArgumentException("undefined ticketType")
         };
     }
 

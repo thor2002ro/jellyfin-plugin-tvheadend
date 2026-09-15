@@ -1,6 +1,6 @@
-using System;
 using System.Collections.Generic;
 using System.Threading;
+using System;
 
 namespace TVHeadEnd.Helper
 {
@@ -83,7 +83,7 @@ namespace TVHeadEnd.Helper
             }
         }
 
-        public void AppendCount(byte[] data, long count)
+        public void appendCount(byte[] data, long count)
         {
             if (count < 0 || count > int.MaxValue)
             {
@@ -95,7 +95,15 @@ namespace TVHeadEnd.Helper
                 int length = (int)count;
                 byte[] dataRange = new byte[length];
                 Array.Copy(data, 0, dataRange, 0, dataRange.Length);
-                AppendAll(dataRange);
+                appendAll(dataRange);
+            }
+        }
+
+        public int Count()
+        {
+            lock (_data)
+            {
+                return _data.Count;
             }
         }
     }

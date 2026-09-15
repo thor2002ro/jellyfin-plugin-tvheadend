@@ -13,21 +13,25 @@ namespace TVHeadEnd.DataHelper
         private readonly ILogger<AutorecDataHelper> _logger;
         private readonly Dictionary<string, HTSMessage> _data;
 
+        private readonly DateTime _initialDateTimeUTC = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
         public AutorecDataHelper(ILogger<AutorecDataHelper> logger)
         {
             _logger = logger;
             _data = new Dictionary<string, HTSMessage>();
         }
 
-        public void AutorecEntryAdd(HTSMessage message)
+        public void clean()
         {
-            string? id = message.GetString("id");
-            if (id == null)
+            lock (_data)
             {
-                _logger.LogDebug("[TVHclient] AutorecDataHelper: entry without an id - skipping");
-                return;
+                _data.Clear();
             }
+        }
 
+        public void autorecEntryAdd(HTSMessage message)
+        {
+            string id = message.getString("id");
             lock (_data)
             {
                 if (_data.ContainsKey(id))
@@ -35,20 +39,13 @@ namespace TVHeadEnd.DataHelper
                     _logger.LogDebug("[TVHclient] AutorecDataHelper.autorecEntryAdd: id already in database - skipping");
                     return;
                 }
-
                 _data.Add(id, message);
             }
         }
 
-        public void AutorecEntryUpdate(HTSMessage message)
+        public void autorecEntryUpdate(HTSMessage message)
         {
-            string? id = message.GetString("id");
-            if (id == null)
-            {
-                _logger.LogDebug("[TVHclient] AutorecDataHelper: entry without an id - skipping");
-                return;
-            }
-
+            string id = message.getString("id");
             lock (_data)
             {
                 if (!_data.TryGetValue(id, out HTSMessage oldMessage) || oldMessage == null)
@@ -56,28 +53,20 @@ namespace TVHeadEnd.DataHelper
                     _logger.LogDebug("[TVHclient] AutorecDataHelper.autorecEntryUpdate: id not in database - skipping");
                     return;
                 }
-
                 foreach (KeyValuePair<string, object> entry in message)
                 {
-                    if (oldMessage.ContainsField(entry.Key))
+                    if (oldMessage.containsField(entry.Key))
                     {
-                        oldMessage.RemoveField(entry.Key);
+                        oldMessage.removeField(entry.Key);
                     }
-
-                    oldMessage.PutField(entry.Key, entry.Value);
+                    oldMessage.putField(entry.Key, entry.Value);
                 }
             }
         }
 
-        public void AutorecEntryDelete(HTSMessage message)
+        public void autorecEntryDelete(HTSMessage message)
         {
-            string? id = message.GetString("id");
-            if (id == null)
-            {
-                _logger.LogDebug("[TVHclient] AutorecDataHelper: entry without an id - skipping");
-                return;
-            }
-
+            string id = message.getString("id");
             lock (_data)
             {
                 _data.Remove(id);
@@ -94,7 +83,7 @@ namespace TVHeadEnd.DataHelper
 
         public Task<IEnumerable<SeriesTimerInfo>> buildAutorecInfos(CancellationToken cancellationToken, int serverUtcOffsetMinutes = 0)
         {
-            return Task.Run<IEnumerable<SeriesTimerInfo>>(() =>
+            return Task.Factory.StartNew<IEnumerable<SeriesTimerInfo>>(() =>
             {
                 lock (_data)
                 {
@@ -200,48 +189,41 @@ namespace TVHeadEnd.DataHelper
             });
         }
 
-        private List<DayOfWeek> GetDayOfWeekListFromInt(int daysOfWeek)
+        private List<DayOfWeek> getDayOfWeekListFromInt(int daysOfWeek)
         {
             List<DayOfWeek> result = new List<DayOfWeek>();
             if ((daysOfWeek & 0x01) != 0)
             {
                 result.Add(DayOfWeek.Monday);
             }
-
             if ((daysOfWeek & 0x02) != 0)
             {
                 result.Add(DayOfWeek.Tuesday);
             }
-
             if ((daysOfWeek & 0x04) != 0)
             {
                 result.Add(DayOfWeek.Wednesday);
             }
-
             if ((daysOfWeek & 0x08) != 0)
             {
                 result.Add(DayOfWeek.Thursday);
             }
-
             if ((daysOfWeek & 0x10) != 0)
             {
                 result.Add(DayOfWeek.Friday);
             }
-
             if ((daysOfWeek & 0x20) != 0)
             {
                 result.Add(DayOfWeek.Saturday);
             }
-
             if ((daysOfWeek & 0x40) != 0)
             {
                 result.Add(DayOfWeek.Sunday);
             }
-
             return result;
         }
 
-        public static int GetDaysOfWeekFromList(IEnumerable<DayOfWeek> days)
+        public static int getDaysOfWeekFromList(List<DayOfWeek> days)
         {
             int result = 0;
             foreach (DayOfWeek currDay in days)
@@ -271,7 +253,6 @@ namespace TVHeadEnd.DataHelper
                         break;
                 }
             }
-
             return result;
         }
 

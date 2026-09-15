@@ -17,15 +17,21 @@ using TVHeadEnd.Configuration;
 using TVHeadEnd.DataHelper;
 using TVHeadEnd.HTSP;
 
+
 namespace TVHeadEnd
 {
     public sealed class HTSConnectionHandler : HTSConnectionListener, IDisposable
     {
+        private const int DvrPriorityImportant = 0;
+        private const int DvrPriorityNormal = 2;
+        private const int DvrPriorityNotSet = 5;
+        private const int LegacyDvrPriorityDefault = 6;
+        private const long MaximumImageBytes = 20L * 1024L * 1024L;
+
         private readonly object _lock = new Object();
         private static readonly TimeSpan InitialLoadTimeout = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ImageCacheRetention = TimeSpan.FromDays(90);
-        private const long MaximumImageBytes = 20L * 1024L * 1024L;
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<HTSConnectionHandler> _logger;
@@ -56,6 +62,7 @@ namespace TVHeadEnd
         private string _userName;
         private string _password;
         private string _streamingMethod;
+        private bool _useHttps;
         private bool _forceDeinterlace;
         private TimeZoneInfo _tvhTimeZone;
 
@@ -81,9 +88,6 @@ namespace TVHeadEnd
             _channelDataHelper = new ChannelDataHelper(loggerFactory.CreateLogger<ChannelDataHelper>());
             _dvrDataHelper = new DvrDataHelper(loggerFactory.CreateLogger<DvrDataHelper>());
             _autorecDataHelper = new AutorecDataHelper(loggerFactory.CreateLogger<AutorecDataHelper>());
-
-            // The channel type is applied in Init(), once the configuration has been read.
-            // ChannelDataHelper defaults to "Ignore" until then.
         }
 
         private static TaskCompletionSource<bool> CreateInitialLoadCompletion()
@@ -110,13 +114,12 @@ namespace TVHeadEnd
             }
         }
 
-        private void Init()
+        private void init()
         {
-            if (_configured == true)
+            if(_configured == true)
             {
-                return;
+                return ;
             }
-
             _logger.LogDebug("[TVHclient] HTSConnectionHandler - Init()");
 
             var config = Plugin.Instance.Configuration;
@@ -125,23 +128,23 @@ namespace TVHeadEnd
 
             if (string.IsNullOrEmpty(config.TVH_ServerName))
             {
-                const string Message = "[TVHclient] HTSConnectionHandler.EnsureConnection: TVH server name must be configured";
-                _logger.LogError(Message);
-                throw new InvalidOperationException(Message);
+                string message = "[TVHclient] HTSConnectionHandler.ensureConnection: TVH server name must be configured";
+                _logger.LogError(message);
+                throw new InvalidOperationException(message);
             }
 
             if (string.IsNullOrEmpty(config.Username))
             {
-                const string Message = "[TVHclient] HTSConnectionHandler.EnsureConnection: username must be configured";
-                _logger.LogError(Message);
-                throw new InvalidOperationException(Message);
+                string message = "[TVHclient] HTSConnectionHandler.ensureConnection: username must be configured";
+                _logger.LogError(message);
+                throw new InvalidOperationException(message);
             }
 
             if (string.IsNullOrEmpty(config.Password))
             {
-                const string Message = "[TVHclient] HTSConnectionHandler.EnsureConnection: password must be configured";
-                _logger.LogError(Message);
-                throw new InvalidOperationException(Message);
+                string message = "[TVHclient] HTSConnectionHandler.ensureConnection: password must be configured";
+                _logger.LogError(message);
+                throw new InvalidOperationException(message);
             }
 
             _priority = config.Priority;
@@ -167,31 +170,69 @@ namespace TVHeadEnd
                 }
             }
 
-            if ((_priority < 0 || _priority > 4) && _priority != 6)
+            if (_priority == LegacyDvrPriorityDefault)
             {
-                _priority = 2;
-                _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: invalid priority - set to 2");
+                _priority = DvrPriorityNotSet;
+            }
+            else if (_priority < DvrPriorityImportant || _priority > DvrPriorityNotSet)
+            {
+                _logger.LogWarning(
+                    "[TVHclient] Recording priority {ConfiguredPriority} is outside the supported range [{LowestPriority}-{HighestPriority}]; using {FallbackPriority}",
+                    _priority,
+                    DvrPriorityImportant,
+                    DvrPriorityNotSet,
+                    DvrPriorityNormal);
+                _priority = DvrPriorityNormal;
             }
 
             _tvhServerName = config.TVH_ServerName.Trim();
             _httpPort = config.HTTP_Port;
             _htspPort = config.HTSP_Port;
-
+            _webRoot = NormalizeWebRoot(config.WebRoot);
             _userName = config.Username.Trim();
             _password = config.Password.Trim();
+            _useHttps = config.UseHttps;
 
-            var httpScheme = config.UseHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
-            _httpBaseUrl = new UriBuilder(httpScheme, _tvhServerName, _httpPort, _webRoot).Uri.AbsoluteUri.TrimEnd('/');
+            _httpBaseUrl = BuildHttpBaseUrl();
 
             string authInfo = _userName + ":" + _password;
             authInfo = Convert.ToBase64String(Encoding.UTF8.GetBytes(authInfo));
             _headers["Authorization"] = "Basic " + authInfo;
-
-            // The constructor runs before any configuration is available, so the channel type
-            // has to be handed to the data helper here, once it has actually been read.
             _channelDataHelper.SetChannelType4Other(_channelType);
-
             _configured = true;
+        }
+
+        private static string NormalizeWebRoot(string webRoot)
+        {
+            if (string.IsNullOrWhiteSpace(webRoot))
+            {
+                return string.Empty;
+            }
+
+            var normalized = webRoot.Trim().TrimEnd('/');
+            return normalized.Length == 0 || normalized.StartsWith('/') ? normalized : "/" + normalized;
+        }
+
+        private string BuildHttpBaseUrl()
+        {
+            var scheme = _useHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
+            return new UriBuilder(scheme, _tvhServerName, _httpPort, _webRoot).Uri.AbsoluteUri.TrimEnd('/');
+        }
+
+        private void ApplyServerWebRoot(string reportedWebRoot)
+        {
+            var resolvedWebRoot = NormalizeWebRoot(reportedWebRoot);
+            if (string.Equals(resolvedWebRoot, _webRoot, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _logger.LogInformation(
+                "[TVHclient] Using TVHeadend-reported web root '{ReportedWebRoot}' instead of configured '{ConfiguredWebRoot}'",
+                resolvedWebRoot,
+                _webRoot);
+            _webRoot = resolvedWebRoot;
+            _httpBaseUrl = BuildHttpBaseUrl();
         }
 
         public void BeginImageRefresh(IEnumerable<string> activeChannelCacheKeys)
@@ -794,33 +835,6 @@ namespace TVHeadEnd
             catch (UnauthorizedAccessException)
             {
             }
-
-            return GetAuthenticatedUrl(image);
-        }
-
-        /// <summary>
-        /// Builds an absolute, credentialed URL for a resource served by TVHeadend over HTTP.
-        /// </summary>
-        /// <remarks>
-        /// The web root is the one reported by the server, so a connection is established first.
-        /// </remarks>
-        /// <param name="relativePath">The path below the web root, with or without a leading slash.</param>
-        /// <returns>An absolute URL including the configured credentials.</returns>
-        public string GetAuthenticatedUrl(string relativePath)
-        {
-            EnsureConnection();
-
-            return "http://" + _userName + ":" + _password + "@" + _tvhServerName + ":" + _httpPort + _webRoot
-                + "/" + relativePath.TrimStart('/');
-        }
-
-        public string? GetChannelImageUrl(string channelId)
-        {
-            Init();
-
-            _logger.LogDebug("[TVHclient] HTSConnectionHandler.GetChannelImage: channelId: {Id}", channelId);
-
-            return ResolveImageUrl(_channelDataHelper.GetChannelIcon4ChannelId(channelId));
         }
 
         public Dictionary<string, string> GetHeaders()
@@ -831,7 +845,7 @@ namespace TVHeadEnd
 
         private void ensureConnection(CancellationToken cancellationToken = default)
         {
-            Init();
+            init();
 
             lock (_lock)
             {
@@ -839,8 +853,8 @@ namespace TVHeadEnd
                 {
                     _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: create new HTS connection");
                     _htsConnection?.Dispose();
-                    Version version = Assembly.GetEntryAssembly().GetName().Version;
-                    _htsConnection = new HTSConnectionAsync(this, "TVHclient4Emby-" + version.ToString(), "" + HTSMessage.HTSP_VERSION, _loggerFactory);
+                    Version version = typeof(HTSConnectionHandler).Assembly.GetName().Version;
+                    _htsConnection = new HTSConnectionAsync(this, "Jellyfin-TVHeadend", version.ToString(), _loggerFactory);
                     _connected = false;
                     ResetInitialLoad();
                     _channelDataHelper.Clean();
@@ -850,16 +864,10 @@ namespace TVHeadEnd
 
                 if (!_connected)
                 {
-                    _logger.LogDebug(
-                        "[TVHclient] HTSConnectionHandler.ensureConnection: used connection parameters: " +
-                        "TVH Server = '{Servername}'; HTTP Port = '{Httpport}'; HTSP Port = '{Htspport}'; Web-Root = '{Webroot}'; " +
-                        "User = '{User}'; Password set = '{Passexists}'",
-                        _tvhServerName,
-                        _httpPort,
-                        _htspPort,
-                        _webRoot,
-                        _userName,
-                        _password.Length > 0);
+                    _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: used connection parameters: " +
+                        "TVH Server = '{servername}'; HTTP Port = '{httpport}'; HTSP Port = '{htspport}'; Web-Root = '{webroot}'; " +
+                        "User = '{user}'; Password set = '{passexists}'",
+                        _tvhServerName, _httpPort, _htspPort, _webRoot, _userName, (_password.Length > 0));
 
                     _htsConnection.open(_tvhServerName, _htspPort, cancellationToken, maxAttempts: 3);
                     _connected = _htsConnection.authenticate(_userName, _password, true, cancellationToken, AuthenticationTimeout);
@@ -869,21 +877,8 @@ namespace TVHeadEnd
                         throw new UnauthorizedAccessException("TVHeadend HTSP authentication failed.");
                     }
 
-                    if (_connected)
-                    {
-                        ApplyServerWebRoot(_htsConnection.GetWebRoot());
-                    }
-
-                    _logger.LogInformation(
-                        "[TVHclient] HTSConnectionHandler.EnsureConnection: connection established = {Connected}; "
-                        + "TVH server = '{ServerName}' {ServerVersion}; HTSP version negotiated = {NegotiatedHtspVersion} "
-                        + "(server supports up to {ServerHtspVersion}, client up to {ClientHtspVersion})",
-                        _connected,
-                        _htsConnection.GetServername(),
-                        _htsConnection.GetServerversion(),
-                        _htsConnection.GetNegotiatedProtocolVersion(),
-                        _htsConnection.GetServerProtocolVersion(),
-                        HTSMessage.HtspVersion);
+                    ApplyServerWebRoot(_htsConnection.getServerWebRoot());
+                    _logger.LogDebug("[TVHclient] HTSConnectionHandler.ensureConnection: connection established {c}", _connected);
                 }
             }
         }
@@ -899,11 +894,7 @@ namespace TVHeadEnd
             _htsConnection?.RemoveResponseHandler(sequence);
         }
 
-        /// <summary>
-        /// Gets the HTSP version in effect for the current connection.
-        /// </summary>
-        /// <returns>The negotiated HTSP version.</returns>
-        public int GetNegotiatedProtocolVersion()
+        public String GetServername()
         {
             ensureConnection();
             return _htsConnection.getServername();
@@ -952,7 +943,7 @@ namespace TVHeadEnd
 
         public int GetPriority()
         {
-            Init();
+            init();
             return _priority;
         }
 
@@ -986,15 +977,13 @@ namespace TVHeadEnd
 
         public String GetProfile()
         {
-            Init();
+            init();
             return _profile;
         }
 
-        public string GetHttpBaseUrl()
+        public String GetHttpBaseUrl()
         {
-            // The web root is taken from the HTSP handshake, so a connection is required
-            // before the base URL is known to be correct.
-            EnsureConnection();
+            ensureConnection();
             return _httpBaseUrl;
         }
 
@@ -1006,7 +995,7 @@ namespace TVHeadEnd
 
         public bool GetForceDeinterlace()
         {
-            Init();
+            init();
             return _forceDeinterlace;
         }
 
@@ -1048,7 +1037,7 @@ namespace TVHeadEnd
             return long.TryParse(channelId, out var numericId) ? _channelDataHelper.GetExternalChannelId(numericId) : channelId;
         }
 
-        public void OnError(Exception ex)
+        public void onError(Exception ex)
         {
             _logger.LogError(ex, "[TVHclient] HTSConnectionHandler: HTSP error");
             lock (_lock)
@@ -1060,7 +1049,7 @@ namespace TVHeadEnd
             }
         }
 
-        public void OnMessage(HTSMessage? response)
+        public void onMessage(HTSMessage response)
         {
             if (response != null)
             {
@@ -1077,23 +1066,23 @@ namespace TVHeadEnd
                         break;
 
                     case "dvrEntryAdd":
-                        _dvrDataHelper.DvrEntryAdd(response);
+                        _dvrDataHelper.dvrEntryAdd(response);
                         break;
                     case "dvrEntryUpdate":
-                        _dvrDataHelper.DvrEntryUpdate(response);
+                        _dvrDataHelper.dvrEntryUpdate(response);
                         break;
                     case "dvrEntryDelete":
-                        _dvrDataHelper.DvrEntryDelete(response);
+                        _dvrDataHelper.dvrEntryDelete(response);
                         break;
 
                     case "autorecEntryAdd":
-                        _autorecDataHelper.AutorecEntryAdd(response);
+                        _autorecDataHelper.autorecEntryAdd(response);
                         break;
                     case "autorecEntryUpdate":
-                        _autorecDataHelper.AutorecEntryUpdate(response);
+                        _autorecDataHelper.autorecEntryUpdate(response);
                         break;
                     case "autorecEntryDelete":
-                        _autorecDataHelper.AutorecEntryDelete(response);
+                        _autorecDataHelper.autorecEntryDelete(response);
                         break;
 
                     case "eventAdd":

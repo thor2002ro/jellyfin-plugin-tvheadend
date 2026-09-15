@@ -452,6 +452,12 @@ static void AssertStoredChannelMetadataIsReconciled()
     }
 }
 
+static int GetPrivateCollectionCount(object instance, string fieldName)
+{
+    var collection = instance.GetType().GetField(fieldName, PrivateInstance)!.GetValue(instance)!;
+    return (int)collection.GetType().GetProperty("Count")!.GetValue(collection)!;
+}
+
 static void AssertPublicImageCacheFlow()
 {
     var root = Path.Combine(Path.GetTempPath(), "tvheadend-public-image-check-" + Guid.NewGuid().ToString("N"));
@@ -501,6 +507,7 @@ static void AssertPublicImageCacheFlow()
             CancellationToken.None).GetAwaiter().GetResult();
         Assert(File.Exists(first.ImagePath), "The public cache flow did not create a local image.");
         Assert(responseHandler.SawAuthorization, "The public cache flow omitted TVHeadend authentication.");
+        Assert(GetPrivateCollectionCount(handler, "_imageDownloads") == 0, "A successful image operation remained retained.");
 
         var requestCount = responseHandler.RequestCount;
         handler.BeginImageRefresh(["channel:42"]);
@@ -527,6 +534,7 @@ static void AssertPublicImageCacheFlow()
             CancellationToken.None).GetAwaiter().GetResult();
         Assert(missing.ImagePath is null, "A missing TVHeadend image produced a cache path.");
         Assert(missingResponse.RequestCount == 1, "A missing image was fetched repeatedly in one guide refresh.");
+        Assert(GetPrivateCollectionCount(missingHandler, "_imageDownloads") == 1, "A missing image result was not retained for its guide refresh.");
         missingHandler.BeginImageRefresh(["channel:404"]);
         missingHandler.CacheImageAsync(
             "imagecache/404",

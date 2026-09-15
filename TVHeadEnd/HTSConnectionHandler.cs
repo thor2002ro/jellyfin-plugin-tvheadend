@@ -397,6 +397,23 @@ namespace TVHeadEnd
                     LazyThreadSafetyMode.ExecutionAndPublication));
 
             var refreshedPath = await download.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var resultMatchesCurrentSource = !hasStableCacheKey;
+            if (hasStableCacheKey && refreshedPath is not null)
+            {
+                var sourcePath = Path.Combine(cacheDirectory, GetImageFilePrefix(cacheKey) + ".source");
+                var currentPath = FindCachedChannelImage(
+                    cacheDirectory,
+                    cacheKey,
+                    sourcePath,
+                    sourceFingerprint);
+                resultMatchesCurrentSource = string.Equals(currentPath, refreshedPath, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (refreshedPath is not null && resultMatchesCurrentSource)
+            {
+                _imageDownloads.TryRemove(new KeyValuePair<string, Lazy<Task<string>>>(operationKey, download));
+            }
+
             return (refreshedPath ?? cachedPath, null);
         }
 

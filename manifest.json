@@ -1,0 +1,28 @@
+[
+  {
+    "name": "TVHeadend",
+    "guid": "3fd018e5-5e78-4e58-b280-a0c068febee0",
+    "owner": "jellyfin",
+    "overview": "Manage TVHeadend from Jellyfin",
+    "description": "Manage TVHeadend from Jellyfin",
+    "category": "LiveTV",
+    "versions": [
+      {
+        "version": "2026.10.6.2123",
+        "changelog": "## New features\n- Selectable recording backend: Choose TVHeadend DVR or Jellyfin DVR in plugin settings. TVHeadend remains the default; Jellyfin DVR uses Jellyfin’s scheduler and configured recording directory.\n- Multiple TVHeadend servers: Jellyfin DVR mode supports separate native tuners and guide providers for each server, registered automatically without manual channel mapping.\n- Connection testing: Test unsaved connection settings for HTSP, HTTP ticket and HTTP Basic streaming, with results for connection, authentication and stream-access failures.\n- Programme thumbnails: Optionally generate missing artwork from buffered video on watched HTSP channels.\n- Background thumbnails: A separate option captures unwatched channels at low priority while no HTSP playback readers are active. Captures are limited to one channel per minute.\n- Channel tags: Import TVHeadend channel tags into Jellyfin, including tag renames and deletions.\n- Track languages: Preserve audio and subtitle languages, normalize language codes consistently, and fill missing languages from stream probing.\n## Playback and performance improvements\n- Enrich HTSP stream metadata with broadcast frame rate and aspect ratio, plus probed interlacing, HDR, bit depth, codec profile and bitrate.\n- Probe existing buffered video without opening another tuner subscription. Cache results and retain broadcast metadata if probing fails.\n- Reduce startup round trips by skipping unused disk-space and server-time queries on playback connections.\n- Lower warm subscriptions to idle priority after the last viewer leaves and restore playback priority when reused.\n- Isolate shared streams by server, account and profile, preventing equal channel numbers on different servers from sharing the wrong stream.\n- Cache native channel listings to avoid repeating failed-server waits during every programme lookup.\n- Group background thumbnail captures by learned mux identity while ensuring every eligible channel gets a turn.\n## Guide, artwork and recording improvements\n- Read programme data from HTSP event pushes instead of repeatedly requesting each channel’s guide.\n- Handle partial updates, deletions and reconnect snapshots in guide and channel caches.\n- Coalesce and throttle guide refreshes to avoid unnecessary full rebuilds.\n- Fetch TVHeadend image-cache artwork through HTSP, with authenticated HTTP fallback when HTSP file access is unavailable.\n- Refresh generated thumbnails after five minutes and overlay cached channel logos when available.\n- Preserve broadcaster artwork and keep channels available when artwork downloads fail or time out.\n- Refresh recording listings after DVR changes without invalidating caches for duplicate pushes.\n- Track recording modification timestamps and retain cached recording artwork after its programme leaves the EPG.\n- Authenticate native HTTP recording streams through TVHeadend ticket URLs, compatible with Jellyfin’s TS recorder.\n- Preserve native tuner IDs during server edits and remove generated native dashboard entries when switching back to TVHeadend DVR.\n- Show the active recording backend and per-server connection and streaming information in plugin status.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/thor2002ro/jellyfin-plugin-tvheadend/releases/download/v2026.10.6.2123/TVHeadEnd_2026.10.6.2123.zip",
+        "checksum": "fe9e05de3d9d0227bb4239794481310f",
+        "timestamp": "2026-10-06T18:25:18Z"
+      },
+      {
+        "version": "2026.9.15.1520",
+        "changelog": "- Note integration of upstream plugin v15 while retaining the fork’s HTSP enhancements.\n- Describe improved cleanup of deferred HTSP streaming resources.\n- Mention that completed guide-image download tasks are now removed to prevent unnecessary accumulation.\n- Highlight the move to xUnit and expanded shared-streaming, cancellation, and cleanup regression coverage.\n- Explain that Release builds now provide a versioned ZIP containing `TVHeadEnd.dll`, suitable for a Jellyfin repository; the DLL remains available for manual installation.\n- State compatibility with Jellyfin 12 and .NET 10.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/thor2002ro/jellyfin-plugin-tvheadend/releases/download/v2026.9.15.1520/TVHeadEnd_2026.9.15.1520.zip",
+        "checksum": "7858cdc5f58a3a9ae7d95f5902c4c1d9",
+        "timestamp": "2026-09-15T18:08:44Z"
+      }
+    ]
+  }
+]

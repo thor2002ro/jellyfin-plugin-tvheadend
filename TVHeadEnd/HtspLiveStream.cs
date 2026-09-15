@@ -98,6 +98,8 @@ namespace TVHeadEnd
         private int _liveReconnectAttempts;
         private int _closeStarted;
         private int _playbackCloseStarted;
+        private int _disposeRequested;
+        private int _ownedResourcesDisposed;
         private int _activeStreamReaders;
         private int _lastMetadataSubscriptionId;
         private int _lastFilteredSubscriptionId;
@@ -746,7 +748,26 @@ namespace TVHeadEnd
                 _subscriptionId,
                 reason);
 
+            if (Volatile.Read(ref _disposeRequested) != 0)
+            {
+                DisposeOwnedResources();
+            }
+
             return Task.FromResult(true);
+        }
+
+        private void DisposeOwnedResources()
+        {
+            if (Interlocked.Exchange(ref _ownedResourcesDisposed, 1) != 0)
+            {
+                return;
+            }
+
+            CancelSharedHubIdleClose();
+            CancelAllOwnerIdleDisconnects();
+            _stream.Dispose();
+            _lifetimeCancellationTokenSource.Dispose();
+            _connectionSemaphore.Dispose();
         }
 
         public Stream GetStream()
@@ -3986,6 +4007,7 @@ namespace TVHeadEnd
 
         public void Dispose()
         {
+            Interlocked.Exchange(ref _disposeRequested, 1);
             Close().GetAwaiter().GetResult();
 
             if (!IsSharedProxy
@@ -3998,11 +4020,7 @@ namespace TVHeadEnd
                 return;
             }
 
-            CancelSharedHubIdleClose();
-            CancelAllOwnerIdleDisconnects();
-            _stream.Dispose();
-            _lifetimeCancellationTokenSource.Dispose();
-            _connectionSemaphore.Dispose();
+            DisposeOwnedResources();
         }
 
         internal static bool LooksLikeTransportStream(byte[] payload)

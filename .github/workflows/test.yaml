@@ -16,3 +16,10 @@ on:
 jobs:
   call:
     uses: jellyfin/jellyfin-meta-plugins/.github/workflows/test.yaml@master
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test Manifest Automation
+        run: python3 -m unittest discover --start-directory scripts/tests --pattern 'test_*manifest.py' --verbose

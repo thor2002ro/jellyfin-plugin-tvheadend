@@ -37,6 +37,16 @@ Jellyfin plugin, with fork-specific changes.
 
 ## Installation
 
+Add this URL as a plugin repository in the Jellyfin dashboard:
+
+```text
+https://raw.githubusercontent.com/thor2002ro/jellyfin-plugin-tvheadend/manifest/manifest.json
+```
+
+The `manifest` branch is generated from published GitHub releases. Only releases
+with a valid `TVHeadEnd_<version>.zip` asset are listed. The automation keeps that
+branch to one amended `Local: Update plugin repository manifest` commit.
+
 Use the normal Jellyfin plugin installation flow when installing a packaged
 release:
 

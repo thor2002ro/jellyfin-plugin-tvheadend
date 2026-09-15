@@ -1,0 +1,47 @@
+name: '📦 Update Plugin Repository Manifest'
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/update-manifest.yaml'
+      - 'scripts/generate_manifest.py'
+      - 'scripts/publish_manifest.py'
+      - 'build.yaml'
+  release:
+    types:
+      - published
+      - edited
+      - deleted
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plugin-repository-manifest
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Generate Manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 scripts/generate_manifest.py
+          --repository "${{ github.repository }}"
+          --output "${{ runner.temp }}/manifest.json"
+
+      - name: Amend Manifest Commit
+        run: >-
+          python3 scripts/publish_manifest.py
+          --manifest "${{ runner.temp }}/manifest.json"

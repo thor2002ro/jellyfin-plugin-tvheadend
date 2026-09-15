@@ -1,0 +1,20 @@
+[
+  {
+    "name": "TVHeadend",
+    "guid": "3fd018e5-5e78-4e58-b280-a0c068febee0",
+    "owner": "jellyfin",
+    "overview": "Manage TVHeadend from Jellyfin",
+    "description": "Manage TVHeadend from Jellyfin",
+    "category": "LiveTV",
+    "versions": [
+      {
+        "version": "2026.9.15.1520",
+        "changelog": "- Note integration of upstream plugin v15 while retaining the fork’s HTSP enhancements.\n- Describe improved cleanup of deferred HTSP streaming resources.\n- Mention that completed guide-image download tasks are now removed to prevent unnecessary accumulation.\n- Highlight the move to xUnit and expanded shared-streaming, cancellation, and cleanup regression coverage.\n- Explain that Release builds now provide a versioned ZIP containing `TVHeadEnd.dll`, suitable for a Jellyfin repository; the DLL remains available for manual installation.\n- State compatibility with Jellyfin 12 and .NET 10.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/thor2002ro/jellyfin-plugin-tvheadend/releases/download/v2026.9.15.1520/TVHeadEnd_2026.9.15.1520.zip",
+        "checksum": "7858cdc5f58a3a9ae7d95f5902c4c1d9",
+        "timestamp": "2026-09-15T18:08:44Z"
+      }
+    ]
+  }
+]

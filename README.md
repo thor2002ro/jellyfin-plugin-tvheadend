@@ -62,13 +62,16 @@ still available when you want TVHeadend to provide the transport stream directly
 
 ## Building and Releasing
 
-The project targets `net10.0` and can be built with:
+The project targets `net10.0`. A Release build produces both the plugin DLL and
+an installable `TVHeadEnd_<version>.zip` archive:
 
 ```powershell
-dotnet build
+dotnet build --configuration Release
 ```
 
-Packaged releases can be produced with
+The ZIP contains `TVHeadEnd.dll` and is the asset to use in a Jellyfin plugin
+repository manifest. The standalone DLL remains available for manual installs.
+GitHub releases are built and packaged with
 [Jellyfin Plugin Repository Manager](https://github.com/oddstr13/jellyfin-plugin-repository-manager)
 using the included `build.yaml`.
 

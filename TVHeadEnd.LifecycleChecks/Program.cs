@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -789,6 +790,29 @@ public sealed class PluginTests
     static object GetMuxerStreamField(object stream, string fieldName)
     {
         return stream.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(stream)!;
+    }
+}
+
+public sealed class ReleasePackagingTests
+{
+    [Fact]
+    public void ReleaseBuildProducesInstallableZip()
+    {
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+        var configuration = Directory.GetParent(AppContext.BaseDirectory)!.Parent!.Name;
+        if (!string.Equals(configuration, "Release", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var releaseDirectory = Path.Combine(repositoryRoot, "TVHeadEnd", "bin", configuration, "net10.0");
+        var archives = Directory.GetFiles(releaseDirectory, "TVHeadEnd_*.zip");
+
+        var archivePath = Assert.Single(archives);
+        using var archive = ZipFile.OpenRead(archivePath);
+        var plugin = Assert.Single(archive.Entries);
+        Assert.Equal("TVHeadEnd.dll", plugin.FullName);
+        Assert.True(plugin.Length > 0, "The packaged plugin DLL is empty.");
     }
 }
 

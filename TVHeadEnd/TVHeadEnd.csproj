@@ -29,4 +29,19 @@
     <PackageReference Include="SmartAnalyzers.MultithreadingAnalyzer" Version="1.1.31" PrivateAssets="All" />
   </ItemGroup>
 
+  <Target Name="CreateReleasePackage" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <PropertyGroup>
+      <PluginPackageDirectory>$(IntermediateOutputPath)plugin-package</PluginPackageDirectory>
+      <PluginPackagePath>$(TargetDir)TVHeadEnd_$(Version).zip</PluginPackagePath>
+    </PropertyGroup>
+    <ItemGroup>
+      <ExistingPluginPackages Include="$(TargetDir)TVHeadEnd_*.zip" />
+    </ItemGroup>
+    <RemoveDir Directories="$(PluginPackageDirectory)" />
+    <Delete Files="@(ExistingPluginPackages)" />
+    <MakeDir Directories="$(PluginPackageDirectory)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PluginPackageDirectory)" />
+    <ZipDirectory SourceDirectory="$(PluginPackageDirectory)" DestinationFile="$(PluginPackagePath)" Overwrite="true" />
+  </Target>
+
 </Project>

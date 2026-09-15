@@ -9,6 +9,7 @@
     <AnalysisMode>AllEnabledByDefault</AnalysisMode>
     <TargetFramework>net9.0</TargetFramework>
     <InformationalVersion>v$([System.DateTime]::Now.ToString('yyyyMMdd-HHmm'))</InformationalVersion>
+    <InformationalVersion>v20260915-1459</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 

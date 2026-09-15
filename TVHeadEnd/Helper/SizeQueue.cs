@@ -1,19 +1,15 @@
-using System;
 using System.Collections.Generic;
 using System.Threading;
+using System;
 
 namespace TVHeadEnd.Helper
 {
-    public class BlockingBuffer<T>
+    public class SizeQueue<T>
     {
         private readonly TimeSpan _timeOut = new TimeSpan(0, 0, 30);
         private readonly Queue<T> _queue = new Queue<T>();
         private readonly int _maxSize;
-
-        public BlockingBuffer(int maxSize)
-        {
-            _maxSize = maxSize;
-        }
+        public SizeQueue(int maxSize) { _maxSize = maxSize; }
 
         public void Enqueue(T item)
         {
@@ -23,7 +19,6 @@ namespace TVHeadEnd.Helper
                 {
                     Monitor.Wait(_queue, _timeOut);
                 }
-
                 _queue.Enqueue(item);
                 if (_queue.Count == 1)
                 {

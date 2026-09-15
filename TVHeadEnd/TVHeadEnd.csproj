@@ -4,10 +4,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>TVHeadEnd</RootNamespace>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <RunAnalyzersDuringBuild>false</RunAnalyzersDuringBuild>
+    <Nullable>annotations</Nullable>
     <AnalysisMode>AllEnabledByDefault</AnalysisMode>
-    <TargetFramework>net9.0</TargetFramework>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 

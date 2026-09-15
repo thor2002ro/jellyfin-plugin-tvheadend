@@ -28,16 +28,6 @@ namespace TVHeadEnd
 {
     public class LiveTvService : ILiveTvService, ISupportsDirectStreamProvider
     {
-        /// <summary>
-        /// DVR_AUTOREC_BTYPE_ALL - record any broadcast.
-        /// </summary>
-        private const int BroadcastTypeAll = 0;
-
-        /// <summary>
-        /// DVR_AUTOREC_BTYPE_NEW_OR_UNKNOWN - record only broadcasts flagged as new or unflagged.
-        /// </summary>
-        private const int BroadcastTypeNewOrUnknown = 1;
-
         private readonly IMediaEncoder _mediaEncoder;
 
         private readonly TimeSpan _timeout = TimeSpan.FromMinutes(5);
@@ -53,6 +43,7 @@ namespace TVHeadEnd
         private readonly SemaphoreSlim _channelRefreshLock = new(1, 1);
 
         private readonly ILogger<LiveTvService> _logger;
+        public DateTime _lastRecordingChange = DateTime.MinValue;
 
         public LiveTvService(
             ILoggerFactory loggerFactory,
@@ -79,21 +70,13 @@ namespace TVHeadEnd
                 _recordingTicketHandler = new AccessTicketHandler(loggerFactory, _htsConnectionHandler, requestTimeout, retries, lifeSpan, Recording);
             }
 
-            // Added for stream probing
+            //Added for stream probing
             _mediaEncoder = mediaEncoder;
         }
 
-        public DateTime LastRecordingChange { get; private set; } = DateTime.MinValue;
+        public string HomePageUrl { get { return "http://tvheadend.org/"; } }
 
-        public string HomePageUrl
-        {
-            get { return "http://tvheadend.org/"; }
-        }
-
-        public string Name
-        {
-            get { return "TVHclient LiveTvService"; }
-        }
+        public string Name { get { return "TVHclient LiveTvService"; } }
 
         public async Task CancelSeriesTimerAsync(string timerId, CancellationToken cancellationToken)
         {
@@ -106,7 +89,7 @@ namespace TVHeadEnd
 
             HTSMessage deleteAutorecMessage = new HTSMessage();
             deleteAutorecMessage.Method = "deleteAutorecEntry";
-            deleteAutorecMessage.PutField("id", timerId);
+            deleteAutorecMessage.putField("id", timerId);
 
             HTSMessage deleteAutorecResponse;
             try
@@ -173,7 +156,7 @@ namespace TVHeadEnd
             }
         }
 
-        public async Task CloseLiveStream(string id, CancellationToken cancellationToken)
+        public async Task CloseLiveStream(string subscriptionId, CancellationToken cancellationToken)
         {
             await Task.Factory.StartNew(() =>
             {
@@ -395,7 +378,7 @@ namespace TVHeadEnd
                 || (!isRemote && image.DateModified != File.GetLastWriteTimeUtc(imagePath));
         }
 
-        public async Task<MediaSourceInfo> GetChannelStream(string channelId, string streamId, CancellationToken cancellationToken)
+        public async Task<MediaSourceInfo> GetChannelStream(string channelId, string mediaSourceId, CancellationToken cancellationToken)
         {
             var streamingMethod = _htsConnectionHandler.GetStreamingMethod();
             if (streamingMethod == StreamingMethods.Htsp)
@@ -669,16 +652,14 @@ namespace TVHeadEnd
             }
             else
             {
-                _logger.LogError("Cannot probe {Source} stream", source);
+                _logger.LogError("Cannot probe {source} stream", source);
             }
         }
 
         private void LogMediaStreamList(IReadOnlyList<MediaStream> theList, string prefix)
         {
             foreach (MediaStream i in theList)
-            {
                 LogMediaStream(i, prefix);
-            }
         }
 
         private void LogMediaStream(MediaStream ms, string prefix)
@@ -720,7 +701,7 @@ namespace TVHeadEnd
 
         public async Task<List<MediaSourceInfo>> GetChannelStreamMediaSources(string channelId, CancellationToken cancellationToken)
         {
-            var source = await GetChannelStream(channelId, string.Empty, cancellationToken).ConfigureAwait(false);
+            var source = await GetChannelStream(channelId, string.Empty, cancellationToken);
             return [source];
         }
 
@@ -755,7 +736,7 @@ namespace TVHeadEnd
             queryEvents.putField("maxTime", ((DateTimeOffset)endDateUtc).ToUnixTimeSeconds());
             int sequence = _htsConnectionHandler.SendMessage(queryEvents, currGetEventsResponseHandler);
 
-            _logger.LogDebug("LiveTvService.GetProgramsAsync: ask TVH for events of channel '{Chanid}'", channelId);
+            _logger.LogDebug("LiveTvService.GetProgramsAsync: ask TVH for events of channel '{chanid}'", channelId);
 
             IEnumerable<ProgramInfo> programs;
             try
@@ -810,7 +791,7 @@ namespace TVHeadEnd
 
         public async Task<IEnumerable<TimerInfo>> GetTimersAsync(CancellationToken cancellationToken)
         {
-            // Retrieve the 'Pending' recordings
+            //  retrieve the 'Pending' recordings");
 
             int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
@@ -828,7 +809,6 @@ namespace TVHeadEnd
                 return [];
             }
         }
-
         public Task ResetTuner(string id, CancellationToken cancellationToken)
         {
             throw new NotImplementedException();
@@ -839,7 +819,7 @@ namespace TVHeadEnd
             await SaveSeriesTimerAsync("updateAutorecEntry", info, cancellationToken).ConfigureAwait(false);
         }
 
-        public async Task UpdateTimerAsync(TimerInfo updatedTimer, CancellationToken cancellationToken)
+        public async Task UpdateTimerAsync(TimerInfo info, CancellationToken cancellationToken)
         {
             int timeOut = await _htsConnectionHandler.WaitForInitialLoadAsync(cancellationToken).ConfigureAwait(false);
             if (timeOut == -1 || cancellationToken.IsCancellationRequested)
@@ -944,7 +924,7 @@ namespace TVHeadEnd
             message.putField("enabled", 1);
             message.putField("channelId", info.RecordAnyChannel || string.IsNullOrWhiteSpace(info.ChannelId) ? -1L : _htsConnectionHandler.ResolveChannelId(info.ChannelId));
             message.putField("daysOfWeek", info.Days == null ? 0 : AutorecDataHelper.getDaysOfWeekFromList(info.Days));
-            message.putField("priority", info.Priority is >= 0 and <= 4 or 6 ? info.Priority : _htsConnectionHandler.GetPriority());
+            message.putField("priority", info.Priority is >= 0 and <= 5 ? info.Priority : _htsConnectionHandler.GetPriority());
             message.putField("startExtra", (long)(info.PrePaddingSeconds / 60));
             message.putField("stopExtra", (long)(info.PostPaddingSeconds / 60));
             message.putField("broadcastType", info.RecordNewOnly ? 1 : 0);
@@ -980,4 +960,5 @@ namespace TVHeadEnd
             }
         }
     }
+
 }

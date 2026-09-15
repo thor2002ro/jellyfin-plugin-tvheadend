@@ -7,6 +7,7 @@ using MediaBrowser.Model.LiveTv;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.HTSP;
 
+
 namespace TVHeadEnd.DataHelper
 {
     public class DvrDataHelper
@@ -22,15 +23,17 @@ namespace TVHeadEnd.DataHelper
             _data = new Dictionary<string, HTSMessage>();
         }
 
-        public void DvrEntryAdd(HTSMessage message)
+        public void clean()
         {
-            string? id = message.GetString("id");
-            if (id == null)
+            lock (_data)
             {
-                _logger.LogDebug("[TVHclient] DvrDataHelper: entry without an id - skipping");
-                return;
+                _data.Clear();
             }
+        }
 
+        public void dvrEntryAdd(HTSMessage message)
+        {
+            string id = message.getString("id");
             lock (_data)
             {
                 if (_data.ContainsKey(id))
@@ -38,20 +41,13 @@ namespace TVHeadEnd.DataHelper
                     _logger.LogDebug("[TVHclient] DvrDataHelper.dvrEntryAdd id already in database - skipping");
                     return;
                 }
-
                 _data.Add(id, message);
             }
         }
 
-        public void DvrEntryUpdate(HTSMessage message)
+        public void dvrEntryUpdate(HTSMessage message)
         {
-            string? id = message.GetString("id");
-            if (id == null)
-            {
-                _logger.LogDebug("[TVHclient] DvrDataHelper: entry without an id - skipping");
-                return;
-            }
-
+            string id = message.getString("id");
             lock (_data)
             {
                 if (!_data.TryGetValue(id, out HTSMessage oldMessage) || oldMessage == null)
@@ -59,28 +55,20 @@ namespace TVHeadEnd.DataHelper
                     _logger.LogDebug("[TVHclient] DvrDataHelper.dvrEntryUpdate id not in database - skipping");
                     return;
                 }
-
                 foreach (KeyValuePair<string, object> entry in message)
                 {
-                    if (oldMessage.ContainsField(entry.Key))
+                    if (oldMessage.containsField(entry.Key))
                     {
-                        oldMessage.RemoveField(entry.Key);
+                        oldMessage.removeField(entry.Key);
                     }
-
-                    oldMessage.PutField(entry.Key, entry.Value);
+                    oldMessage.putField(entry.Key, entry.Value);
                 }
             }
         }
 
-        public void DvrEntryDelete(HTSMessage message)
+        public void dvrEntryDelete(HTSMessage message)
         {
-            string? id = message.GetString("id");
-            if (id == null)
-            {
-                _logger.LogDebug("[TVHclient] DvrDataHelper: entry without an id - skipping");
-                return;
-            }
-
+            string id = message.getString("id");
             lock (_data)
             {
                 _data.Remove(id);
@@ -111,7 +99,7 @@ namespace TVHeadEnd.DataHelper
 
         public Task<IEnumerable<MyRecordingInfo>> buildDvrInfos(CancellationToken cancellationToken)
         {
-            return Task.Run<IEnumerable<MyRecordingInfo>>(() =>
+            return Task.Factory.StartNew<IEnumerable<MyRecordingInfo>>(() =>
             {
                 lock (_data)
                 {
@@ -187,6 +175,16 @@ namespace TVHeadEnd.DataHelper
                             ri.Overview = description;
                         }
 
+                        if (string.IsNullOrWhiteSpace(ri.Overview) && m.TryGetString("summary", out var summary))
+                        {
+                            ri.Overview = summary;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(ri.Overview) && m.TryGetString("subtitle", out var overviewSubtitle))
+                        {
+                            ri.Overview = overviewSubtitle;
+                        }
+
                         if (string.IsNullOrWhiteSpace(ri.Overview) && m.TryGetString("comment", out var comment))
                         {
                             ri.Overview = comment;
@@ -223,10 +221,10 @@ namespace TVHeadEnd.DataHelper
                         }
 
                         // Path must not be set to force emby use of the LiveTvService methods!!!!
-                        // if (m.ContainsField("path"))
-                        // {
-                        //    ri.Path = m.GetString("path");
-                        // }
+                        //if (m.containsField("path"))
+                        //{
+                        //    ri.Path = m.getString("path");
+                        //}
 
                         if (m.TryGetString("autorecId", out var autorecId))
                         {
@@ -259,15 +257,14 @@ namespace TVHeadEnd.DataHelper
 
                         result.Add(ri);
                     }
-
                     return result;
                 }
             });
         }
 
-        public Task<IEnumerable<TimerInfo>> BuildPendingTimersInfos(CancellationToken cancellationToken)
+        public Task<IEnumerable<TimerInfo>> buildPendingTimersInfos(CancellationToken cancellationToken)
         {
-            return Task.Run<IEnumerable<TimerInfo>>(() =>
+            return Task.Factory.StartNew<IEnumerable<TimerInfo>>(() =>
             {
                 lock (_data)
                 {
@@ -317,6 +314,16 @@ namespace TVHeadEnd.DataHelper
                             ti.Overview = description;
                         }
 
+                        if (string.IsNullOrWhiteSpace(ti.Overview) && m.TryGetString("summary", out var summary))
+                        {
+                            ti.Overview = summary;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(ti.Overview) && m.TryGetString("subtitle", out var subtitle))
+                        {
+                            ti.Overview = subtitle;
+                        }
+
                         if (string.IsNullOrWhiteSpace(ti.Overview) && m.TryGetString("comment", out var comment))
                         {
                             ti.Overview = comment;
@@ -362,7 +369,6 @@ namespace TVHeadEnd.DataHelper
 
                         result.Add(ti);
                     }
-
                     return result;
                 }
             });

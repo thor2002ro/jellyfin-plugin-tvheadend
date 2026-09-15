@@ -9,7 +9,7 @@ using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Helper;
-using TVHeadEnd.HTSP.Responses;
+using TVHeadEnd.HTSP_Responses;
 
 namespace TVHeadEnd.HTSP
 {
@@ -32,9 +32,9 @@ namespace TVHeadEnd.HTSP
         private static int _seq;
 
         private readonly object _lock;
-        private readonly IHTSConnectionListener _listener;
-        private readonly string _clientName;
-        private readonly string _clientVersion;
+        private readonly HTSConnectionListener _listener;
+        private readonly String _clientName;
+        private readonly String _clientVersion;
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<HTSConnectionAsync> _logger;
 
@@ -52,28 +52,19 @@ namespace TVHeadEnd.HTSP
         private readonly SizeQueue<HTSMessage> _messagesForSendQueue;
         private readonly ConcurrentDictionary<int, HTSResponseHandler> _responseHandlers;
 
-        private readonly CancellationTokenSource _receiveHandlerThreadTokenSource;
-        private readonly CancellationTokenSource _messageBuilderThreadTokenSource;
-        private readonly CancellationTokenSource _sendingHandlerThreadTokenSource;
-        private readonly CancellationTokenSource _messageDistributorThreadTokenSource;
+        private Thread _receiveHandlerThread;
+        private Thread _messageBuilderThread;
+        private Thread _sendingHandlerThread;
+        private Thread _messageDistributorThread;
 
-        private volatile bool _needsRestart;
-        private volatile bool _connected;
-        private volatile int _seq;
+        private CancellationTokenSource _receiveHandlerThreadTokenSource;
+        private CancellationTokenSource _messageBuilderThreadTokenSource;
+        private CancellationTokenSource _sendingHandlerThreadTokenSource;
+        private CancellationTokenSource _messageDistributorThreadTokenSource;
 
-        private int _serverProtocolVersion;
-        private string? _servername;
-        private string? _serverversion;
-        private string? _webRoot;
+        private Socket _socket = null;
 
-        private Thread? _receiveHandlerThread;
-        private Thread? _messageBuilderThread;
-        private Thread? _sendingHandlerThread;
-        private Thread? _messageDistributorThread;
-
-        private Socket? _socket;
-
-        public HTSConnectionAsync(IHTSConnectionListener listener, string clientName, string clientVersion, ILoggerFactory loggerFactory)
+        public HTSConnectionAsync(HTSConnectionListener listener, String clientName, String clientVersion, ILoggerFactory loggerFactory)
         {
             _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger<HTSConnectionAsync>();
@@ -96,7 +87,7 @@ namespace TVHeadEnd.HTSP
             _messageDistributorThreadTokenSource = new CancellationTokenSource();
         }
 
-        public void Stop()
+        public void stop()
         {
             _expectedClose = true;
             _connected = false;
@@ -107,17 +98,14 @@ namespace TVHeadEnd.HTSP
                 {
                     _receiveHandlerThreadTokenSource.Cancel();
                 }
-
                 if (_messageBuilderThread != null && _messageBuilderThread.IsAlive)
                 {
                     _messageBuilderThreadTokenSource.Cancel();
                 }
-
                 if (_sendingHandlerThread != null && _sendingHandlerThread.IsAlive)
                 {
                     _sendingHandlerThreadTokenSource.Cancel();
                 }
-
                 if (_messageDistributorThread != null && _messageDistributorThread.IsAlive)
                 {
                     _messageDistributorThreadTokenSource.Cancel();
@@ -125,6 +113,7 @@ namespace TVHeadEnd.HTSP
             }
             catch
             {
+
             }
 
             CloseSocket();
@@ -259,17 +248,7 @@ namespace TVHeadEnd.HTSP
             }
         }
 
-        private static Thread StartBackgroundThread(ThreadStart threadStart)
-        {
-            Thread thread = new Thread(threadStart)
-            {
-                IsBackground = true
-            };
-            thread.Start();
-            return thread;
-        }
-
-        public bool Authenticate(string username, string password)
+        public Boolean authenticate(String username, String password)
         {
             return authenticate(username, password, true, CancellationToken.None, DefaultResponseTimeout);
         }
@@ -285,17 +264,17 @@ namespace TVHeadEnd.HTSP
 
             HTSMessage helloMessage = new HTSMessage();
             helloMessage.Method = "hello";
-            helloMessage.PutField("clientname", _clientName);
-            helloMessage.PutField("clientversion", _clientVersion);
-            helloMessage.PutField("htspversion", HTSMessage.HtspVersion);
-            helloMessage.PutField("username", username);
+            helloMessage.putField("clientname", _clientName);
+            helloMessage.putField("clientversion", _clientVersion);
+            helloMessage.putField("htspversion", HTSMessage.HTSP_VERSION);
+            helloMessage.putField("username", username);
 
             HTSMessage helloResponse = SendAndGetResponse(helloMessage, cancellationToken, responseTimeout);
             if (helloResponse != null)
             {
-                if (helloResponse.ContainsField("htspversion"))
+                if (helloResponse.containsField("htspversion"))
                 {
-                    _serverProtocolVersion = helloResponse.GetInt("htspversion");
+                    _serverProtocolVersion = helloResponse.getInt("htspversion");
                 }
                 else
                 {
@@ -312,7 +291,7 @@ namespace TVHeadEnd.HTSP
 
                 if (helloResponse.containsField("servername"))
                 {
-                    _servername = helloResponse.GetString("servername");
+                    _servername = helloResponse.getString("servername");
                 }
                 else
                 {
@@ -320,9 +299,9 @@ namespace TVHeadEnd.HTSP
                     _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: hello didn't include required field 'servername' - htsp incorrectly implemented by tvheadend");
                 }
 
-                if (helloResponse.ContainsField("serverversion"))
+                if (helloResponse.containsField("serverversion"))
                 {
-                    _serverversion = helloResponse.GetString("serverversion");
+                    _serverversion = helloResponse.getString("serverversion");
                 }
                 else
                 {
@@ -359,11 +338,11 @@ namespace TVHeadEnd.HTSP
                 byte[] salt = null;
                 if (helloResponse.containsField("challenge"))
                 {
-                    salt = helloResponse.GetByteArray("challenge");
+                    salt = helloResponse.getByteArray("challenge");
                 }
                 else
                 {
-                    salt = Array.Empty<byte>();
+                    salt = new byte[0];
                     _logger.LogInformation("[TVHclient] HTSConnectionAsync.authenticate: hello didn't include required field 'challenge' - htsp incorrectly implemented by tvheadend");
                 }
 
@@ -379,7 +358,7 @@ namespace TVHeadEnd.HTSP
                 HTSMessage authResponse = SendAndGetResponse(authMessage, cancellationToken, responseTimeout);
                 if (authResponse != null)
                 {
-                    bool auth = authResponse.GetInt("noaccess", 0) != 1;
+                    Boolean auth = authResponse.getInt("noaccess", 0) != 1;
                     if (auth)
                     {
                         HTSMessage getDiskSpaceMessage = new HTSMessage();
@@ -421,11 +400,10 @@ namespace TVHeadEnd.HTSP
                         }
                     }
 
-                    _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: authenticated = {M}", auth);
+                    _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: authenticated = {m}", auth);
                     return auth;
                 }
             }
-
             _logger.LogError("[TVHclient] HTSConnectionAsync.authenticate: no hello response");
             return false;
         }
@@ -484,18 +462,14 @@ namespace TVHeadEnd.HTSP
             return _servername;
         }
 
-        public string? GetServerversion()
+        public string getServerversion()
         {
             return _serverversion;
         }
 
-        /// <summary>
-        /// Gets the web root TVHeadend reported during the HTSP handshake.
-        /// </summary>
-        /// <returns>The server's web root, or <c>null</c> if it serves from the root.</returns>
-        public string? GetWebRoot()
+        public string getDiskspace()
         {
-            return _webRoot;
+            return _diskSpace;
         }
 
         public int sendMessage(HTSMessage message, HTSResponseHandler responseHandler)
@@ -691,7 +665,7 @@ namespace TVHeadEnd.HTSP
                         // auto update messages
                         if (_listener != null)
                         {
-                            _listener.OnMessage(response);
+                            _listener.onMessage(response);
                         }
                     }
                 }

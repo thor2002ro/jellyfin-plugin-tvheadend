@@ -30,6 +30,7 @@ var sharedHubs = (ConcurrentDictionary<string, HtspLiveStream>)sharedHubsField.G
 var removeSharedHub = typeof(HtspLiveStream).GetMethod("RemoveSharedHub", PrivateStatic)!;
 var releasePlayback = typeof(HtspLiveStream).GetMethod("ReleaseSharedPlaybackReference", PrivateInstance)!;
 var attachPlayback = typeof(HtspLiveStream).GetMethod("TryAttachPlaybackToProducer", PrivateInstance)!;
+var closeProducerNow = typeof(HtspLiveStream).GetMethod("CloseProducerNow", PrivateInstance)!;
 var logQueueStatus = typeof(HtspLiveStream).GetMethod("LogQueueStatus", PrivateInstance)!;
 var channelId = Guid.NewGuid().ToString("N");
 using var staleHub = CreateStream(channelId);
@@ -70,6 +71,36 @@ using (registeredHub.GetStream())
 registeredHub.Dispose();
 Assert(GetInt(registeredHub, "_closeStarted") == 1, "Dispose did not close the unused producer.");
 Assert(!sharedHubs.ContainsKey(registeredChannelId), "Dispose left the shared hub registered.");
+
+var deferredHub = CreateStream(Guid.NewGuid().ToString("N"));
+var deferredPlayback = CreateStream(Guid.NewGuid().ToString("N"));
+var deferredOwnerReader = deferredHub.GetStream();
+try
+{
+    Assert(
+        (bool)attachPlayback.Invoke(deferredPlayback, new object[] { deferredHub, false })!,
+        "The deferred-disposal check could not attach a shared playback.");
+
+    deferredHub.Dispose();
+    Assert(GetInt(deferredHub, "_closeStarted") == 0, "Disposing the owner closed a producer that still had a shared playback.");
+
+    deferredPlayback.Close().GetAwaiter().GetResult();
+    Assert(
+        ((Task<bool>)closeProducerNow.Invoke(deferredHub, new object[] { "last shared playback closed", true })!).GetAwaiter().GetResult(),
+        "The producer did not close after its final shared playback left.");
+    Assert(
+        ThrowsObjectDisposed(() => ProbeSemaphore((SemaphoreSlim)GetField(deferredHub, "_connectionSemaphore"))),
+        "Deferred producer disposal left its connection semaphore open.");
+    Assert(
+        ThrowsObjectDisposed(() => _ = ((CancellationTokenSource)GetField(deferredHub, "_lifetimeCancellationTokenSource")).Token),
+        "Deferred producer disposal left its cancellation source open.");
+}
+finally
+{
+    deferredOwnerReader.Dispose();
+    deferredPlayback.Dispose();
+    deferredHub.Dispose();
+}
 
 using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
 {
@@ -171,6 +202,27 @@ static void SetField(HtspLiveStream stream, string fieldName, object value)
 static int GetPlaybackReferenceCount(HtspLiveStream stream)
 {
     return (int)typeof(HtspLiveStream).GetMethod("GetSharedPlaybackReferenceCount", PrivateInstance)!.Invoke(stream, null)!;
+}
+
+static void ProbeSemaphore(SemaphoreSlim semaphore)
+{
+    if (semaphore.Wait(0))
+    {
+        semaphore.Release();
+    }
+}
+
+static bool ThrowsObjectDisposed(Action action)
+{
+    try
+    {
+        action();
+        return false;
+    }
+    catch (ObjectDisposedException)
+    {
+        return true;
+    }
 }
 
 static void Assert(bool condition, string message)

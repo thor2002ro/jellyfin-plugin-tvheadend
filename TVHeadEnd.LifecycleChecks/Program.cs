@@ -23,6 +23,8 @@ using TVHeadEnd.HTSP;
 const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
 const BindingFlags PrivateStatic = BindingFlags.Static | BindingFlags.NonPublic;
 
+AssertSharedJellyfinReferencesMatchTargetAbi();
+
 var sharedHubsField = typeof(HtspLiveStream).GetField("SharedHubsByChannelId", PrivateStatic)!;
 var sharedHubs = (ConcurrentDictionary<string, HtspLiveStream>)sharedHubsField.GetValue(null)!;
 var removeSharedHub = typeof(HtspLiveStream).GetMethod("RemoveSharedHub", PrivateStatic)!;
@@ -174,6 +176,27 @@ static void Assert(bool condition, string message)
     if (!condition)
     {
         throw new InvalidOperationException(message);
+    }
+}
+
+static void AssertSharedJellyfinReferencesMatchTargetAbi()
+{
+    var buildManifestPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "build.yaml"));
+    var buildManifest = File.ReadAllText(buildManifestPath);
+    var targetAbiMatch = System.Text.RegularExpressions.Regex.Match(buildManifest, "(?m)^targetAbi:\\s*\"(?<version>[^\"]+)\"\\s*$");
+    Assert(targetAbiMatch.Success, "The build manifest does not declare targetAbi.");
+
+    var targetAbi = Version.Parse(targetAbiMatch.Groups["version"].Value);
+    var sharedReferences = typeof(Plugin).Assembly.GetReferencedAssemblies()
+        .Where(reference => reference.Name is "MediaBrowser.Common" or "MediaBrowser.Controller" or "MediaBrowser.Model")
+        .ToArray();
+
+    Assert(sharedReferences.Length == 3, "The plugin's Jellyfin shared-library references could not be identified.");
+    foreach (var reference in sharedReferences)
+    {
+        Assert(
+            reference.Version == targetAbi,
+            $"The plugin references {reference.Name} {reference.Version}, but build.yaml declares target ABI {targetAbi}.");
     }
 }
 

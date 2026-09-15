@@ -28,19 +28,12 @@ public sealed class PluginTests
     private const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
     private const BindingFlags PrivateStatic = BindingFlags.Static | BindingFlags.NonPublic;
 
-    /// <summary>
-    /// Verifies shared-stream ownership, closure, and concurrent attachment behavior.
-    /// </summary>
     [Fact]
-    public async Task SharedStreamsReleaseReadersAndResourcesSafely()
+    public void StaleSharedHubCannotRemoveReplacement()
     {
         var sharedHubsField = typeof(HtspLiveStream).GetField("SharedHubsByChannelId", PrivateStatic)!;
         var sharedHubs = (ConcurrentDictionary<string, HtspLiveStream>)sharedHubsField.GetValue(null)!;
         var removeSharedHub = typeof(HtspLiveStream).GetMethod("RemoveSharedHub", PrivateStatic)!;
-        var releasePlayback = typeof(HtspLiveStream).GetMethod("ReleaseSharedPlaybackReference", PrivateInstance)!;
-        var attachPlayback = typeof(HtspLiveStream).GetMethod("TryAttachPlaybackToProducer", PrivateInstance)!;
-        var closeProducerNow = typeof(HtspLiveStream).GetMethod("CloseProducerNow", PrivateInstance)!;
-        var logQueueStatus = typeof(HtspLiveStream).GetMethod("LogQueueStatus", PrivateInstance)!;
         var channelId = Guid.NewGuid().ToString("N");
         using var staleHub = CreateStream(channelId);
         using var replacementHub = CreateStream(channelId);
@@ -49,7 +42,11 @@ public sealed class PluginTests
         Assert(!(bool)removeSharedHub.Invoke(null, new object[] { channelId, staleHub })!, "A stale hub removed its replacement.");
         Assert(ReferenceEquals(sharedHubs[channelId], replacementHub), "The replacement hub was not preserved.");
         Assert((bool)removeSharedHub.Invoke(null, new object[] { channelId, replacementHub })!, "The current hub could not remove itself.");
+    }
 
+    [Fact]
+    public async Task ClosingPlaybackReleasesReadersAndRejectsLateReaders()
+    {
         using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
         {
             using var reader = stream.GetStream();
@@ -64,7 +61,14 @@ public sealed class PluginTests
             Assert(ReferenceEquals(lateReader, Stream.Null), "Closed playback created a late reader.");
             Assert(GetPlaybackReferenceCount(stream) == 0, "A late reader restored closed playback ownership.");
         }
+    }
 
+    [Fact]
+    public async Task DuplicateReleaseDoesNotResetIdleCloseTimer()
+    {
+        var sharedHubsField = typeof(HtspLiveStream).GetField("SharedHubsByChannelId", PrivateStatic)!;
+        var sharedHubs = (ConcurrentDictionary<string, HtspLiveStream>)sharedHubsField.GetValue(null)!;
+        var releasePlayback = typeof(HtspLiveStream).GetMethod("ReleaseSharedPlaybackReference", PrivateInstance)!;
         var registeredChannelId = Guid.NewGuid().ToString("N");
         var registeredHub = CreateStream(registeredChannelId);
         sharedHubs[registeredChannelId] = registeredHub;
@@ -80,7 +84,13 @@ public sealed class PluginTests
         registeredHub.Dispose();
         Assert(GetInt(registeredHub, "_closeStarted") == 1, "Dispose did not close the unused producer.");
         Assert(!sharedHubs.ContainsKey(registeredChannelId), "Dispose left the shared hub registered.");
+    }
 
+    [Fact]
+    public async Task DisposedProducerReleasesResourcesAfterFinalSharedPlaybackCloses()
+    {
+        var attachPlayback = typeof(HtspLiveStream).GetMethod("TryAttachPlaybackToProducer", PrivateInstance)!;
+        var closeProducerNow = typeof(HtspLiveStream).GetMethod("CloseProducerNow", PrivateInstance)!;
         var deferredHub = CreateStream(Guid.NewGuid().ToString("N"));
         var deferredPlayback = CreateStream(Guid.NewGuid().ToString("N"));
         var deferredOwnerReader = deferredHub.GetStream();
@@ -110,7 +120,11 @@ public sealed class PluginTests
             deferredPlayback.Dispose();
             deferredHub.Dispose();
         }
+    }
 
+    [Fact]
+    public async Task DisposingReaderReleasesReaderCount()
+    {
         using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
         {
             var reader = stream.GetStream();
@@ -119,7 +133,12 @@ public sealed class PluginTests
             Assert(GetInt(stream, "_activeStreamReaders") == 0, "Disposing a reader leaked its count.");
             await stream.Close();
         }
+    }
 
+    [Fact]
+    public void QueueDropsAreReportedWithoutForcingKeyframeWait()
+    {
+        var logQueueStatus = typeof(HtspLiveStream).GetMethod("LogQueueStatus", PrivateInstance)!;
         using (var stream = CreateStream(Guid.NewGuid().ToString("N")))
         {
             var message = new HTSMessage();
@@ -137,7 +156,11 @@ public sealed class PluginTests
                 ((string)GetField(stream, "_lastVideoDamageReason")).Contains("queue dropped frames", StringComparison.Ordinal),
                 "Queue damage reason was not retained.");
         }
+    }
 
+    [Fact]
+    public async Task ConcurrentReaderCreationAndPlaybackCloseDoNotLeakOwnership()
+    {
         for (var i = 0; i < 100; i++)
         {
             using var stream = CreateStream(Guid.NewGuid().ToString("N"));
@@ -151,7 +174,12 @@ public sealed class PluginTests
             Assert(GetPlaybackReferenceCount(stream) == 0, "Concurrent close leaked playback ownership.");
             Assert(ReferenceEquals(stream.GetStream(), Stream.Null), "Concurrent close allowed a late reader.");
         }
+    }
 
+    [Fact]
+    public async Task ConcurrentPlaybackAttachAndCloseDoNotLeakOwnership()
+    {
+        var attachPlayback = typeof(HtspLiveStream).GetMethod("TryAttachPlaybackToProducer", PrivateInstance)!;
         for (var i = 0; i < 100; i++)
         {
             using var hub = CreateStream(Guid.NewGuid().ToString("N"));
@@ -199,6 +227,45 @@ public sealed class PluginTests
 
     [Fact]
     public void PublicImageCacheFlowCoalescesAndPrunes() => AssertPublicImageCacheFlow();
+
+    [Fact]
+    public async Task ConcurrentImageRequestsDoNotRetainCompletedOperation()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tvheadend-concurrent-image-check-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var (plugin, imageEncoder) = ConfigureImageCache(root);
+            var responseHandler = new BlockingImageResponseHandler();
+            using var handler = new HTSConnectionHandler(
+                NullLoggerFactory.Instance,
+                new TestHttpClientFactory(new HttpClient(responseHandler)),
+                imageEncoder);
+            handler.BeginImageRefresh(["channel:concurrent"]);
+
+            var first = handler.CacheImageAsync(
+                "imagecache/concurrent",
+                "channel:concurrent",
+                CancellationToken.None);
+            await responseHandler.Started.WaitAsync(TimeSpan.FromSeconds(5));
+            var second = handler.CacheImageAsync(
+                "imagecache/concurrent",
+                "channel:concurrent",
+                CancellationToken.None);
+            responseHandler.Release();
+
+            var results = await Task.WhenAll(first, second);
+            Assert(responseHandler.RequestCount == 1, "Concurrent image callers started duplicate TVHeadend downloads.");
+            Assert(results[0].ImagePath == results[1].ImagePath, "Concurrent image callers received different cache paths.");
+            Assert(File.Exists(results[0].ImagePath), "The shared image download did not create a local file.");
+            Assert(GetPrivateCollectionCount(handler, "_imageDownloads") == 0, "A completed concurrent image operation remained retained.");
+            Assert(results[0].ImagePath.StartsWith(plugin.ImageCachePath, StringComparison.Ordinal), "The shared image was cached outside the plugin image directory.");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
 
     static HtspLiveStream CreateStream(string channelId)
     {
@@ -484,32 +551,39 @@ public sealed class PluginTests
         return (int)collection.GetType().GetProperty("Count")!.GetValue(collection)!;
     }
 
+    static (Plugin Plugin, IImageEncoder ImageEncoder) ConfigureImageCache(string root)
+    {
+        var applicationPaths = CreateProxy<IApplicationPaths>((method, _) =>
+            method.ReturnType == typeof(string) ? root : GetDefault(method.ReturnType));
+        var xmlSerializer = CreateProxy<IXmlSerializer>((method, arguments) =>
+            method.Name.StartsWith("Deserialize", StringComparison.Ordinal)
+                ? Activator.CreateInstance((Type)arguments[0])
+                : GetDefault(method.ReturnType));
+        var plugin = new Plugin(applicationPaths, xmlSerializer);
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            TVH_ServerName = "tvh",
+            Username = "user",
+            Password = "password"
+        });
+
+        var imageEncoder = CreateProxy<IImageEncoder>((method, _) =>
+            method.Name == nameof(IImageEncoder.GetImageSize)
+                ? new ImageDimensions(1, 1)
+                : GetDefault(method.ReturnType));
+        return (plugin, imageEncoder);
+    }
+
     static void AssertPublicImageCacheFlow()
     {
         var root = Path.Combine(Path.GetTempPath(), "tvheadend-public-image-check-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try
         {
-            var applicationPaths = CreateProxy<IApplicationPaths>((method, _) =>
-                method.ReturnType == typeof(string) ? root : GetDefault(method.ReturnType));
-            var xmlSerializer = CreateProxy<IXmlSerializer>((method, arguments) =>
-                method.Name.StartsWith("Deserialize", StringComparison.Ordinal)
-                    ? Activator.CreateInstance((Type)arguments[0])
-                    : GetDefault(method.ReturnType));
-            var plugin = new Plugin(applicationPaths, xmlSerializer);
-            plugin.UpdateConfiguration(new PluginConfiguration
-            {
-                TVH_ServerName = "tvh",
-                Username = "user",
-                Password = "password"
-            });
+            var (plugin, imageEncoder) = ConfigureImageCache(root);
 
             var responseHandler = new ImageResponseHandler();
             var httpClient = new HttpClient(responseHandler);
-            var imageEncoder = CreateProxy<IImageEncoder>((method, _) =>
-                method.Name == nameof(IImageEncoder.GetImageSize)
-                    ? new ImageDimensions(1, 1)
-                    : GetDefault(method.ReturnType));
             using var handler = new HTSConnectionHandler(
                 NullLoggerFactory.Instance,
                 new TestHttpClientFactory(httpClient),
@@ -599,6 +673,7 @@ public sealed class PluginTests
                 CancellationToken.None).GetAwaiter().GetResult();
             Assert(File.Exists(recovered.ImagePath), "A canceled caller prevented the shared cache download from completing.");
             Assert(blockingResponse.RequestCount == 1, "Retrying after caller cancellation duplicated the TVHeadend download.");
+            Assert(GetPrivateCollectionCount(blockingHandler, "_imageDownloads") == 0, "A completed image operation remained retained after its first caller canceled.");
 
             blockingHandler.CacheImageAsync(
                 null,

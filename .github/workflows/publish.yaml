@@ -5,13 +5,39 @@ on:
     types:
       - released
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Numeric release version, optionally prefixed with v'
+        required: true
+        type: string
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.normalize.outputs.value }}
+    steps:
+      - name: Normalize Release Version
+        id: normalize
+        env:
+          RELEASE_VERSION: ${{ github.event.release.tag_name || inputs.version }}
+        shell: bash
+        run: |-
+          version="${RELEASE_VERSION#v}"
+          if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+            echo "Release version must contain four numeric components: ${RELEASE_VERSION}" >&2
+            exit 1
+          fi
+          echo "value=${version}" >> "${GITHUB_OUTPUT}"
   call:
+    needs:
+      - version
     uses: jellyfin/jellyfin-meta-plugins/.github/workflows/publish.yaml@master
     with:
-      version: ${{ github.event.release.tag_name }}
-      is-unstable: ${{ github.event.release.prerelease }}
+      version: ${{ needs.version.outputs.value }}
+      is-unstable: ${{ github.event_name == 'release' && github.event.release.prerelease || false }}
+      dotnet-version: '10.0.x'
+      dotnet-target: 'net10.0'
     secrets:
       deploy-host: ${{ secrets.REPO_HOST }}
       deploy-user: ${{ secrets.REPO_USER }}

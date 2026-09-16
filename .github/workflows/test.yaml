@@ -1,4 +1,4 @@
-name: '🧪 Test Plugin'
+name: '🧪 Test Manifest Automation'
 
 on:
   push:
@@ -14,8 +14,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  call:
-    uses: jellyfin/jellyfin-meta-plugins/.github/workflows/test.yaml@master
   manifest:
     runs-on: ubuntu-latest
     steps:

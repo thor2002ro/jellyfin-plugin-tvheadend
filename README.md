@@ -80,15 +80,21 @@ and an installable `TVHeadEnd_<version>.zip` archive:
 dotnet build --configuration Release
 ```
 
-Pass `-p:Version=<version>` when an exact version must be reproduced. GitHub
-builds calculate the timestamp in `Europe/Bucharest` and pass that one value to
-the compiler and packager.
+Pass `-p:Version=<version>` when an exact version must be reproduced.
 
 The ZIP contains `TVHeadEnd.dll` and is the asset to use in a Jellyfin plugin
 repository manifest. The standalone DLL remains available for manual installs.
-GitHub releases are built and packaged with
-[Jellyfin Plugin Repository Manager](https://github.com/oddstr13/jellyfin-plugin-repository-manager)
-using the included `build.yaml`.
+
+GitHub Actions does not compile or package the plugin. To publish a release:
+
+1. Build the Release ZIP locally.
+2. Create or open a draft GitHub release for that version.
+3. Upload `TVHeadEnd_<version>.zip` to the draft.
+4. Publish the release only after the upload completes.
+
+Publishing the release triggers the manifest workflow, which downloads and
+validates the uploaded ZIP without replacing or rebuilding it. If the ZIP is
+added after publication, run the manifest workflow manually.
 
 ## Upstream
 

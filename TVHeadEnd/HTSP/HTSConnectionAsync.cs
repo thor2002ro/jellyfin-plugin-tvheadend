@@ -359,7 +359,7 @@ namespace TVHeadEnd.HTSP
                 if (authResponse != null)
                 {
                     Boolean auth = authResponse.getInt("noaccess", 0) != 1;
-                    if (auth)
+                    if (auth && enableAsyncMetadata)
                     {
                         HTSMessage getDiskSpaceMessage = new HTSMessage();
                         getDiskSpaceMessage.Method = "getDiskSpace";
@@ -392,13 +392,10 @@ namespace TVHeadEnd.HTSP
                         HTSMessage sysTimeResponse = SendAndGetResponse(getSysTimeMessage, cancellationToken, responseTimeout, throwOnTimeout);
                         _serverUtcOffsetMinutes = sysTimeResponse?.getInt("gmtoffset", 0) ?? 0;
 
-                        if (enableAsyncMetadata)
-                        {
-                            HTSMessage enableAsyncMetadataMessage = new HTSMessage();
-                            enableAsyncMetadataMessage.Method = "enableAsyncMetadata";
-                            enableAsyncMetadataMessage.putField("epg", 1);
-                            sendMessage(enableAsyncMetadataMessage, null);
-                        }
+                        HTSMessage enableAsyncMetadataMessage = new HTSMessage();
+                        enableAsyncMetadataMessage.Method = "enableAsyncMetadata";
+                        enableAsyncMetadataMessage.putField("epg", 1);
+                        sendMessage(enableAsyncMetadataMessage, null);
                     }
 
                     _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: authenticated = {m}", auth);

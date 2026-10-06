@@ -19,6 +19,9 @@ Jellyfin plugin, with fork-specific changes.
 - HTSP direct streaming with shared upstream subscriptions, independent buffered
   readers, clean-keyframe startup, optional initial tune buffering, and a silent
   stream watchdog.
+  Stream-only connections skip unused disk/time queries. Warm subscriptions
+  drop to low priority after the last viewer leaves and regain viewer priority
+  on reuse, allowing channel switches to reclaim a contended tuner.
 - Broadcast frame rate and aspect ratio, enriched by a short probe of buffered
   HTSP output for interlacing, HDR, bit depth, codec profile, and bitrate. The
   probe keeps the complete track list, opens no additional tuner subscription,

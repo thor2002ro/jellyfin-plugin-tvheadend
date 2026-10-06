@@ -53,6 +53,8 @@ namespace TVHeadEnd
         private const int MinStallWatchdogSeconds = 5;
         private const int MaxStallWatchdogSeconds = 120;
         private const int MaxHtspQueueDepth = 20 * MiB;
+        private const int PlaybackSubscriptionWeight = 100;
+        private const int IdleSubscriptionWeight = 1;
         private const int SignalErrorWindowSeconds = 5;
         private const int SignalRecoveryAttemptWindowSeconds = 60;
 
@@ -99,6 +101,7 @@ namespace TVHeadEnd
         private CancellationTokenSource _stallWatchdogCancellationTokenSource;
         private Task _stallWatchdogTask;
         private HTSConnectionAsync _connection;
+        private int? _subscriptionWeight;
         private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
         private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
         private int _subscriptionId;
@@ -533,6 +536,7 @@ namespace TVHeadEnd
                 lock (_connectionStateLock)
                 {
                     _connection = connection;
+                    _subscriptionWeight = null;
                 }
 
                 connection.open(hostname, port, cancellationToken, maxAttempts: 1);
@@ -564,6 +568,15 @@ namespace TVHeadEnd
                 }
 
                 ParseSubscribeResponse(await subscribeTask.ConfigureAwait(false));
+                lock (_sharedReferenceLock)
+                {
+                    lock (_connectionStateLock)
+                    {
+                        if (ReferenceEquals(_connection, connection))
+                            _subscriptionWeight = (int)subscribe.GetField("weight");
+                    }
+                    UpdateSubscriptionWeightLocked();
+                }
 
                 if (waitForMuxPacket)
                 {
@@ -599,7 +612,7 @@ namespace TVHeadEnd
             var subscribe = new HTSMessage { Method = "subscribe" };
             subscribe.putField("channelId", HtspFieldHelper.ParseUInt32Id(_channelId, "channelId"));
             subscribe.putField("subscriptionId", _subscriptionId);
-            subscribe.putField("weight", 100);
+            subscribe.putField("weight", GetSharedPlaybackReferenceCount() > 0 ? PlaybackSubscriptionWeight : IdleSubscriptionWeight);
             subscribe.putField("90khz", 1);
             subscribe.putField("normts", 1);
 
@@ -1189,10 +1202,26 @@ namespace TVHeadEnd
                 CancelSharedHubIdleCloseLocked();
                 if (wasEmpty)
                 {
+                    UpdateSubscriptionWeightLocked();
                     MarkPlayableMuxPacketReceived();
                 }
 
                 return true;
+            }
+        }
+
+        // Call while holding _sharedReferenceLock so a departing viewer cannot lower a reused hub's priority.
+        private void UpdateSubscriptionWeightLocked()
+        {
+            lock (_connectionStateLock)
+            {
+                var weight = _sharedPlaybackReferences.Count > 0 ? PlaybackSubscriptionWeight : IdleSubscriptionWeight;
+                if (_closing || _connection == null || !_subscriptionWeight.HasValue || _subscriptionWeight == weight) return;
+                var request = new HTSMessage { Method = "subscriptionChangeWeight" };
+                request.putField("subscriptionId", _subscriptionId);
+                request.putField("weight", weight);
+                _connection.sendMessage(request, null);
+                _subscriptionWeight = weight;
             }
         }
 
@@ -1383,6 +1412,7 @@ namespace TVHeadEnd
                 }
 
                 CancelSharedHubIdleCloseLocked();
+                UpdateSubscriptionWeightLocked();
                 idleCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellationTokenSource.Token);
                 _sharedHubIdleCloseCancellationTokenSource = idleCts;
             }
@@ -4050,6 +4080,7 @@ namespace TVHeadEnd
             {
                 connection = _connection;
                 _connection = null;
+                _subscriptionWeight = null;
             }
 
             if (connection == null)

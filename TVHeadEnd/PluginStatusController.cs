@@ -74,6 +74,8 @@ namespace TVHeadEnd
 
     public sealed class PluginRuntimeStatus
     {
+        public bool UseNativeTuners { get; set; }
+        public IReadOnlyList<NativeServerStatus> NativeServers { get; set; } = [];
         public DateTime GeneratedUtc { get; set; }
         public string PluginVersion { get; set; }
         public string StreamingMethod { get; set; }
@@ -111,9 +113,11 @@ namespace TVHeadEnd
     public sealed class PluginStatusController : ControllerBase
     {
         private readonly HTSConnectionHandler _connectionHandler;
+        private readonly NativeTunerHost _nativeHost;
 
-        public PluginStatusController(HTSConnectionHandler connectionHandler)
+        public PluginStatusController(HTSConnectionHandler connectionHandler, NativeTunerHost nativeHost = null)
         {
+            _nativeHost = nativeHost;
             _connectionHandler = connectionHandler;
         }
 
@@ -123,15 +127,18 @@ namespace TVHeadEnd
             var configuration = Plugin.Instance?.Configuration;
             var runningChannels = HtspLiveStream.GetRunningChannelStatuses();
             var connection = _connectionHandler.GetConnectionStatus();
+            var nativeServers = _nativeHost?.GetServerStatuses() ?? [];
             return Ok(new PluginRuntimeStatus
             {
+                UseNativeTuners = _nativeHost != null,
+                NativeServers = nativeServers,
                 GeneratedUtc = DateTime.UtcNow,
                 PluginVersion = typeof(Plugin).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
                     ?? typeof(Plugin).Assembly.GetName().Version?.ToString()
                     ?? "unknown",
                 StreamingMethod = configuration?.StreamingMethod ?? string.Empty,
                 Server = configuration == null ? string.Empty : configuration.TVH_ServerName + ":" + configuration.HTSP_Port,
-                Connected = connection.Connected,
+                Connected = _nativeHost == null ? connection.Connected : nativeServers.Any(server => server.Connected),
                 ServerVersion = connection.ServerVersion,
                 HtspProtocolVersion = connection.ProtocolVersion,
                 RunningChannelCount = runningChannels.Count,

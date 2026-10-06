@@ -10,6 +10,26 @@ namespace TVHeadEnd.Configuration
     {
         public const int DefaultHTSPQueueDepth = 10 * 1024 * 1024;
 
+        public bool UseNativeTuners { get; set; }
+        public NativeServerConfiguration[] NativeServers { get; set; } = [];
+
+        public PluginConfiguration ForServer(NativeServerConfiguration server)
+        {
+            server.Validate();
+            var copy = (PluginConfiguration)MemberwiseClone();
+            copy.TVH_ServerName = server.Host.Trim();
+            copy.HTSP_Port = server.HtspPort;
+            copy.HTTP_Port = server.HttpPort;
+            copy.UseHttps = server.UseHttps;
+            copy.WebRoot = server.WebRoot;
+            copy.Username = server.Username;
+            copy.Password = server.Password;
+            copy.Profile = server.Profile;
+            copy.StreamingMethod = server.StreamingMethod;
+            copy.TVH_TimeZoneId = server.TimeZoneId;
+            return copy;
+        }
+
         public string TVH_ServerName { get; set; }
 		public string TVH_TimeZoneId { get; set; }
 		public string RecordingStreamSecret { get; set; }

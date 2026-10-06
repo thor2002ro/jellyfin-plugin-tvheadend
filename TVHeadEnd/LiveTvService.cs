@@ -30,6 +30,9 @@ namespace TVHeadEnd
     public class LiveTvService : ILiveTvService, ISupportsDirectStreamProvider
     {
         private readonly IMediaEncoder _mediaEncoder;
+        private readonly PluginConfiguration _configuration;
+        internal string NativeServerId { get; }
+        internal PluginConfiguration Configuration => _configuration ?? Plugin.Instance?.Configuration;
 
         private readonly TimeSpan _timeout = TimeSpan.FromMinutes(5);
 
@@ -52,8 +55,11 @@ namespace TVHeadEnd
             HTSConnectionHandler connectionHandler,
             IServerApplicationHost appHost,
             IHttpContextAccessor httpContextAccessor,
-            ILibraryManager libraryManager)
+            ILibraryManager libraryManager,
+            PluginConfiguration configuration = null, string nativeServerId = null)
         {
+            NativeServerId = nativeServerId;
+            _configuration = configuration;
             _loggerFactory = loggerFactory;
             _appHost = appHost;
             _httpContextAccessor = httpContextAccessor;
@@ -77,10 +83,10 @@ namespace TVHeadEnd
 
         public string HomePageUrl { get { return "http://tvheadend.org/"; } }
 
-        public string Name { get { return "TVHclient LiveTvService"; } }
+        public string Name { get { return NativeServerId == null ? "TVHclient LiveTvService" : "Emby"; } }
 
         internal HtspLiveStream CreateCaptureStream(long channelId) => new(new MediaSourceInfo(),
-            channelId.ToString(CultureInfo.InvariantCulture), _loggerFactory, null, null);
+            channelId.ToString(CultureInfo.InvariantCulture), _loggerFactory, null, null, configuration: _configuration);
 
         public async Task CancelSeriesTimerAsync(string timerId, CancellationToken cancellationToken)
         {
@@ -194,7 +200,7 @@ namespace TVHeadEnd
             createTimerMessage.putField("configName", _htsConnectionHandler.GetProfile());
             createTimerMessage.putField("description", info.Overview);
             createTimerMessage.putField("title", info.Name);
-            createTimerMessage.putField("creator", Plugin.Instance.Configuration.Username);
+            createTimerMessage.putField("creator", Configuration.Username);
 
             HTSMessage createTimerResponse;
             try
@@ -385,6 +391,8 @@ namespace TVHeadEnd
         public async Task<MediaSourceInfo> GetChannelStream(string channelId, string mediaSourceId, CancellationToken cancellationToken)
         {
             var streamingMethod = _htsConnectionHandler.GetStreamingMethod();
+            // Jellyfin's native TS recorder does not forward HTTP headers; the existing ticket authenticates both playback and recording.
+            if (NativeServerId != null && streamingMethod == StreamingMethods.HttpBasic) streamingMethod = StreamingMethods.HttpTicket;
             if (streamingMethod == StreamingMethods.Htsp)
             {
                 _logger.LogInformation(
@@ -445,7 +453,7 @@ namespace TVHeadEnd
             {
                 try
                 {
-                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), _htsConnectionHandler.ResolveChannelId(channelId).ToString(), _loggerFactory, _appHost, _httpContextAccessor, _mediaEncoder);
+                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), _htsConnectionHandler.ResolveChannelId(channelId).ToString(), _loggerFactory, _appHost, _httpContextAccessor, _mediaEncoder, _configuration);
                     await stream.Open(cancellationToken).ConfigureAwait(false);
                     return stream;
                 }
@@ -509,7 +517,7 @@ namespace TVHeadEnd
             return Convert.ToHexString(HMACSHA256.HashData(secret, Encoding.UTF8.GetBytes(recordingId)));
         }
 
-        private static string GetStableHtspMediaSourceId(string channelId)
+        internal static string GetStableHtspMediaSourceId(string channelId)
         {
             var normalizedChannelId = string.IsNullOrWhiteSpace(channelId) ? string.Empty : channelId.Trim();
             var hash = SHA256.HashData(Encoding.UTF8.GetBytes("tvheadend-htsp:" + normalizedChannelId));
@@ -712,8 +720,8 @@ namespace TVHeadEnd
             cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(new SeriesTimerInfo
             {
-                PostPaddingSeconds = Plugin.Instance.Configuration.Post_Padding,
-                PrePaddingSeconds = Plugin.Instance.Configuration.Pre_Padding,
+                PostPaddingSeconds = Configuration.Post_Padding,
+                PrePaddingSeconds = Configuration.Pre_Padding,
                 Priority = _htsConnectionHandler.GetPriority(),
                 RecordAnyChannel = true,
                 RecordAnyTime = true,
@@ -753,10 +761,10 @@ namespace TVHeadEnd
                 program.ImageUrl = image.ImageUrl;
                 program.HasImage = !string.IsNullOrEmpty(program.ImagePath)
                     || !string.IsNullOrEmpty(program.ImageUrl);
-                if (!broadcasterHasImage && program.HasImage != true && Plugin.Instance?.Configuration.GenerateMissingProgrammeImages == true
-                    && ProgrammeImageService.CurrentConnectionIdentity == _htsConnectionHandler.GetProgrammeConnectionIdentity())
+                if (!broadcasterHasImage && program.HasImage != true && Configuration?.GenerateMissingProgrammeImages == true
+                    && ProgrammeImageService.GetConnectionIdentity(Configuration.TVH_ServerName, Configuration.HTSP_Port, Configuration.Username) == _htsConnectionHandler.GetProgrammeConnectionIdentity())
                 {
-                    var generated = ProgrammeImageService.GetImagePath(_htsConnectionHandler.ResolveChannelId(channelId), program.Id, program.StartDate);
+                    var generated = ProgrammeImageService.GetImagePathForConnection(_htsConnectionHandler.ResolveChannelId(channelId), program.Id, program.StartDate, _htsConnectionHandler.GetProgrammeConnectionIdentity());
                     if (File.Exists(generated))
                     {
                         program.ImagePath = generated;

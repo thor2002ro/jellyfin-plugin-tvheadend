@@ -10,6 +10,25 @@ Jellyfin plugin, with fork-specific changes.
 
 ## What It Includes
 
+- Optional native Jellyfin tuners for multiple TVHeadend servers. Select
+  **Recording backend > Jellyfin DVR**, add each server using the connection fields
+  and **Add / update server**, then **Save** and restart Jellyfin. A native tuner and
+  guide provider are registered automatically for each server; no manual guide mapping is needed.
+  Server edits and mode changes require restart. Native mode uses Jellyfin's
+  recording scheduler and recording directory; integrated mode remains the default
+  and uses TVHeadend DVR. Existing schedules and recordings are not migrated.
+  Native HTTP streams use TVHeadend ticket URLs so both playback and Jellyfin's
+  TS recorder authenticate correctly, including when HTTP Basic is selected.
+  HTSP keeps shared streams, track languages, recovery and programme thumbnails.
+  Each server has scoped channel/programme IDs and connections; native channel
+  enumeration is cached for five minutes and refreshed by a full guide refresh.
+  The tuner card uses a clean endpoint URL; its stable server ID is stored in
+  Jellyfin's device field. Switching to TVHeadend DVR removes generated native
+  dashboard entries and retains the saved native servers.
+  Stock Jellyfin-web shows each guide's server name on its secondary line.
+  Its hard-coded provider-type heading remains "Unknown" for custom providers;
+  no custom frontend is needed for server labels, tuning, EPG or recording.
+
 - Jellyfin Live TV backed by TVHeadend channels, EPG data, timers, series
   timers, and recordings.
 - TVHeadend recording management from Jellyfin, including DVR profiles,

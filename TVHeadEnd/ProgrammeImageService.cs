@@ -30,6 +30,11 @@ public sealed class ProgrammeImageService(
     ILibraryManager libraryManager,
     ILogger<ProgrammeImageService> logger) : BackgroundService
 {
+    internal bool ExtractionRunning => _activeExtraction is { IsCompleted: false };
+    internal DateTime LastBackgroundCaptureUtc => _lastBackgroundCaptureUtc;
+    private Configuration.PluginConfiguration Configuration => liveTvService.Configuration;
+    private string Identity => Configuration == null ? null : GetConnectionIdentity(Configuration.TVH_ServerName, Configuration.HTSP_Port, Configuration.Username);
+    private string LibraryChannelId(string rawId) => liveTvService.NativeServerId == null ? rawId : NativeTunerHost.Prefix(liveTvService.NativeServerId) + rawId;
     private Task<string> _activeExtraction;
     private DateTime _lastBackgroundCaptureUtc;
     private readonly Queue<long> _backgroundCandidates = new();
@@ -53,35 +58,39 @@ public sealed class ProgrammeImageService(
         }
     }
 
-    internal static string GetImagePath(long channelId, string eventId, DateTime start)
+    internal static string GetImagePath(long channelId, string eventId, DateTime start) => GetImagePathForConnection(channelId, eventId, start, CurrentConnectionIdentity);
+
+    internal static string GetImagePathForConnection(long channelId, string eventId, DateTime start, string identity)
     {
         var plugin = Plugin.Instance;
         if (plugin == null) return null;
-        var key = string.Join("|", CurrentConnectionIdentity, channelId.ToString(CultureInfo.InvariantCulture), eventId, start.Ticks.ToString(CultureInfo.InvariantCulture));
+        var key = string.Join("|", identity, channelId.ToString(CultureInfo.InvariantCulture), eventId, start.Ticks.ToString(CultureInfo.InvariantCulture));
         return Path.Combine(plugin.ImageCachePath, "programme-frame-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))) + ".jpg");
     }
 
-    internal async Task CaptureMissingImagesAsync(CancellationToken token)
+    internal Task CaptureMissingImagesAsync(CancellationToken token) => CaptureMissingImagesForServerAsync(token, true);
+
+    internal async Task CaptureMissingImagesForServerAsync(CancellationToken token, bool allowBackgroundCapture)
     {
-        if (Plugin.Instance?.Configuration.GenerateMissingProgrammeImages != true || _activeExtraction is { IsCompleted: false }) return;
-        var identity = CurrentConnectionIdentity;
-        bool StillCurrent() => identity == CurrentConnectionIdentity && identity == connectionHandler.GetProgrammeConnectionIdentity();
+        if (Configuration?.GenerateMissingProgrammeImages != true || _activeExtraction is { IsCompleted: false }) return;
+        var identity = Identity;
+        bool StillCurrent() => identity == Identity && identity == connectionHandler.GetProgrammeConnectionIdentity();
         if (!StillCurrent()) return;
-        var channelIds = HtspLiveStream.GetWatchedChannelIds();
-        if (channelIds.Length == 0 && Plugin.Instance.Configuration.CaptureUnwatchedProgrammeImages
+        var channelIds = HtspLiveStream.GetWatchedChannelIdsForConnection(identity);
+        if (channelIds.Length == 0 && allowBackgroundCapture && Configuration.CaptureUnwatchedProgrammeImages
             && DateTime.UtcNow - _lastBackgroundCaptureUtc >= TimeSpan.FromMinutes(1))
         {
             var available = libraryManager.GetItemList(new InternalItemsQuery { IncludeItemTypes = [BaseItemKind.LiveTvChannel] })
-                .OfType<LiveTvChannel>().Where(item => item.ServiceName == liveTvService.Name && item.ChannelType != ChannelType.Radio)
+                .OfType<LiveTvChannel>().Where(item => item.ServiceName == liveTvService.Name && item.ChannelType != ChannelType.Radio && (liveTvService.NativeServerId == null || item.ExternalId.StartsWith(NativeTunerHost.Prefix(liveTvService.NativeServerId), StringComparison.Ordinal)))
                 .OrderBy(item => item.ExternalId, StringComparer.Ordinal).ToArray();
-            var resolved = connectionHandler.ResolveChannelIds(available.Select(item => item.ExternalId));
+            var resolved = connectionHandler.ResolveChannelIds(available.Select(item => liveTvService.NativeServerId == null ? item.ExternalId : item.ExternalId[NativeTunerHost.Prefix(liveTvService.NativeServerId).Length..]));
             var candidate = GetNextBackgroundChannel(resolved, identity);
             if (candidate.HasValue) channelIds = [candidate.Value];
         }
         foreach (var channelId in channelIds)
         {
             token.ThrowIfCancellationRequested();
-            if (Plugin.Instance?.Configuration.GenerateMissingProgrammeImages != true || !StillCurrent() || _activeExtraction is { IsCompleted: false }) return;
+            if (Configuration?.GenerateMissingProgrammeImages != true || !StillCurrent() || _activeExtraction is { IsCompleted: false }) return;
             string samplePath = null, extractedPath = null, stagingPath = null, stampedPath = null, backupPath = null, imagePath = null;
             var published = false;
             var replaced = false;
@@ -96,14 +105,14 @@ public sealed class ProgrammeImageService(
                 if (epg == null || !string.IsNullOrWhiteSpace(epg.getString("image", string.Empty))) continue;
                 var start = DateTimeOffset.FromUnixTimeSeconds(epg.getLong("start")).UtcDateTime;
                 var eventId = epg.getLong("eventId").ToString(CultureInfo.InvariantCulture);
-                var path = GetImagePath(channelId, eventId, start);
+                var path = GetImagePathForConnection(channelId, eventId, start, identity);
                 imagePath = path;
                 var channel = libraryManager.GetItemList(new InternalItemsQuery {
-                    IncludeItemTypes = [BaseItemKind.LiveTvChannel], ExternalId = connectionHandler.GetExternalChannelId(channelId)
+                    IncludeItemTypes = [BaseItemKind.LiveTvChannel], ExternalId = LibraryChannelId(connectionHandler.GetExternalChannelId(channelId))
                 }).OfType<LiveTvChannel>().FirstOrDefault(item => item.ServiceName == liveTvService.Name);
                 if (channel == null) continue;
                 var programme = libraryManager.GetItemList(new InternalItemsQuery {
-                    IncludeItemTypes = [BaseItemKind.LiveTvProgram], ChannelIds = [channel.Id], ExternalId = eventId
+                    IncludeItemTypes = [BaseItemKind.LiveTvProgram], ChannelIds = [channel.Id], ExternalId = liveTvService.NativeServerId == null ? eventId : NativeTunerHost.Prefix(liveTvService.NativeServerId) + eventId + "_" + channel.ExternalId
                 }).OfType<LiveTvProgram>().FirstOrDefault(item => item.StartDate == start);
                 if (programme == null || (programme.HasImage(ImageType.Primary)
                     && programme.GetImageInfo(ImageType.Primary, 0)?.Path != path)) continue;
@@ -116,7 +125,7 @@ public sealed class ProgrammeImageService(
                     timeout.CancelAfter(TimeSpan.FromSeconds(20));
                     if (!HtspLiveStream.TryGetWatchedSample(channelId, start, identity, out var chunks, out var video))
                     {
-                        if (!Plugin.Instance.Configuration.CaptureUnwatchedProgrammeImages || HtspLiveStream.GetWatchedChannelIds().Length > 0
+                        if (!allowBackgroundCapture || !Configuration.CaptureUnwatchedProgrammeImages || HtspLiveStream.GetWatchedChannelIds().Length > 0
                             || DateTime.UtcNow - _lastBackgroundCaptureUtc < TimeSpan.FromMinutes(1)) continue;
                         _lastBackgroundCaptureUtc = DateTime.UtcNow;
                         captureStream = liveTvService.CreateCaptureStream(channelId);
@@ -124,7 +133,7 @@ public sealed class ProgrammeImageService(
                         while (!captureStream.TryGetBufferedSample(start, identity, out chunks, out video))
                         {
                             if (captureStream.IsCaptureClosed) throw new IOException("HTSP programme capture stopped before a keyframe arrived.");
-                            if (!Plugin.Instance.Configuration.GenerateMissingProgrammeImages || !Plugin.Instance.Configuration.CaptureUnwatchedProgrammeImages
+                            if (!Configuration.GenerateMissingProgrammeImages || !Configuration.CaptureUnwatchedProgrammeImages
                                 || !StillCurrent() || HtspLiveStream.GetWatchedChannelIds().Length > 0) break;
                             await Task.Delay(100, timeout.Token).ConfigureAwait(false);
                         }
@@ -152,7 +161,7 @@ public sealed class ProgrammeImageService(
                     var size = new FileInfo(extractedPath).Length;
                     if (size is <= 0 or > 20 * 1024 * 1024) continue;
                     connectionHandler.ValidateImage(extractedPath);
-                    if (Plugin.Instance?.Configuration.GenerateMissingProgrammeImages != true || !StillCurrent()) continue;
+                    if (Configuration?.GenerateMissingProgrammeImages != true || !StillCurrent()) continue;
                     var logo = channel.GetImageInfo(ImageType.Primary, 0)?.Path;
                     if (File.Exists(logo))
                     {
@@ -163,11 +172,11 @@ public sealed class ProgrammeImageService(
                     Directory.CreateDirectory(Path.GetDirectoryName(path));
                     stagingPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                     File.Copy(stampedPath ?? extractedPath, stagingPath);
-                    if (Plugin.Instance?.Configuration.GenerateMissingProgrammeImages != true || !StillCurrent()) continue;
+                    if (Configuration?.GenerateMissingProgrammeImages != true || !StillCurrent()) continue;
                 }
 
                 now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                if (Plugin.Instance?.Configuration.GenerateMissingProgrammeImages != true || !StillCurrent()
+                if (Configuration?.GenerateMissingProgrammeImages != true || !StillCurrent()
                     || (programme.HasImage(ImageType.Primary) && programme.GetImageInfo(ImageType.Primary, 0)?.Path != path)
                     || !connectionHandler.GetCachedEvents(channelId, now, now).Any(item => item.getLong("eventId").ToString(CultureInfo.InvariantCulture) == eventId
                         && item.getLong("start") == epg.getLong("start") && item.getLong("stop") > now

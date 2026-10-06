@@ -41,6 +41,8 @@ namespace TVHeadEnd
 
             configuration.Username = current?.Username ?? string.Empty;
             configuration.Password = current?.Password ?? string.Empty;
+            configuration.NativeServers = current?.NativeServers ?? [];
+            configuration.UseNativeTuners = current?.UseNativeTuners ?? false;
             configuration.RecordingStreamSecret = string.IsNullOrWhiteSpace(current?.RecordingStreamSecret)
                 ? Convert.ToHexString(RandomNumberGenerator.GetBytes(32))
                 : current.RecordingStreamSecret;

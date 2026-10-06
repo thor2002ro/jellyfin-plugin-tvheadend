@@ -39,6 +39,7 @@ namespace TVHeadEnd
         private static readonly TimeSpan ImageCacheRetention = TimeSpan.FromDays(90);
 
         private readonly ILoggerFactory _loggerFactory;
+        private readonly PluginConfiguration _configuration;
         private readonly ILogger<HTSConnectionHandler> _logger;
         private readonly HttpClient _httpClient;
         private readonly IImageEncoder _imageEncoder;
@@ -92,8 +93,10 @@ namespace TVHeadEnd
             ILoggerFactory loggerFactory,
             IHttpClientFactory httpClientFactory,
             IImageEncoder imageEncoder,
-            ITaskManager taskManager = null)
+            ITaskManager taskManager = null,
+            PluginConfiguration configuration = null)
         {
+            _configuration = configuration;
             _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger<HTSConnectionHandler>();
             _httpClient = httpClientFactory.CreateClient();
@@ -146,7 +149,7 @@ namespace TVHeadEnd
             }
             _logger.LogDebug("[TVHclient] HTSConnectionHandler - Init()");
 
-            var config = Plugin.Instance.Configuration;
+            var config = _configuration ?? Plugin.Instance.Configuration;
 
             _logger.LogDebug("[TVHclient] HTSConnectionHandler - Config initialized");
 
@@ -402,7 +405,7 @@ namespace TVHeadEnd
                 return (null, resolvedUrl);
             }
 
-            cacheKey ??= resolvedUrl;
+            cacheKey ??= _configuration == null ? resolvedUrl : GetProgrammeConnectionIdentity() + "|" + resolvedUrl;
             var cacheDirectory = GetImageCacheDirectory();
             var cachedPath = FindCachedImage(cacheDirectory, cacheKey);
             var sourceFingerprint = GetImageFilePrefix(resolvedUrl);

@@ -11,8 +11,9 @@ namespace TVHeadEnd
     {
         private readonly Func<Task> _close;
 
-        public MediaSourceLiveStream(MediaSourceInfo mediaSource, Func<Task> close)
+        public MediaSourceLiveStream(MediaSourceInfo mediaSource, Func<Task> close, string tunerHostId = null)
         {
+            TunerHostId = tunerHostId;
             MediaSource = mediaSource;
             _close = close;
             ConsumerCount = 1;
@@ -24,7 +25,7 @@ namespace TVHeadEnd
 
         public string OriginalStreamId { get; set; }
 
-        public string TunerHostId => null;
+        public string TunerHostId { get; }
 
         public bool EnableStreamSharing { get; set; }
 

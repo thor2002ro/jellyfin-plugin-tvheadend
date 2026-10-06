@@ -19,6 +19,7 @@ using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using TVHeadEnd.Configuration;
 using TVHeadEnd.Helper;
 using TVHeadEnd.HTSP;
 
@@ -225,8 +226,10 @@ namespace TVHeadEnd
             return SharedHubsByChannelId.TryRemove(new KeyValuePair<string, HtspLiveStream>(channelId, hub));
         }
 
-        public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor, IMediaEncoder mediaEncoder = null)
+        public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor, IMediaEncoder mediaEncoder = null, PluginConfiguration configuration = null, string tunerHostId = null)
         {
+            _configuration = configuration;
+            _tunerHostId = tunerHostId;
             MediaSource = mediaSource;
             _channelId = channelId;
             _loggerFactory = loggerFactory;
@@ -245,7 +248,14 @@ namespace TVHeadEnd
 
         public string OriginalStreamId { get; set; }
 
-        public string TunerHostId => null;
+        private readonly PluginConfiguration _configuration;
+        private readonly string _tunerHostId;
+        private PluginConfiguration Configuration => _configuration ?? Plugin.Instance?.Configuration;
+        private string _sharingKey;
+        private string SharingKey => _sharingKey ??= Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new object[] {
+            Configuration?.TVH_ServerName?.Trim().ToLowerInvariant(), Configuration?.HTSP_Port,
+            Configuration?.Username?.Trim(), Configuration?.Password?.Trim(), Configuration?.Profile?.Trim(), _channelId }))));
+        public string TunerHostId => _tunerHostId;
 
         public bool EnableStreamSharing { get; set; }
 
@@ -259,7 +269,7 @@ namespace TVHeadEnd
         internal async Task OpenCaptureAsync(CancellationToken token)
         {
             _captureOnly = true;
-            var config = Plugin.Instance.Configuration;
+            var config = Configuration;
             await ConnectAndSubscribeAsync(config.TVH_ServerName.Trim(), config.HTSP_Port, config.Username.Trim(),
                 config.Password.Trim(), config.Profile?.Trim(), token, waitForMuxPacket: false).ConfigureAwait(false);
         }
@@ -302,7 +312,7 @@ namespace TVHeadEnd
         {
             using var openLifetime = CancellationTokenSource.CreateLinkedTokenSource(openCancellationToken, _lifetimeCancellationTokenSource.Token);
             var openToken = openLifetime.Token;
-            var config = Plugin.Instance.Configuration;
+            var config = Configuration;
             var hostname = config.TVH_ServerName.Trim();
             var username = config.Username.Trim();
             var password = config.Password.Trim();
@@ -369,11 +379,11 @@ namespace TVHeadEnd
         {
             while (true)
             {
-                if (SharedHubsByChannelId.TryGetValue(_channelId, out var existingHub))
+                if (SharedHubsByChannelId.TryGetValue(SharingKey, out var existingHub))
                 {
                     if (!existingHub.IsSharedHubUsable)
                     {
-                        RemoveSharedHub(_channelId, existingHub);
+                        RemoveSharedHub(SharingKey, existingHub);
                         continue;
                     }
 
@@ -429,7 +439,7 @@ namespace TVHeadEnd
                 catch
                 {
                     ReleaseSharedPlaybackReference(UniqueId, "failed to open shared channel hub");
-                    RemoveSharedHub(_channelId, this);
+                    RemoveSharedHub(SharingKey, this);
                     _registeredAsSharedHub = false;
                     _sharedProducer = null;
                     await CloseProducerNow("failed to open shared channel hub").ConfigureAwait(false);
@@ -654,15 +664,15 @@ namespace TVHeadEnd
             return subscribe;
         }
 
-        private static int GetConfiguredQueueDepth()
+        private int GetConfiguredQueueDepth()
         {
-            var configured = Plugin.Instance?.Configuration?.HTSPQueueDepth ?? 0;
+            var configured = Configuration?.HTSPQueueDepth ?? 0;
             return Math.Max(0, Math.Min(MaxHtspQueueDepth, configured));
         }
 
-        private static int GetConfiguredStallTimeoutSeconds()
+        private int GetConfiguredStallTimeoutSeconds()
         {
-            var configured = Plugin.Instance?.Configuration?.HTSPStallTimeoutSeconds ?? 0;
+            var configured = Configuration?.HTSPStallTimeoutSeconds ?? 0;
             if (configured <= 0)
             {
                 return 0;
@@ -689,7 +699,7 @@ namespace TVHeadEnd
                 capabilities.Count > 0 ? string.Join(",", capabilities.OrderBy(i => i, StringComparer.OrdinalIgnoreCase)) : "<none>",
                 string.IsNullOrWhiteSpace(connection.getServerWebRoot()) ? "/" : connection.getServerWebRoot());
 
-            if ((Plugin.Instance?.Configuration?.HTSPFilterControlStreams ?? false)
+            if ((Configuration?.HTSPFilterControlStreams ?? false)
                 && connection.getNegotiatedProtocolVersion() < 12)
             {
                 _logger.LogWarning(
@@ -786,7 +796,7 @@ namespace TVHeadEnd
 
             if (_registeredAsSharedHub)
             {
-                RemoveSharedHub(_channelId, this);
+                RemoveSharedHub(SharingKey, this);
                 _registeredAsSharedHub = false;
             }
 
@@ -1271,7 +1281,7 @@ namespace TVHeadEnd
                     throw new ObjectDisposedException(nameof(HtspLiveStream));
                 }
 
-                if (registerAsSharedHub && !SharedHubsByChannelId.TryAdd(_channelId, this))
+                if (registerAsSharedHub && !SharedHubsByChannelId.TryAdd(SharingKey, this))
                 {
                     return false;
                 }
@@ -1280,7 +1290,7 @@ namespace TVHeadEnd
                 {
                     if (registerAsSharedHub)
                     {
-                        RemoveSharedHub(_channelId, this);
+                        RemoveSharedHub(SharingKey, this);
                     }
 
                     return false;
@@ -1710,7 +1720,7 @@ namespace TVHeadEnd
                     {
                         await Task.Delay(delay, _lifetimeCancellationTokenSource.Token).ConfigureAwait(false);
 
-                        var config = Plugin.Instance.Configuration;
+                        var config = Configuration;
                         await ConnectAndSubscribeAsync(
                             config.TVH_ServerName.Trim(),
                             config.HTSP_Port,
@@ -2692,7 +2702,7 @@ namespace TVHeadEnd
 
         private void RequestControlStreamFilter(IReadOnlyCollection<HtspTransportStreamMuxer.StreamInfo> droppedStreams)
         {
-            if (!(Plugin.Instance?.Configuration?.HTSPFilterControlStreams ?? false)
+            if (!(Configuration?.HTSPFilterControlStreams ?? false)
                 || droppedStreams == null
                 || droppedStreams.Count == 0
                 || Volatile.Read(ref _lastFilteredSubscriptionId) == _subscriptionId)
@@ -2913,7 +2923,7 @@ namespace TVHeadEnd
             // with only the tracks that happened to emit packets during the probe window.
             MediaSource.SupportsProbing = false;
 
-            var config = Plugin.Instance?.Configuration;
+            var config = Configuration;
             _metadataCacheKey = JsonSerializer.Serialize(new {
                 config?.TVH_ServerName, config?.HTSP_Port, config?.Username, config?.Profile, Channel = _channelId });
             // Include codec headers: a channel can change format without changing its ID or resolution.
@@ -3049,10 +3059,21 @@ namespace TVHeadEnd
             return stream.Index + ":" + codec + language + title;
         }
 
-        internal static long[] GetWatchedChannelIds()
+        internal static long[] GetWatchedChannelIds() => GetWatchedChannelIdsForConnection(null);
+
+        internal static async Task CloseNativeStreamsAsync()
+        {
+            foreach (var producer in RunningChannelsByUniqueId.Values.Where(stream => stream._tunerHostId != null).ToArray())
+            {
+                await producer.CloseProducerNow("native tuner stopped").ConfigureAwait(false);
+                producer.Dispose();
+            }
+        }
+
+        internal static long[] GetWatchedChannelIdsForConnection(string identity)
         {
             return RunningChannelsByUniqueId.Values
-                .Where(stream => !stream._closing && Volatile.Read(ref stream._activeStreamReaders) > 0)
+                .Where(stream => !stream._closing && Volatile.Read(ref stream._activeStreamReaders) > 0 && (identity == null || stream._serverIdentity == identity))
                 .Select(stream => long.TryParse(stream._channelId, out var id) ? id : -1)
                 .Where(id => id >= 0).Distinct().ToArray();
         }
@@ -3216,7 +3237,7 @@ namespace TVHeadEnd
             {
                 if (stream.Type == MediaStreamType.Video)
                 {
-                    if (Plugin.Instance?.Configuration?.ForceDeinterlace == true) stream.IsInterlaced = true;
+                    if (Configuration?.ForceDeinterlace == true) stream.IsInterlaced = true;
                     if (!(stream.BitRate > 0) && stream.Width > 0 && stream.Height > 0)
                     {
                         // Estimate only when the probe has no rate; avoid Jellyfin's oversized live-TV fallback.
@@ -3899,7 +3920,7 @@ namespace TVHeadEnd
                 _sourceMux = source.getString("mux", string.Empty);
                 _sourceProvider = source.getString("provider", string.Empty);
                 _sourceMuxIdentity = GetMuxIdentity(source);
-                if (_serverIdentity == ProgrammeImageService.CurrentConnectionIdentity && long.TryParse(_channelId, out var channelId))
+                if (_serverIdentity == ProgrammeImageService.GetConnectionIdentity(Configuration?.TVH_ServerName, Configuration?.HTSP_Port ?? 0, Configuration?.Username) && long.TryParse(_channelId, out var channelId))
                 {
                     var key = (_serverIdentity, channelId);
                     if (_sourceMuxIdentity == null) KnownChannelMuxes.TryRemove(key, out _);
@@ -3944,7 +3965,7 @@ namespace TVHeadEnd
         internal static void PruneKnownMuxes(string identity, HashSet<long> channels)
         {
             foreach (var entry in KnownChannelMuxes)
-                if (entry.Key.Server != identity || !channels.Contains(entry.Key.Channel)) KnownChannelMuxes.TryRemove(entry.Key, out _);
+                if (entry.Key.Server == identity && !channels.Contains(entry.Key.Channel)) KnownChannelMuxes.TryRemove(entry.Key, out _);
         }
 
         private void WriteOutput(byte[] chunk, bool randomAccess = false, bool forceBootstrapReady = false)
@@ -3978,44 +3999,44 @@ namespace TVHeadEnd
             RunningChannelsByUniqueId.TryRemove(UniqueId, out _);
             if (_registeredAsSharedHub)
             {
-                RemoveSharedHub(_channelId, this);
+                RemoveSharedHub(SharingKey, this);
                 _registeredAsSharedHub = false;
             }
         }
 
-        private static bool GetConfiguredStreamSharingEnabled()
+        private bool GetConfiguredStreamSharingEnabled()
         {
-            return Plugin.Instance?.Configuration?.HTSPEnableStreamSharing ?? true;
+            return Configuration?.HTSPEnableStreamSharing ?? true;
         }
 
-        private static bool GetConfiguredKeyframeStartupEnabled()
+        private bool GetConfiguredKeyframeStartupEnabled()
         {
-            return Plugin.Instance?.Configuration?.HTSPKeyframeStartupEnabled ?? true;
+            return Configuration?.HTSPKeyframeStartupEnabled ?? true;
         }
 
-        private static int GetConfiguredInitialTuneBufferMs()
+        private int GetConfiguredInitialTuneBufferMs()
         {
-            return Math.Max(0, Math.Min(3000, Plugin.Instance?.Configuration?.HTSPInitialTuneBufferMs ?? 0));
+            return Math.Max(0, Math.Min(3000, Configuration?.HTSPInitialTuneBufferMs ?? 0));
         }
 
-        private static bool GetConfiguredHealthLoggingEnabled()
+        private bool GetConfiguredHealthLoggingEnabled()
         {
-            return Plugin.Instance?.Configuration?.HTSPHealthLoggingEnabled ?? true;
+            return Configuration?.HTSPHealthLoggingEnabled ?? true;
         }
 
-        private static int GetConfiguredHealthLogIntervalSeconds()
+        private int GetConfiguredHealthLogIntervalSeconds()
         {
-            return Math.Max(0, Math.Min(600, Plugin.Instance?.Configuration?.HTSPHealthLogIntervalSeconds ?? 30));
+            return Math.Max(0, Math.Min(600, Configuration?.HTSPHealthLogIntervalSeconds ?? 30));
         }
 
-        private static bool GetConfiguredSignalHealthLoggingEnabled()
+        private bool GetConfiguredSignalHealthLoggingEnabled()
         {
-            return Plugin.Instance?.Configuration?.HTSPSignalHealthLoggingEnabled ?? true;
+            return Configuration?.HTSPSignalHealthLoggingEnabled ?? true;
         }
 
-        private static bool GetConfiguredDetailedDiagnostics()
+        private bool GetConfiguredDetailedDiagnostics()
         {
-            return Plugin.Instance?.Configuration?.HTSPDetailedDiagnostics ?? false;
+            return Configuration?.HTSPDetailedDiagnostics ?? false;
         }
 
         public static IReadOnlyList<HtspRunningChannelStatus> GetRunningChannelStatuses()
@@ -4112,34 +4133,34 @@ namespace TVHeadEnd
             };
         }
 
-        private static bool GetConfiguredSignalRecoveryEnabled()
+        private bool GetConfiguredSignalRecoveryEnabled()
         {
-            return Plugin.Instance?.Configuration?.HTSPSignalRecoveryEnabled ?? true;
+            return Configuration?.HTSPSignalRecoveryEnabled ?? true;
         }
 
-        private static int GetConfiguredSignalLockLossSeconds()
+        private int GetConfiguredSignalLockLossSeconds()
         {
-            return Math.Max(1, Math.Min(30, Plugin.Instance?.Configuration?.HTSPSignalLockLossSeconds ?? 3));
+            return Math.Max(1, Math.Min(30, Configuration?.HTSPSignalLockLossSeconds ?? 3));
         }
 
-        private static int GetConfiguredSignalUncBurstThreshold()
+        private int GetConfiguredSignalUncBurstThreshold()
         {
-            return Math.Max(1, Math.Min(1000, Plugin.Instance?.Configuration?.HTSPSignalUncBurstThreshold ?? 5));
+            return Math.Max(1, Math.Min(1000, Configuration?.HTSPSignalUncBurstThreshold ?? 5));
         }
 
-        private static int GetConfiguredSignalIdrWaitSeconds()
+        private int GetConfiguredSignalIdrWaitSeconds()
         {
-            return Math.Max(1, Math.Min(15, Plugin.Instance?.Configuration?.HTSPSignalIdrWaitSeconds ?? 3));
+            return Math.Max(1, Math.Min(15, Configuration?.HTSPSignalIdrWaitSeconds ?? 3));
         }
 
-        private static int GetConfiguredSignalRecoveryMaxReconnects()
+        private int GetConfiguredSignalRecoveryMaxReconnects()
         {
-            return Math.Max(0, Math.Min(10, Plugin.Instance?.Configuration?.HTSPSignalRecoveryMaxReconnects ?? 2));
+            return Math.Max(0, Math.Min(10, Configuration?.HTSPSignalRecoveryMaxReconnects ?? 2));
         }
 
-        private static int GetConfiguredSignalRecoveryCooldownSeconds()
+        private int GetConfiguredSignalRecoveryCooldownSeconds()
         {
-            return Math.Max(1, Math.Min(300, Plugin.Instance?.Configuration?.HTSPSignalRecoveryCooldownSeconds ?? 15));
+            return Math.Max(1, Math.Min(300, Configuration?.HTSPSignalRecoveryCooldownSeconds ?? 15));
         }
 
         private void ResetConnectionAttemptSignals()

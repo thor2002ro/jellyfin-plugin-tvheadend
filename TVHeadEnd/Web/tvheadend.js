@@ -3,11 +3,17 @@
 };
 
 export default function (view, params) {
+    let nativeServers = [];
+    let primaryConnection = {};
     let statusTimer = null;
     let statusRequestInFlight = null;
     const bytesPerMiB = 1024 * 1024;
     const defaultQueueDepthBytes = 10 * bytesPerMiB;
     const maxQueueDepthMiB = 20;
+
+    function useJellyfinDvr(page) {
+        return page.querySelector('#selRecordingBackend').value === 'Jellyfin';
+    }
 
     function getStreamingMethod(config) {
         return config.StreamingMethod || 'Htsp';
@@ -61,6 +67,12 @@ export default function (view, params) {
 
     function loadConfig(page, config) {
         const values = config || {};
+        nativeServers = (values.NativeServers || []).map(server => ({ ...server }));
+        primaryConnection = { Host: values.TVH_ServerName || '', HtspPort: values.HTSP_Port ?? 9982, HttpPort: values.HTTP_Port ?? 9981,
+            UseHttps: values.UseHttps === true, WebRoot: values.WebRoot || '/', Username: values.Username || '', Password: values.Password || '',
+            StreamingMethod: values.StreamingMethod || 'Htsp', TimeZoneId: values.TVH_TimeZoneId || '', Name: '', Profile: '' };
+        page.querySelector('#selRecordingBackend').value = values.UseNativeTuners === true ? 'Jellyfin' : 'TVHeadend';
+        renderNativeServers(page);
         page.querySelector('#txtTVH_ServerName').value = values.TVH_ServerName || '';
         loadTimeZones(page.querySelector('#txtTVH_TimeZoneId'), page.querySelector('#tvhTimeZones'), values.TVH_TimeZoneId || '');
         page.querySelector('#txtHTTP_Port').value = Number.isFinite(values.HTTP_Port) ? values.HTTP_Port : 9981;
@@ -98,6 +110,30 @@ export default function (view, params) {
         updateDependentState(page);
     }
 
+    function renderNativeServers(page, selectedId = '') {
+        const select = page.querySelector('#selNativeServer');
+        select.options.length = 0;
+        select.add(new Option('New server', ''));
+        nativeServers.forEach(server => select.add(new Option(server.Name || server.Host, server.Id)));
+        select.value = selectedId;
+        page.querySelector('#nativeServerStatus').textContent = `${nativeServers.length} native server(s). Changes apply after Save and restart.`;
+    }
+
+    function loadNativeConnection(server) {
+        view.querySelector('#txtTVH_ServerName').value = server.Host;
+        view.querySelector('#txtHTSP_Port').value = server.HtspPort;
+        view.querySelector('#txtHTTP_Port').value = server.HttpPort;
+        view.querySelector('#chkUseHttps').checked = server.UseHttps === true;
+        view.querySelector('#txtWebRoot').value = server.WebRoot || '/';
+        view.querySelector('#txtUserName').value = server.Username;
+        view.querySelector('#txtPassword').value = server.Password;
+        view.querySelector('#selStreamingMethod').value = server.StreamingMethod || 'Htsp';
+        view.querySelector('#txtTVH_TimeZoneId').value = server.TimeZoneId || '';
+        view.querySelector('#txtNativeServerName').value = server.Name;
+        view.querySelector('#txtNativeProfile').value = server.Profile || '';
+        updateDependentState(view);
+    }
+
     function loadProfiles(page, selectedProfile) {
         const select = page.querySelector('#txtProfile');
         const status = page.querySelector('#profileStatus');
@@ -114,6 +150,10 @@ export default function (view, params) {
         };
 
         setOptions([]);
+        if (useJellyfinDvr(page)) {
+            status.textContent = 'Native stream profiles are entered per server above.';
+            return Promise.resolve();
+        }
         select.disabled = true;
         return ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('TVHeadEnd/Profiles'), dataType: 'json' })
             .then(profiles => {
@@ -126,7 +166,7 @@ export default function (view, params) {
                     ? 'TVHeadend denied DVR profile access. Enable Basic recorder access and allow the required DVR configuration for the configured user.'
                     : 'Profiles could not be loaded; the saved selection is retained.';
             })
-            .finally(() => { select.disabled = false; });
+            .finally(() => { select.disabled = useJellyfinDvr(page); });
     }
 
     function escapeHtml(value) {
@@ -256,12 +296,17 @@ export default function (view, params) {
 
         const resetButton = page.querySelector('#btnResetDefaults');
         if (resetButton) {
-            resetButton.title = 'Reset TVHeadend plugin settings to their default values, keeping hostname, username, and password.';
-            resetButton.setAttribute('aria-label', 'Reset TVHeadend plugin settings to defaults, keeping hostname, username, and password');
+            resetButton.title = 'Reset TVHeadend plugin settings to their default values, keeping connection credentials and native servers.';
+            resetButton.setAttribute('aria-label', 'Reset TVHeadend plugin settings to defaults, keeping connection credentials and native servers');
         }
     }
 
     function updateDependentState(page) {
+        const nativeMode = useJellyfinDvr(page);
+        ['#selNativeServer', '#txtNativeServerName', '#txtNativeProfile', '#btnStoreNativeServer', '#btnRemoveNativeServer']
+            .forEach(id => { page.querySelector(id).disabled = !nativeMode; });
+        ['#txtPriority', '#txtProfile', '#txtPrePadding', '#txtPostPadding', '#chkHideRecordingsChannel']
+            .forEach(id => { page.querySelector(id).disabled = nativeMode; });
         const recoveryEnabled = page.querySelector('#chkHTSPSignalRecoveryEnabled').checked;
         const recovery = page.querySelector('#signalRecoverySettings');
         recovery.classList.toggle('tvhDependentDisabled', !recoveryEnabled);
@@ -275,14 +320,21 @@ export default function (view, params) {
 
     function renderStatus(page, status) {
         const runningChannels = Array.isArray(status.RunningChannels) ? status.RunningChannels : Array.isArray(status.Producers) ? status.Producers : [];
-        const serverStatus = status.Connected
-            ? `${status.Server || 'not configured'} · Connected · ${status.ServerVersion || 'unknown version'} · HTSP ${status.HtspProtocolVersion == null ? 'unknown' : status.HtspProtocolVersion}`
-            : `${status.Server || 'not configured'} · Disconnected`;
+        const describeServer = server => server.Connected
+            ? `${server.Server || 'not configured'} | Connected | ${server.ServerVersion || 'unknown version'} | HTSP ${server.HtspProtocolVersion == null ? 'unknown' : server.HtspProtocolVersion}`
+            : `${server.Server || 'not configured'} | Disconnected`;
+        const serverStatus = status.UseNativeTuners
+            ? (status.NativeServers || []).map(server => `${server.Name} | ${describeServer(server)}`).join('; ') || 'No native servers configured'
+            : describeServer(status);
+        const streamingMethods = status.UseNativeTuners
+            ? (status.NativeServers || []).map(server => `${server.Name}: ${server.StreamingMethod || 'unknown'}`).join('; ') || 'No native servers configured'
+            : status.StreamingMethod || 'legacy/default';
         page.querySelector('#statusUpdated').textContent = `Updated ${new Date(status.GeneratedUtc).toLocaleTimeString()}`;
         page.querySelector('#statusSummary').innerHTML =
             metric('Plugin version', status.PluginVersion || 'unknown') +
+            metric('Recording backend', status.UseNativeTuners ? 'Jellyfin DVR' : 'TVHeadend DVR') +
             metric('TVHeadend server', serverStatus) +
-            metric('Streaming method', status.StreamingMethod || 'legacy/default') +
+            metric('Streaming method', streamingMethods) +
             metric('Running Channels', String(status.RunningChannelCount ?? status.ActiveProducerCount ?? 0));
 
         const container = page.querySelector('#activeTuners');
@@ -393,6 +445,48 @@ export default function (view, params) {
 
     view.addEventListener('viewhide', stopStatusPolling);
     view.querySelector('#btnRefreshStatus').addEventListener('click', () => loadStatus(view, true));
+    view.querySelector('#selRecordingBackend').addEventListener('change', function () {
+        const selected = nativeServers.find(server => server.Id === view.querySelector('#selNativeServer').value);
+        if (!useJellyfinDvr(view)) loadNativeConnection(primaryConnection);
+        else if (selected) loadNativeConnection(selected);
+        updateDependentState(view);
+    });
+    view.querySelector('#selNativeServer').addEventListener('change', function () {
+        if (!useJellyfinDvr(view)) return;
+        const server = nativeServers.find(item => item.Id === this.value);
+        if (server) loadNativeConnection(server);
+        else {
+            view.querySelector('#txtNativeServerName').value = '';
+            view.querySelector('#txtNativeProfile').value = '';
+        }
+    });
+    view.querySelector('#btnStoreNativeServer').addEventListener('click', function () {
+        if (!useJellyfinDvr(view)) return;
+        const connection = connectionSettings(view);
+        const status = view.querySelector('#nativeServerStatus');
+        if (!connection.TVH_ServerName || !connection.Username.trim() || !connection.Password.trim()
+            || /[\s/@?#]/.test(connection.TVH_ServerName)) {
+            status.textContent = 'Enter a hostname or IP address, username and password in the connection settings.';
+            return;
+        }
+        const id = view.querySelector('#selNativeServer').value || Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+        const server = {
+            Id: id, Name: view.querySelector('#txtNativeServerName').value.trim() || connection.TVH_ServerName,
+            Host: connection.TVH_ServerName, HtspPort: connection.HTSP_Port, HttpPort: connection.HTTP_Port,
+            UseHttps: connection.UseHttps, WebRoot: connection.WebRoot, Username: connection.Username, Password: connection.Password,
+            StreamingMethod: connection.StreamingMethod, Profile: view.querySelector('#txtNativeProfile').value.trim(),
+            TimeZoneId: view.querySelector('#txtTVH_TimeZoneId').value.trim()
+        };
+        const index = nativeServers.findIndex(item => item.Id === id);
+        if (index < 0) nativeServers.push(server); else nativeServers[index] = server;
+        renderNativeServers(view, id);
+    });
+    view.querySelector('#btnRemoveNativeServer').addEventListener('click', function () {
+        if (!useJellyfinDvr(view)) return;
+        const id = view.querySelector('#selNativeServer').value;
+        nativeServers = nativeServers.filter(server => server.Id !== id);
+        renderNativeServers(view);
+    });
     view.querySelector('#btnTestConnection').addEventListener('click', function () {
         if (this.disabled) return;
         const button = this;
@@ -418,7 +512,7 @@ export default function (view, params) {
     view.querySelector('#chkHTSPSignalRecoveryEnabled').addEventListener('change', () => updateDependentState(view));
     view.querySelector('#chkHTSPHealthLoggingEnabled').addEventListener('change', () => updateDependentState(view));
     view.querySelector('#btnResetDefaults').addEventListener('click', function () {
-        if (!window.confirm('Reset TVHeadend plugin settings to defaults? Hostname, username, and password will be kept.')) return;
+        if (!window.confirm('Reset TVHeadend plugin settings to defaults? Primary credentials, native servers and tuner mode will be kept.')) return;
         Dashboard.showLoadingMsg();
         ApiClient.ajax({
             type: 'POST',
@@ -435,8 +529,10 @@ export default function (view, params) {
         Dashboard.showLoadingMsg();
         const form = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
-            Object.assign(config, connectionSettings(form));
-            config.TVH_TimeZoneId = form.querySelector('#txtTVH_TimeZoneId').value.trim();
+            config.UseNativeTuners = useJellyfinDvr(form);
+            config.NativeServers = nativeServers.map(server => ({ ...server }));
+            if (!config.UseNativeTuners) Object.assign(config, connectionSettings(form));
+            if (!config.UseNativeTuners) config.TVH_TimeZoneId = form.querySelector('#txtTVH_TimeZoneId').value.trim();
             config.Priority = priorityValue(form.querySelector('#txtPriority').value);
             config.Profile = form.querySelector('#txtProfile').value.trim();
             config.Pre_Padding = intValue(form.querySelector('#txtPrePadding'), 0, 0, 86400);

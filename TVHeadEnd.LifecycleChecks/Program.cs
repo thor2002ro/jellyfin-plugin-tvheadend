@@ -605,7 +605,8 @@ public sealed class PluginTests
         var releasePlayback = typeof(HtspLiveStream).GetMethod("ReleaseSharedPlaybackReference", PrivateInstance)!;
         var registeredChannelId = Guid.NewGuid().ToString("N");
         var registeredHub = CreateStream(registeredChannelId);
-        sharedHubs[registeredChannelId] = registeredHub;
+        var registeredKey = (string)typeof(HtspLiveStream).GetProperty("SharingKey", PrivateInstance)!.GetValue(registeredHub)!;
+        sharedHubs[registeredKey] = registeredHub;
         SetField(registeredHub, "_registeredAsSharedHub", true);
         using (registeredHub.GetStream())
         {
@@ -617,7 +618,7 @@ public sealed class PluginTests
 
         registeredHub.Dispose();
         Assert(GetInt(registeredHub, "_closeStarted") == 1, "Dispose did not close the unused producer.");
-        Assert(!sharedHubs.ContainsKey(registeredChannelId), "Dispose left the shared hub registered.");
+        Assert(!sharedHubs.ContainsKey(registeredKey), "Dispose left the shared hub registered.");
     }
 
     [Fact]

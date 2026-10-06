@@ -250,6 +250,21 @@
 
             <form class="TVHclientConfigurationForm">
                 <details class="tvhSection" open>
+                    <summary>Recording backend and servers</summary>
+                    <div class="tvhSectionBody">
+                        <div class="selectContainer"><label for="selRecordingBackend">Recording backend</label><select is="emby-select" id="selRecordingBackend" aria-describedby="recordingBackendDescription"><option value="TVHeadend">TVHeadend DVR</option><option value="Jellyfin">Jellyfin DVR</option></select><div id="recordingBackendDescription" class="fieldDescription">TVHeadend DVR schedules and stores recordings on the primary TVHeadend server. Jellyfin DVR uses native tuners for the servers below and Jellyfin's recording scheduler and recording directory; configure recording options in Dashboard &gt; Live TV. Select one backend, Save and restart Jellyfin. Existing schedules and recordings are not migrated.</div></div>
+                        <div class="inputContainer"><label for="selNativeServer">Native servers</label><select is="emby-select" id="selNativeServer"></select></div>
+                        <div class="tvhGrid">
+                            <div class="inputContainer"><input is="emby-input" id="txtNativeServerName" label="Server name" /></div>
+                            <div class="inputContainer"><input is="emby-input" id="txtNativeProfile" label="Native stream profile (optional)" /></div>
+                        </div>
+                        <div class="fieldDescription">Select a server to edit its connection below. Test connection applies to the displayed settings. Add or update the server, then Save.</div>
+                        <button is="emby-button" type="button" id="btnStoreNativeServer" class="raised"><span>Add / update server from connection settings</span></button>
+                        <button is="emby-button" type="button" id="btnRemoveNativeServer" class="raised"><span>Remove selected server</span></button>
+                        <div id="nativeServerStatus" role="status" aria-live="polite"></div>
+                    </div>
+                </details>
+                <details class="tvhSection" open>
                     <summary>Connection and authentication</summary>
                     <div class="tvhSectionBody tvhGrid">
                         <div class="inputContainer"><input is="emby-input" type="text" id="txtTVH_ServerName" label="TVHeadend hostname or IP address" /></div>

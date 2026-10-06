@@ -25,6 +25,8 @@ Jellyfin plugin, with fork-specific changes.
   and caches results for 30 minutes with format-change detection. Probe failures
   leave playback available; the Force deinterlace setting still takes precedence.
 - TVHeadend channel tags imported into Jellyfin, including tag renames/deletions.
+- Audio and subtitle languages preserved from TVHeadend, with probe fallback for
+  missing values and consistent ISO-639 codes in Jellyfin and MPEG-TS descriptors.
 - An in-plugin MPEG-TS muxer for HTSP payloads, including common video, audio,
   DVB subtitle, teletext, and private/fallback stream handling.
 - Signal monitoring and recovery for HTSP streams, including lock/SNR/UNC

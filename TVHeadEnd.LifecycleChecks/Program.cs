@@ -29,6 +29,37 @@ public sealed class PluginTests
     private const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
     private const BindingFlags PrivateStatic = BindingFlags.Static | BindingFlags.NonPublic;
 
+    [Theory]
+    [InlineData("en", "eng")]
+    [InlineData(" RO ", "ron")]
+    [InlineData("en-US", "eng")]
+    [InlineData(" FRA ", "fra")]
+    [InlineData("ger", "ger")]
+    [InlineData("und", null)]
+    [InlineData("123", null)]
+    [InlineData("", null)]
+    public void AudioAndSubtitleLanguagesMatchJellyfinAndTransportDescriptors(string supplied, string expected)
+    {
+        var (muxer, sources) = CreateMuxer("AAC", "DVBSUB");
+        foreach (var source in sources)
+        {
+            source.GetType().GetProperty("Language")!.SetValue(source, supplied);
+            var build = typeof(HtspLiveStream).GetMethod("CreateMediaStream", PrivateStatic)!;
+            var track = (MediaStream)build.Invoke(null, new[] { source, (object)0 })!;
+            Xunit.Assert.Equal(expected, track.Language);
+            var descriptors = (byte[])muxer.GetType().GetMethod("BuildDescriptors", PrivateStatic)!
+                .Invoke(null, new[] { source, source.GetType().GetProperty("Codec")!.GetValue(source) })!;
+            if (expected != null)
+            {
+                Xunit.Assert.Equal(new byte[] { 0x0A, 4 }, descriptors.Take(2));
+                Xunit.Assert.Equal(expected, System.Text.Encoding.ASCII.GetString(descriptors, 2, 3));
+            }
+        }
+        var bytes = (byte[])muxer.GetType().GetMethod("GetIsoLanguageBytes", PrivateStatic)!
+            .Invoke(null, new object[] { supplied })!;
+        Xunit.Assert.Equal(expected ?? "und", System.Text.Encoding.ASCII.GetString(bytes));
+    }
+
     [Fact]
     public void HtspVideoUsesBroadcastTimingInsteadOfFixedInterlacing()
     {
@@ -52,17 +83,21 @@ public sealed class PluginTests
         Xunit.Assert.NotNull(merge);
         var video = new MediaStream { Index = 0, Type = MediaStreamType.Video, Codec = "hevc" };
         var audio = new MediaStream { Index = 2, Type = MediaStreamType.Audio, Language = "eng", Title = "Audio description" };
-        var silentAudio = new MediaStream { Index = 3, Type = MediaStreamType.Audio, Language = "fra" };
+        var silentAudio = new MediaStream { Index = 3, Type = MediaStreamType.Audio, Language = "und" };
         var subtitle = new MediaStream { Index = 4, Type = MediaStreamType.Subtitle, Codec = "dvbsub" };
-        var streams = new List<MediaStream> { video, audio, silentAudio, subtitle };
+        var unprobedAudio = new MediaStream { Index = 5, Type = MediaStreamType.Audio, Language = "fra" };
+        var streams = new List<MediaStream> { video, audio, silentAudio, subtitle, unprobedAudio };
         var probe = new List<MediaStream>
         {
             new() { Index = 0, Type = MediaStreamType.Video, IsInterlaced = false, BitDepth = 10,
                 ColorTransfer = "smpte2084", Profile = "Main 10", RealFrameRate = 25, BitRate = 8000000 },
-            new() { Index = 3, Type = MediaStreamType.Audio, ChannelLayout = "stereo", BitRate = 128000 }
+            new() { Index = 2, Type = MediaStreamType.Audio, Language = "fra" },
+            new() { Index = 3, Type = MediaStreamType.Audio, ChannelLayout = "stereo", BitRate = 128000, Language = "ro" },
+            new() { Index = 4, Type = MediaStreamType.Subtitle, Language = "deu" }
         };
         merge.Invoke(null, new object[] { streams, probe });
-        Xunit.Assert.Equal(4, streams.Count);
+        Xunit.Assert.Equal(5, streams.Count);
+        Xunit.Assert.Same(unprobedAudio, streams[4]);
         Xunit.Assert.Equal(10, video.BitDepth);
         Xunit.Assert.Equal("smpte2084", video.ColorTransfer);
         Xunit.Assert.Equal(25f, video.RealFrameRate);
@@ -70,6 +105,8 @@ public sealed class PluginTests
         Xunit.Assert.Equal("Audio description", audio.Title);
         Xunit.Assert.Null(audio.BitRate);
         Xunit.Assert.Equal(128000, silentAudio.BitRate);
+        Xunit.Assert.Equal("ron", silentAudio.Language);
+        Xunit.Assert.Equal("deu", subtitle.Language);
         Xunit.Assert.Equal(4, subtitle.Index);
     }
 

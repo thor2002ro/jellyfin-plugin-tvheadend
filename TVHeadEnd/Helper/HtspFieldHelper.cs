@@ -1,10 +1,34 @@
 using System;
 using System.Globalization;
+using System.Linq;
 
 namespace TVHeadEnd.Helper;
 
 internal static class HtspFieldHelper
 {
+    public static string NormalizeLanguage(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        value = value.Trim().ToLowerInvariant();
+        if (value.Length == 3 && value.All(c => c >= 'a' && c <= 'z'))
+        {
+            // Preserve broadcast ISO-639 aliases; "und" supplies no language information.
+            return value == "und" ? null : value;
+        }
+
+        var primary = value.Split('-', '_')[0];
+        if (primary.Length != 2 || !primary.All(c => c >= 'a' && c <= 'z')) return null;
+        try
+        {
+            var iso = CultureInfo.GetCultureInfo(value.Replace('_', '-')).ThreeLetterISOLanguageName;
+            return iso.Length == 3 ? iso : null;
+        }
+        catch (CultureNotFoundException)
+        {
+            return null;
+        }
+    }
+
     public static long ParseUInt32Id(string value, string fieldName)
     {
         if (string.IsNullOrWhiteSpace(value))

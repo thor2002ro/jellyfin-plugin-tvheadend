@@ -3077,6 +3077,11 @@ namespace TVHeadEnd
                 // Match emitted TS indexes, not list positions: a short sample can miss a silent track.
                 var probe = probed.FirstOrDefault(p => p.Index == stream.Index && p.Type == stream.Type);
                 if (probe == null) continue;
+                if (stream.Type == MediaStreamType.Audio || stream.Type == MediaStreamType.Subtitle)
+                {
+                    stream.Language = HtspFieldHelper.NormalizeLanguage(stream.Language)
+                        ?? HtspFieldHelper.NormalizeLanguage(probe.Language);
+                }
                 if (probe.BitRate > 0) stream.BitRate = probe.BitRate;
                 stream.Profile = probe.Profile ?? stream.Profile;
                 stream.ChannelLayout = probe.ChannelLayout ?? stream.ChannelLayout;
@@ -3129,7 +3134,7 @@ namespace TVHeadEnd
                 Index = ffmpegStreamIndex,
                 Type = mediaStreamType,
                 Codec = ToJellyfinCodec(stream.Codec),
-                Language = NormalizeLanguage(stream.Language),
+                Language = HtspFieldHelper.NormalizeLanguage(stream.Language),
                 TimeBase = "1/90000",
                 IsExternal = false
             };
@@ -3388,17 +3393,6 @@ namespace TVHeadEnd
                 .Replace("_", string.Empty, StringComparison.Ordinal)
                 .Replace(" ", string.Empty, StringComparison.Ordinal)
                 .ToUpperInvariant();
-        }
-
-        private static string NormalizeLanguage(string language)
-        {
-            if (string.IsNullOrWhiteSpace(language))
-            {
-                return null;
-            }
-
-            var normalized = new string(language.Trim().ToLowerInvariant().Where(char.IsLetter).Take(3).ToArray());
-            return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
         }
 
         private void ResetQueueDiagnostics()

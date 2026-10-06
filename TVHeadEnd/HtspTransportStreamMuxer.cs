@@ -1120,17 +1120,7 @@ namespace TVHeadEnd
 
         private static byte[] GetIsoLanguageBytes(string language)
         {
-            var normalized = new string((language ?? string.Empty)
-                .Where(char.IsLetter)
-                .Take(3)
-                .Select(char.ToLowerInvariant)
-                .ToArray());
-            if (normalized.Length != 3)
-            {
-                normalized = "und";
-            }
-
-            return Encoding.ASCII.GetBytes(normalized);
+            return Encoding.ASCII.GetBytes(Helper.HtspFieldHelper.NormalizeLanguage(language) ?? "und");
         }
 
         private static void AddDescriptor(List<byte> descriptors, byte tag, params byte[] data)

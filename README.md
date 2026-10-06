@@ -48,6 +48,9 @@ Jellyfin plugin, with fork-specific changes.
 - Runtime status in the plugin settings page: connection state, active tuners,
   reader counts, signal metrics, queue health, drops, reconnects, startup cache
   state, and per-stream packet/event counters.
+- A Test connection button for unsaved HTSP, HTTP ticket and HTTP basic settings.
+  HTTP tests check HTSP access and briefly probe an accessible channel at low
+  priority; results cover connection/authentication failures without saving settings.
 - Jellyfin 12 / .NET 10 packaging metadata.
 
 ## Requirements

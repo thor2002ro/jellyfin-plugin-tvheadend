@@ -262,6 +262,9 @@
                         <div class="inputContainer"><input is="emby-input" type="password" id="txtPassword" autocomplete="current-password" label="Password" /></div>
                         <div class="selectContainer"><select is="emby-select" id="selStreamingMethod" label="Streaming method"><option value="Htsp">HTSP</option><option value="HttpTicket">HTTP ticket</option><option value="HttpBasic">HTTP basic authentication</option></select><div class="fieldDescription">All methods expose available audio and subtitle tracks. HTSP uses the native subscription protocol; HTTP methods probe the transport stream.</div></div>
                     </div>
+                    <button is="emby-button" type="button" id="btnTestConnection" class="raised" aria-describedby="connectionTestDescription"><span>Test connection</span></button>
+                    <div id="connectionTestDescription" class="fieldDescription">Tests the values shown without saving. HTTP methods briefly probe a channel at low priority.</div>
+                    <div id="connectionTestResult" role="status" aria-live="polite" aria-atomic="true"></div>
                 </details>
 
                 <details class="tvhSection" open>

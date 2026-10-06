@@ -46,6 +46,19 @@ export default function (view, params) {
         return [0, 1, 2, 3, 4, 5].includes(priority) ? priority : 2;
     }
 
+    function connectionSettings(form) {
+        return {
+            TVH_ServerName: form.querySelector('#txtTVH_ServerName').value.trim(),
+            HTTP_Port: intValue(form.querySelector('#txtHTTP_Port'), 9981, 1, 65535),
+            UseHttps: form.querySelector('#chkUseHttps').checked,
+            HTSP_Port: intValue(form.querySelector('#txtHTSP_Port'), 9982, 1, 65535),
+            WebRoot: form.querySelector('#txtWebRoot').value.trim() || '/',
+            Username: form.querySelector('#txtUserName').value,
+            Password: form.querySelector('#txtPassword').value,
+            StreamingMethod: form.querySelector('#selStreamingMethod').value
+        };
+    }
+
     function loadConfig(page, config) {
         const values = config || {};
         page.querySelector('#txtTVH_ServerName').value = values.TVH_ServerName || '';
@@ -378,6 +391,28 @@ export default function (view, params) {
 
     view.addEventListener('viewhide', stopStatusPolling);
     view.querySelector('#btnRefreshStatus').addEventListener('click', () => loadStatus(view, true));
+    view.querySelector('#btnTestConnection').addEventListener('click', function () {
+        if (this.disabled) return;
+        const button = this;
+        const result = view.querySelector('#connectionTestResult');
+        button.disabled = true;
+        result.textContent = 'Testing connection…';
+        result.setAttribute('aria-busy', 'true');
+        ApiClient.ajax({
+            type: 'POST',
+            url: ApiClient.getUrl('TVHeadEnd/Configuration/TestConnection'),
+            contentType: 'application/json',
+            dataType: 'json',
+            data: JSON.stringify(connectionSettings(view))
+        }).then(response => {
+            result.textContent = `${response.Success ? 'Success' : 'Failed'}: ${response.Message}`;
+        }).catch(() => {
+            result.textContent = 'Unable to run the connection test. Check your Jellyfin connection and administrator access.';
+        }).finally(() => {
+            button.disabled = false;
+            result.setAttribute('aria-busy', 'false');
+        });
+    });
     view.querySelector('#chkHTSPSignalRecoveryEnabled').addEventListener('change', () => updateDependentState(view));
     view.querySelector('#chkHTSPHealthLoggingEnabled').addEventListener('change', () => updateDependentState(view));
     view.querySelector('#btnResetDefaults').addEventListener('click', function () {
@@ -398,21 +433,14 @@ export default function (view, params) {
         Dashboard.showLoadingMsg();
         const form = this;
         ApiClient.getPluginConfiguration(TVHclientConfigurationPageVar.pluginUniqueId).then(config => {
-            config.TVH_ServerName = form.querySelector('#txtTVH_ServerName').value.trim();
+            Object.assign(config, connectionSettings(form));
             config.TVH_TimeZoneId = form.querySelector('#txtTVH_TimeZoneId').value.trim();
-            config.HTTP_Port = intValue(form.querySelector('#txtHTTP_Port'), 9981, 1, 65535);
-            config.UseHttps = form.querySelector('#chkUseHttps').checked;
-            config.HTSP_Port = intValue(form.querySelector('#txtHTSP_Port'), 9982, 1, 65535);
-            config.WebRoot = form.querySelector('#txtWebRoot').value.trim() || '/';
-            config.Username = form.querySelector('#txtUserName').value;
-            config.Password = form.querySelector('#txtPassword').value;
             config.Priority = priorityValue(form.querySelector('#txtPriority').value);
             config.Profile = form.querySelector('#txtProfile').value.trim();
             config.Pre_Padding = intValue(form.querySelector('#txtPrePadding'), 0, 0, 86400);
             config.Post_Padding = intValue(form.querySelector('#txtPostPadding'), 0, 0, 86400);
             config.ChannelType = form.querySelector('#selChannelType').value;
             config.HideRecordingsChannel = form.querySelector('#chkHideRecordingsChannel').checked;
-            config.StreamingMethod = form.querySelector('#selStreamingMethod').value;
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
             config.HTSPQueueDepth = saveQueueDepth(form.querySelector('#txtHTSPQueueDepth'));
             config.HTSPInitialTuneBufferMs = intValue(form.querySelector('#txtHTSPInitialTuneBufferMs'), 0, 0, 3000);

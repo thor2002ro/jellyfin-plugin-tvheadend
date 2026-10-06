@@ -258,7 +258,7 @@ namespace TVHeadEnd.HTSP
             return authenticate(username, password, enableAsyncMetadata, CancellationToken.None, DefaultResponseTimeout);
         }
 
-        public Boolean authenticate(String username, String password, bool enableAsyncMetadata, CancellationToken cancellationToken, TimeSpan responseTimeout)
+        public Boolean authenticate(String username, String password, bool enableAsyncMetadata, CancellationToken cancellationToken, TimeSpan responseTimeout, bool throwOnTimeout = false)
         {
             _logger.LogDebug("[TVHclient] HTSConnectionAsync.authenticate: start");
 
@@ -269,7 +269,7 @@ namespace TVHeadEnd.HTSP
             helloMessage.putField("htspversion", HTSMessage.HTSP_VERSION);
             helloMessage.putField("username", username);
 
-            HTSMessage helloResponse = SendAndGetResponse(helloMessage, cancellationToken, responseTimeout);
+            HTSMessage helloResponse = SendAndGetResponse(helloMessage, cancellationToken, responseTimeout, throwOnTimeout);
             if (helloResponse != null)
             {
                 if (helloResponse.containsField("htspversion"))
@@ -355,7 +355,7 @@ namespace TVHeadEnd.HTSP
                 authMessage.Method = "authenticate";
                 authMessage.putField("username", username);
                 authMessage.putField("digest", digest);
-                HTSMessage authResponse = SendAndGetResponse(authMessage, cancellationToken, responseTimeout);
+                HTSMessage authResponse = SendAndGetResponse(authMessage, cancellationToken, responseTimeout, throwOnTimeout);
                 if (authResponse != null)
                 {
                     Boolean auth = authResponse.getInt("noaccess", 0) != 1;
@@ -363,7 +363,7 @@ namespace TVHeadEnd.HTSP
                     {
                         HTSMessage getDiskSpaceMessage = new HTSMessage();
                         getDiskSpaceMessage.Method = "getDiskSpace";
-                        HTSMessage diskSpaceResponse = SendAndGetResponse(getDiskSpaceMessage, cancellationToken, responseTimeout);
+                        HTSMessage diskSpaceResponse = SendAndGetResponse(getDiskSpaceMessage, cancellationToken, responseTimeout, throwOnTimeout);
                         if (diskSpaceResponse != null)
                         {
                             long freeDiskSpace = -1;
@@ -389,7 +389,7 @@ namespace TVHeadEnd.HTSP
                         }
 
                         var getSysTimeMessage = new HTSMessage { Method = "getSysTime" };
-                        HTSMessage sysTimeResponse = SendAndGetResponse(getSysTimeMessage, cancellationToken, responseTimeout);
+                        HTSMessage sysTimeResponse = SendAndGetResponse(getSysTimeMessage, cancellationToken, responseTimeout, throwOnTimeout);
                         _serverUtcOffsetMinutes = sysTimeResponse?.getInt("gmtoffset", 0) ?? 0;
 
                         if (enableAsyncMetadata)
@@ -409,7 +409,7 @@ namespace TVHeadEnd.HTSP
             return false;
         }
 
-        private HTSMessage SendAndGetResponse(HTSMessage message, CancellationToken cancellationToken, TimeSpan responseTimeout)
+        private HTSMessage SendAndGetResponse(HTSMessage message, CancellationToken cancellationToken, TimeSpan responseTimeout, bool throwOnTimeout = false)
         {
             var responseHandler = new LoopBackResponseHandler();
             int sequence = sendMessage(message, responseHandler);
@@ -418,7 +418,7 @@ namespace TVHeadEnd.HTSP
                 var timeout = responseTimeout <= TimeSpan.Zero ? DefaultResponseTimeout : responseTimeout;
                 return responseHandler.GetResponseAsync(cancellationToken, timeout).GetAwaiter().GetResult();
             }
-            catch (TimeoutException)
+            catch (TimeoutException) when (!throwOnTimeout)
             {
                 return null;
             }

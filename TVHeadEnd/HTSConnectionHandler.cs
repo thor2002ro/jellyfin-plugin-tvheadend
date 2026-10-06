@@ -224,7 +224,7 @@ namespace TVHeadEnd
             _configured = true;
         }
 
-        private static string NormalizeWebRoot(string webRoot)
+        internal static string NormalizeWebRoot(string webRoot)
         {
             if (string.IsNullOrWhiteSpace(webRoot))
             {

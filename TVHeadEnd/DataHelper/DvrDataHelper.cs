@@ -14,6 +14,10 @@ namespace TVHeadEnd.DataHelper
     {
         private readonly ILogger<DvrDataHelper> _logger;
         private readonly Dictionary<string, HTSMessage> _data;
+        private readonly Dictionary<string, DateTime> _lastUpdated = new();
+        private long _revision;
+
+        internal long Revision { get { lock (_data) return _revision; } }
 
         private readonly DateTime _initialDateTimeUTC = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
@@ -27,7 +31,9 @@ namespace TVHeadEnd.DataHelper
         {
             lock (_data)
             {
+                if (_data.Count > 0) _revision++;
                 _data.Clear();
+                _lastUpdated.Clear();
             }
         }
 
@@ -42,6 +48,7 @@ namespace TVHeadEnd.DataHelper
                     return;
                 }
                 _data.Add(id, message);
+                MarkChanged(id);
             }
         }
 
@@ -55,14 +62,15 @@ namespace TVHeadEnd.DataHelper
                     _logger.LogDebug("[TVHclient] DvrDataHelper.dvrEntryUpdate id not in database - skipping");
                     return;
                 }
+                var changed = false;
                 foreach (KeyValuePair<string, object> entry in message)
                 {
-                    if (oldMessage.containsField(entry.Key))
-                    {
-                        oldMessage.removeField(entry.Key);
-                    }
+                    if (entry.Key is "method" or "seq") continue;
+                    changed |= !oldMessage.containsField(entry.Key)
+                        || !ChannelDataHelper.FieldsEqual(oldMessage.GetField(entry.Key), entry.Value);
                     oldMessage.putField(entry.Key, entry.Value);
                 }
+                if (changed) MarkChanged(id);
             }
         }
 
@@ -71,8 +79,17 @@ namespace TVHeadEnd.DataHelper
             string id = message.getString("id");
             lock (_data)
             {
-                _data.Remove(id);
+                if (_data.Remove(id)) _revision++;
+                _lastUpdated.Remove(id);
             }
+        }
+
+        private void MarkChanged(string id)
+        {
+            _revision++;
+            var previous = _lastUpdated.GetValueOrDefault(id);
+            var now = DateTime.UtcNow;
+            _lastUpdated[id] = now > previous ? now : previous.AddTicks(1);
         }
 
         public long ResolveDvrId(string dvrId)
@@ -113,7 +130,7 @@ namespace TVHeadEnd.DataHelper
                         }
 
                         HTSMessage m = entry.Value;
-                        MyRecordingInfo ri = new MyRecordingInfo();
+                        MyRecordingInfo ri = new MyRecordingInfo { DateLastUpdated = _lastUpdated[entry.Key] };
 
                         if (m.TryGetString("error", out var error)
                             && error.Contains("missing", StringComparison.OrdinalIgnoreCase))
@@ -196,7 +213,8 @@ namespace TVHeadEnd.DataHelper
                             ri.IsSeries = true;
                         }
 
-                        ri.HasImage = false;
+                        if (m.TryGetString("image", out var image)) ri.ImageUrl = image;
+                        ri.HasImage = !string.IsNullOrWhiteSpace(ri.ImageUrl);
 
                         if (m.TryGetString("state", out var state))
                         {

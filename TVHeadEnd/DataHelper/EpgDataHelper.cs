@@ -63,6 +63,11 @@ public sealed class EpgDataHelper
         }
     }
 
+    internal HTSMessage GetEvent(long eventId)
+    {
+        lock (_events) return _events.TryGetValue(eventId, out var message) ? Clone(message) : null;
+    }
+
     public HTSMessage[] GetEvents(long channel, long startUnix = long.MinValue, long endUnix = long.MaxValue)
     {
         lock (_events)

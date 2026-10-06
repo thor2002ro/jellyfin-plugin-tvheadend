@@ -106,7 +106,7 @@ namespace TVHeadEnd.DataHelper
             lock (_data) return _data.Remove(channelId);
         }
 
-        private static bool FieldsEqual(object left, object right, bool unordered = false)
+        internal static bool FieldsEqual(object left, object right, bool unordered = false)
         {
             if (left is IList leftList && right is IList rightList)
             {

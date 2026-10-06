@@ -15,6 +15,19 @@ Jellyfin plugin, with fork-specific changes.
 - TVHeadend recording management from Jellyfin, including DVR profiles,
   priorities, pre/post padding, and an optional synthetic "TVHeadend Recordings"
   channel.
+  DVR pushes invalidate that channel's cached listing on its next request,
+  including external additions, completions and deletions. Duplicate pushes
+  do not invalidate; reconnects discard stale entries. The five-minute fallback
+  remains in place without additional polling.
+  Each cached recording also carries a UTC change timestamp for Jellyfin's
+  existing modification-date mapping. Real DVR changes advance it; duplicate
+  pushes do not. Reconnect snapshots establish fresh cache-local timestamps.
+- Recordings reuse broadcaster artwork or existing generated programme thumbnails.
+  Artwork resolved while the EPG is available is cached by server/account and
+  recording ID, so it remains available after EPG expiry. Generated fallback
+  follows the existing programme artwork checkbox and opens no tuner or encoder.
+  Associations and copied thumbnails use the existing 90-day cache retention;
+  slow artwork enrichment is capped at ten seconds and does not hide recordings.
 - Streaming through HTSP, HTTP ticket URLs, or HTTP basic authentication.
 - HTSP direct streaming with shared upstream subscriptions, independent buffered
   readers, clean-keyframe startup, optional initial tune buffering, and a silent

@@ -300,6 +300,9 @@ namespace TVHeadEnd
                         }
                     }
 
+                    foreach (var path in Directory.EnumerateFiles(cacheDirectory, "*.recording"))
+                        if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow - ImageCacheRetention) File.Delete(path);
+
                     foreach (var path in EnumerateCachedImages(cacheDirectory, string.Empty))
                     {
                         var sourcePath = Path.Combine(
@@ -1159,13 +1162,112 @@ namespace TVHeadEnd
 
         public async Task<IEnumerable<MyRecordingInfo>> BuildDvrInfos(CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var revision = RecordingRevision;
             var recordings = await _dvrDataHelper.buildDvrInfos(cancellationToken).ConfigureAwait(false);
-            foreach (var recording in recordings)
+            var artwork = recordings.Select(recording =>
             {
-                recording.ChannelId = GetExternalChannelId(recording.ChannelId);
+                var source = recording.ImageUrl;
+                recording.ImageUrl = null;
+                recording.HasImage = false;
+                return (recording, source);
+            }).ToArray();
+            using var artworkBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            artworkBudget.CancelAfter(TimeSpan.FromSeconds(10));
+            try
+            {
+                await Parallel.ForEachAsync(artwork, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = artworkBudget.Token },
+                    async (item, token) =>
+                    {
+                        try { await ResolveRecordingArtworkAsync(item.recording, item.source, revision, token).ConfigureAwait(false); }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                        catch (Exception ex) { _logger.LogDebug(ex, "Recording artwork unavailable for {RecordingId}", item.recording.Id); }
+                    }).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (var recording in recordings) recording.ChannelId = GetExternalChannelId(recording.ChannelId);
 
             return recordings;
+        }
+
+        private async Task ResolveRecordingArtworkAsync(MyRecordingInfo recording, string directImage, long revision, CancellationToken token)
+        {
+            var identity = GetProgrammeConnectionIdentity();
+            if (identity == null || identity != ProgrammeImageService.CurrentConnectionIdentity) return;
+            var directory = GetImageCacheDirectory();
+            var key = "recording:" + identity + "|" + recording.Id;
+            var association = Path.Combine(directory, GetImageFilePrefix(key) + ".recording");
+            var epg = long.TryParse(recording.ProgramId, out var eventId) ? _epgDataHelper.GetEvent(eventId) : null;
+            long.TryParse(recording.ChannelId, out var channelId);
+            if (epg != null && (!epg.TryGetLong("channelId", out var epgChannel) || epgChannel != channelId
+                || !epg.TryGetLong("start", out var start) || !epg.TryGetLong("stop", out var stop)
+                || start < 0 || stop < start || stop > 253402300799L
+                || DateTimeOffset.FromUnixTimeSeconds(start).UtcDateTime >= recording.EndDate
+                || DateTimeOffset.FromUnixTimeSeconds(stop).UtcDateTime <= recording.StartDate)) epg = null;
+            var source = ResolveImageUrl(directImage) ?? ResolveImageUrl(epg?.getString("image", null));
+            if (string.IsNullOrWhiteSpace(source) && File.Exists(association))
+                source = ResolveImageUrl(await File.ReadAllTextAsync(association, token).ConfigureAwait(false));
+            var sourceKey = key + ":association";
+            var sourceFingerprint = GetImageFilePrefix(source ?? "generated");
+            bool StillCurrent() => revision == RecordingRevision && identity == ProgrammeImageService.CurrentConnectionIdentity
+                && identity == GetProgrammeConnectionIdentity()
+                && _channelImageSources.TryGetValue(sourceKey, out var latest) && latest == sourceFingerprint;
+            if (revision != RecordingRevision) return;
+            lock (_channelImageSources) _channelImageSources[sourceKey] = sourceFingerprint;
+            string image = null;
+            if (!string.IsNullOrWhiteSpace(source))
+            {
+                var cached = await CacheImageAsync(source, key, token).ConfigureAwait(false);
+                image = cached.ImagePath ?? cached.ImageUrl;
+                var resolved = ResolveImageUrl(source);
+                if (image != null && resolved != null && StillCurrent())
+                {
+                    Directory.CreateDirectory(directory);
+                    if (!File.Exists(association) || await File.ReadAllTextAsync(association, token).ConfigureAwait(false) != resolved)
+                    {
+                        var temporary = association + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                        try
+                        {
+                            await File.WriteAllTextAsync(temporary, resolved, token).ConfigureAwait(false);
+                            lock (_channelImageSources)
+                                if (StillCurrent()) File.Move(temporary, association, true);
+                        }
+                        finally { File.Delete(temporary); }
+                    }
+                }
+            }
+            if (image == null && Plugin.Instance.Configuration.GenerateMissingProgrammeImages)
+            {
+                image = FindCachedImage(directory, key);
+                if (image == null && epg != null)
+                {
+                    var generated = ProgrammeImageService.GetImagePath(channelId, recording.ProgramId,
+                        DateTimeOffset.FromUnixTimeSeconds(epg.getLong("start")).UtcDateTime);
+                    if (File.Exists(generated))
+                    {
+                        ValidateImage(generated);
+                        image = Path.Combine(directory, GetImageFilePrefix(key) + ".jpg");
+                        var temporary = image + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                        try
+                        {
+                            File.Copy(generated, temporary);
+                            token.ThrowIfCancellationRequested();
+                            lock (_channelImageSources)
+                            {
+                                if (!StillCurrent()) return;
+                                File.Move(temporary, image, true);
+                            }
+                        }
+                        finally { File.Delete(temporary); }
+                    }
+                }
+            }
+            if (!StillCurrent()) return;
+            if (File.Exists(image)) TouchCachedImage(image);
+            if (File.Exists(association)) TouchCachedImage(association);
+            recording.ImageUrl = image;
+            recording.HasImage = !string.IsNullOrEmpty(image);
         }
 
         public async Task<IEnumerable<SeriesTimerInfo>> BuildAutorecInfos(CancellationToken cancellationToken)
@@ -1274,6 +1376,8 @@ namespace TVHeadEnd
 
         public HTSMessage[] GetCachedEvents(long channelId, long startUnix = long.MinValue, long endUnix = long.MaxValue)
             => _epgDataHelper.GetEvents(channelId, startUnix, endUnix);
+
+        internal long RecordingRevision => _dvrDataHelper.Revision;
 
         internal string GetExternalChannelId(long channelId) => _channelDataHelper.GetExternalChannelId(channelId);
 

@@ -95,6 +95,7 @@ namespace TVHeadEnd
             values.Add(Math.Floor(minute).ToString(CultureInfo.InvariantCulture));
 
             values.Add(_liveTvService._lastRecordingChange.Ticks.ToString(CultureInfo.InvariantCulture));
+            values.Add(_htsConnectionHandler.RecordingRevision.ToString(CultureInfo.InvariantCulture));
 
             return string.Join("-", values.ToArray());
         }

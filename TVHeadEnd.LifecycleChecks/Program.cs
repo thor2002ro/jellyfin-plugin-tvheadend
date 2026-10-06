@@ -29,6 +29,318 @@ public sealed class PluginTests
     private const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
     private const BindingFlags PrivateStatic = BindingFlags.Static | BindingFlags.NonPublic;
 
+    [Fact]
+    public async Task AlreadyCancelledImageCallerDoesNotStartADownload()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tvheadend-cancelled-image-" + Guid.NewGuid().ToString("N"));
+        var (_, imageEncoder) = ConfigureImageCache(root);
+        var response = new MissingImageResponseHandler();
+        try
+        {
+            using var handler = new HTSConnectionHandler(NullLoggerFactory.Instance,
+                new TestHttpClientFactory(new HttpClient(response)), imageEncoder);
+            using var cancellation = new CancellationTokenSource();
+            await cancellation.CancelAsync();
+            await Xunit.Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => handler.CacheImageAsync("artwork/cancelled", null, cancellation.Token));
+            Xunit.Assert.Equal(0, response.RequestCount);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task CancelledEpgImageCallerDoesNotRetainTheCompletedSharedDownload()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tvheadend-cancelled-epg-" + Guid.NewGuid().ToString("N"));
+        var (_, imageEncoder) = ConfigureImageCache(root);
+        var response = new BlockingImageResponseHandler();
+        try
+        {
+            using var handler = new HTSConnectionHandler(NullLoggerFactory.Instance,
+                new TestHttpClientFactory(new HttpClient(response)), imageEncoder);
+            using var cancellation = new CancellationTokenSource();
+            var caller = handler.CacheImageAsync("artwork/cancelled-epg", null, cancellation.Token);
+            await response.Started.WaitAsync(TimeSpan.FromSeconds(5));
+            var downloads = (ConcurrentDictionary<string, Lazy<Task<string>>>)typeof(HTSConnectionHandler)
+                .GetField("_imageDownloads", PrivateInstance)!.GetValue(handler)!;
+            var shared = downloads.Values.Single().Value;
+            await cancellation.CancelAsync();
+            await Xunit.Assert.ThrowsAnyAsync<OperationCanceledException>(() => caller);
+            response.Release();
+            var path = await shared.WaitAsync(TimeSpan.FromSeconds(5));
+            Xunit.Assert.True(File.Exists(path));
+            Xunit.Assert.Empty(downloads);
+            var cached = await handler.CacheImageAsync("artwork/cancelled-epg", null, CancellationToken.None);
+            Xunit.Assert.Equal(path, cached.ImagePath);
+            Xunit.Assert.Equal(1, response.RequestCount);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Theory]
+    [InlineData("denied", true)]
+    [InlineData("timeout", true)]
+    [InlineData("missing", false)]
+    public void HtspArtworkConnectionFailuresStopTheRefreshCascade(string failure, bool expected)
+    {
+        Exception error = failure switch {
+            "denied" => new UnauthorizedAccessException(),
+            "timeout" => new TimeoutException(),
+            _ => new IOException("Image not found") };
+        var stop = typeof(HTSConnectionHandler).GetMethod("ShouldStopImageRefresh", PrivateStatic)!;
+        Xunit.Assert.Equal(expected, (bool)stop.Invoke(null, new object[] { error }));
+    }
+
+    [Theory]
+    [InlineData(false, false, false, false)]
+    [InlineData(true, false, false, false)]
+    [InlineData(false, true, false, false)]
+    [InlineData(false, false, true, false)]
+    [InlineData(false, false, false, true)]
+    public async Task HtspArtworkPublicCacheHandlesPermissionsAndLateOpen(bool denied, bool lateOpen, bool httpFailure, bool cancelAuthentication)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "tvheadend-htsp-art-" + Guid.NewGuid().ToString("N"));
+        var (plugin, imageEncoder) = ConfigureImageCache(root);
+        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        plugin.UpdateConfiguration(new PluginConfiguration {
+            TVH_ServerName = "127.0.0.1", HTSP_Port = ((IPEndPoint)listener.LocalEndpoint).Port,
+            WebRoot = "/root", Username = "user", Password = "password" });
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var png = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
+        var hellos = 0;
+        var closes = 0;
+        var denials = 0;
+        var authenticationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAuthentication = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = Task.Run(async () =>
+        {
+            using var client = await listener.AcceptTcpClientAsync(stop.Token);
+            using var network = client.GetStream();
+            try
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    var header = new byte[4];
+                    await network.ReadExactlyAsync(header, stop.Token);
+                    var length = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(header);
+                    Xunit.Assert.InRange(length, 0, 65536);
+                    var frame = new byte[length + 4];
+                    header.CopyTo(frame, 0);
+                    await network.ReadExactlyAsync(frame.AsMemory(4), stop.Token);
+                    var request = HTSMessage.parse(frame, NullLogger<HTSMessage>.Instance);
+                    var reply = new HTSMessage();
+                    reply.putField("seq", request.GetField("seq"));
+                    if (request.Method == "authenticate" && cancelAuthentication)
+                    {
+                        authenticationStarted.TrySetResult();
+                        await releaseAuthentication.Task.WaitAsync(stop.Token);
+                    }
+                    if (request.Method == "hello")
+                    {
+                        hellos++;
+                        reply.putField("htspversion", 44);
+                        reply.putField("webroot", "/root");
+                        reply.putField("challenge", new byte[32]);
+                    }
+                    if (request.Method == "fileOpen")
+                    {
+                        if (lateOpen) await Task.Delay(TimeSpan.FromSeconds(6), stop.Token);
+                        if (denied)
+                        {
+                            denials++;
+                            reply.putField("noaccess", 1);
+                        }
+                        else if (request.getString("file") == "imagecache/43") reply.putField("error", "Image not found");
+                        else
+                        {
+                            Xunit.Assert.Equal("imagecache/42", request.getString("file"));
+                            reply.putField("id", 7);
+                            reply.putField("size", png.Length);
+                        }
+                    }
+                    if (request.Method == "fileRead") reply.putField("data", png);
+                    if (request.Method == "fileClose") closes++;
+                    await network.WriteAsync(reply.BuildBytes(), stop.Token);
+                }
+            }
+            catch (Exception ex) when (ex is OperationCanceledException || ex is IOException) { }
+        });
+        var http = new ArtworkHttpResponseHandler(png);
+        try
+        {
+            using var handler = new HTSConnectionHandler(NullLoggerFactory.Instance,
+                new TestHttpClientFactory(new HttpClient(http)), imageEncoder);
+            handler.BeginImageRefresh(["channel:42"]);
+            if (cancelAuthentication)
+            {
+                using var cancelledCaller = new CancellationTokenSource();
+                var caller = Task.Run(() => handler.CacheImageAsync("imagecache/42", null, cancelledCaller.Token));
+                await authenticationStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                try
+                {
+                    await cancelledCaller.CancelAsync();
+                    await Xunit.Assert.ThrowsAnyAsync<OperationCanceledException>(
+                        () => caller.WaitAsync(TimeSpan.FromSeconds(1)));
+                }
+                finally
+                {
+                    releaseAuthentication.TrySetResult();
+                    var downloads = (ConcurrentDictionary<string, Lazy<Task<string>>>)typeof(HTSConnectionHandler)
+                        .GetField("_imageDownloads", PrivateInstance)!.GetValue(handler)!;
+                    var shared = downloads.Values.FirstOrDefault()?.Value;
+                    if (shared != null) await shared.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                return;
+            }
+            if (httpFailure)
+            {
+                http.Forbidden = true;
+                var unavailable = await handler.CacheImageAsync("artwork/private.png", "channel:private", stop.Token);
+                Xunit.Assert.Null(unavailable.ImagePath);
+                http.Forbidden = false;
+                var suppressed = await handler.CacheImageAsync("artwork/other.png", "channel:other", stop.Token);
+                Xunit.Assert.Null(suppressed.ImagePath);
+                Xunit.Assert.Equal(1, http.RequestCount);
+            }
+            var channel = await handler.CacheImageAsync("imagecache/42", "channel:42", stop.Token);
+            if (lateOpen)
+            {
+                Xunit.Assert.Null(channel.ImagePath);
+                var connection = (HTSConnectionAsync)typeof(HTSConnectionHandler).GetField("_htsConnection", PrivateInstance)!.GetValue(handler)!;
+                Xunit.Assert.True(connection.needsRestart(), "An unacknowledged file open retained its metadata socket and server handle.");
+                var independentHttp = await handler.CacheImageAsync("artwork/ready.png", "channel:http", stop.Token);
+                Xunit.Assert.NotNull(independentHttp.ImagePath);
+                return;
+            }
+            Xunit.Assert.NotNull(channel.ImagePath);
+            Xunit.Assert.Equal(png, await File.ReadAllBytesAsync(channel.ImagePath, stop.Token));
+            var programmes = await Task.WhenAll(Enumerable.Range(0, 50)
+                .Select(_ => handler.CacheImageAsync("imagecache/42", null, stop.Token)));
+            Xunit.Assert.Single(programmes.Select(p => p.ImagePath).Distinct());
+            var programme = programmes[0];
+            Xunit.Assert.NotNull(programme.ImagePath);
+            var failed = await handler.CacheImageAsync("imagecache/43", "channel:42", stop.Token);
+            Xunit.Assert.Equal(channel.ImagePath, failed.ImagePath);
+            Xunit.Assert.Equal(1, hellos);
+            Xunit.Assert.Equal(denied ? 0 : 2, closes);
+            Xunit.Assert.Equal((denied ? 3 : 0) + (httpFailure ? 1 : 0), http.RequestCount);
+            Xunit.Assert.Equal(denied ? 1 : 0, denials);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            listener.Stop();
+            await server;
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Theory]
+    [InlineData("imagecache/42", "http://tvh:9981/root/imagecache/42")]
+    [InlineData("/imagecache/42", "http://tvh:9981/root/imagecache/42")]
+    [InlineData("/root/imagecache/42", "http://tvh:9981/root/imagecache/42")]
+    [InlineData("//images.example/logo.png", "http://images.example/logo.png")]
+    [InlineData("https://images.example/logo.png", "https://images.example/logo.png")]
+    public void ArtworkUrlResolutionDoesNotDuplicateWebRootsOrRewriteExternalHosts(string supplied, string expected)
+    {
+        var resolve = typeof(HTSConnectionHandler).GetMethod("ResolveImageUrl", PrivateStatic,
+            null, new[] { typeof(string), typeof(string) }, null)!;
+        Xunit.Assert.Equal(expected, resolve.Invoke(null, new object[] { "http://tvh:9981/root", supplied }));
+    }
+
+    [Theory]
+    [InlineData("http://tvh:9981/root/imagecache/42", "imagecache/42")]
+    [InlineData("http://tvh:9981/root/imagecache/0042", "imagecache/42")]
+    [InlineData("http://other:9981/root/imagecache/42", null)]
+    [InlineData("http://tvh:9981/imagecache/42", null)]
+    [InlineData("http://tvh:9981/root/imagecache/42/extra", null)]
+    [InlineData("http://tvh:9981/root/imagecache/0", null)]
+    [InlineData("http://tvh:9981/root/imagecache/42?ticket=secret", null)]
+    public void HtspArtworkRoutingRespectsServerAndWebRoot(string url, string expected)
+    {
+        var route = typeof(HTSConnectionHandler).GetMethod("GetHtspImagePath", PrivateStatic);
+        Xunit.Assert.NotNull(route);
+        Xunit.Assert.Equal(expected, route.Invoke(null, new object[] { new Uri("http://tvh:9981/root"), new Uri(url) }));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task HtspArtworkReaderContinuesPartialReadsAndClosesHandle(bool knownSize)
+    {
+        var read = typeof(HTSConnectionHandler).GetMethod("ReadHtspImageFileAsync", PrivateStatic);
+        Xunit.Assert.NotNull(read);
+        var reads = 0;
+        var closed = false;
+        Task<HTSMessage> Send(HTSMessage request, CancellationToken token)
+        {
+            var reply = new HTSMessage();
+            if (request.Method == "fileOpen")
+            {
+                Xunit.Assert.Equal("imagecache/42", request.getString("file"));
+                reply.putField("id", new System.Numerics.BigInteger(7));
+                if (knownSize) reply.putField("size", new System.Numerics.BigInteger(4));
+            }
+            else if (request.Method == "fileRead")
+            {
+                Xunit.Assert.Equal(7L, (long)request.GetField("id"));
+                reply.putField("data", reads++ switch { 0 => new byte[] { 1 }, 1 => new byte[] { 2, 3, 4 }, _ => Array.Empty<byte>() });
+            }
+            else if (request.Method == "fileClose") closed = true;
+            return Task.FromResult(reply);
+        }
+        var data = await (Task<byte[]>)read.Invoke(null, new object[] {
+            "imagecache/42", (Func<HTSMessage, CancellationToken, Task<HTSMessage>>)Send, CancellationToken.None });
+        Xunit.Assert.Equal(new byte[] { 1, 2, 3, 4 }, data);
+        Xunit.Assert.True(closed);
+    }
+
+    [Theory]
+    [InlineData("oversize")]
+    [InlineData("truncated")]
+    [InlineData("missing-data")]
+    [InlineData("oversized-chunk")]
+    [InlineData("cancelled")]
+    public async Task HtspArtworkFailuresAlwaysCloseTheHandle(string failure)
+    {
+        var read = typeof(HTSConnectionHandler).GetMethod("ReadHtspImageFileAsync", PrivateStatic);
+        Xunit.Assert.NotNull(read);
+        using var cancellation = new CancellationTokenSource();
+        var closed = false;
+        async Task<HTSMessage> Send(HTSMessage request, CancellationToken token)
+        {
+            var reply = new HTSMessage();
+            if (request.Method == "fileOpen")
+            {
+                reply.putField("id", new System.Numerics.BigInteger(7));
+                if (failure == "oversize") reply.putField("size", new System.Numerics.BigInteger(20 * 1024 * 1024 + 1));
+                if (failure == "truncated") reply.putField("size", new System.Numerics.BigInteger(4));
+            }
+            if (request.Method == "fileRead")
+            {
+                if (failure == "cancelled")
+                {
+                    await cancellation.CancelAsync();
+                    return await Task.FromCanceled<HTSMessage>(token);
+                }
+                if (failure != "missing-data") reply.putField("data", failure == "oversized-chunk"
+                    ? new byte[(int)(long)request.GetField("size") + 1] : Array.Empty<byte>());
+            }
+            if (request.Method == "fileClose")
+            {
+                Xunit.Assert.False(token.IsCancellationRequested);
+                closed = true;
+            }
+            return reply;
+        }
+        Func<Task> act = () => (Task<byte[]>)read.Invoke(null, new object[] {
+            "imagecache/42", (Func<HTSMessage, CancellationToken, Task<HTSMessage>>)Send, cancellation.Token });
+        if (failure == "cancelled") await Xunit.Assert.ThrowsAnyAsync<OperationCanceledException>(act);
+        else await Xunit.Assert.ThrowsAsync<InvalidDataException>(act);
+        Xunit.Assert.True(closed);
+    }
+
     [Theory]
     [InlineData("en", "eng")]
     [InlineData(" RO ", "ron")]
@@ -662,7 +974,8 @@ public sealed class PluginTests
         (Func<bool>)(() => true),
         null!,
         null!,
-        CancellationToken.None
+        CancellationToken.None,
+        null!
         };
 
         try
@@ -801,7 +1114,7 @@ public sealed class PluginTests
             Assert(File.Exists(recentTemporaryPath), "An active image download was pruned.");
 
             var first = handler.CacheImageAsync(
-                "imagecache/42",
+                "artwork/42",
                 "channel:42",
                 CancellationToken.None).GetAwaiter().GetResult();
             Assert(File.Exists(first.ImagePath), "The public cache flow did not create a local image.");
@@ -811,7 +1124,7 @@ public sealed class PluginTests
             var requestCount = responseHandler.RequestCount;
             handler.BeginImageRefresh(["channel:42"]);
             var second = handler.CacheImageAsync(
-                "imagecache/42",
+                "artwork/42",
                 "channel:42",
                 CancellationToken.None).GetAwaiter().GetResult();
             Assert(first.ImagePath == second.ImagePath, "An unchanged guide refresh changed the cached image path.");
@@ -824,11 +1137,11 @@ public sealed class PluginTests
                 imageEncoder);
             missingHandler.BeginImageRefresh(["channel:404"]);
             var missing = missingHandler.CacheImageAsync(
-                "imagecache/404",
+                "artwork/404",
                 "channel:404",
                 CancellationToken.None).GetAwaiter().GetResult();
             missingHandler.CacheImageAsync(
-                "imagecache/404",
+                "artwork/404",
                 "channel:404",
                 CancellationToken.None).GetAwaiter().GetResult();
             Assert(missing.ImagePath is null, "A missing TVHeadend image produced a cache path.");
@@ -836,7 +1149,7 @@ public sealed class PluginTests
             Assert(GetPrivateCollectionCount(missingHandler, "_imageDownloads") == 1, "A missing image result was not retained for its guide refresh.");
             missingHandler.BeginImageRefresh(["channel:404"]);
             missingHandler.CacheImageAsync(
-                "imagecache/404",
+                "artwork/404",
                 "channel:404",
                 CancellationToken.None).GetAwaiter().GetResult();
             Assert(missingResponse.RequestCount == 2, "A missing image was not retried on the next guide refresh.");
@@ -849,7 +1162,7 @@ public sealed class PluginTests
             blockingHandler.BeginImageRefresh(["channel:99"]);
             using var cancellation = new CancellationTokenSource();
             var canceledRequest = blockingHandler.CacheImageAsync(
-                "imagecache/99",
+                "artwork/99",
                 "channel:99",
                 cancellation.Token);
             blockingResponse.Started.GetAwaiter().GetResult();
@@ -867,7 +1180,7 @@ public sealed class PluginTests
             Assert(canceled, "Canceling a guide refresh did not release its caller.");
             blockingResponse.Release();
             var recovered = blockingHandler.CacheImageAsync(
-                "imagecache/99",
+                "artwork/99",
                 "channel:99",
                 CancellationToken.None).GetAwaiter().GetResult();
             Assert(File.Exists(recovered.ImagePath), "A canceled caller prevented the shared cache download from completing.");
@@ -988,6 +1301,21 @@ public sealed class PluginTests
     static object GetMuxerStreamField(object stream, string fieldName)
     {
         return stream.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(stream)!;
+    }
+}
+
+sealed class ArtworkHttpResponseHandler(byte[] image) : HttpMessageHandler
+{
+    public int RequestCount { get; private set; }
+    public bool Forbidden { get; set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        RequestCount++;
+        if (Forbidden) return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden));
+        return Task.FromResult(request.RequestUri.AbsolutePath.EndsWith("/43", StringComparison.Ordinal)
+            ? new HttpResponseMessage(HttpStatusCode.NotFound)
+            : new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(image) });
     }
 }
 

@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -16,6 +17,7 @@ using Microsoft.Extensions.Logging;
 using TVHeadEnd.Configuration;
 using TVHeadEnd.DataHelper;
 using TVHeadEnd.HTSP;
+using TVHeadEnd.HTSP_Responses;
 
 
 namespace TVHeadEnd
@@ -43,7 +45,8 @@ namespace TVHeadEnd
         private readonly SemaphoreSlim _imageDownloadSlots = new(4);
         private readonly CancellationTokenSource _disposeCancellation = new();
         private int _imageRefreshGeneration;
-        private int _imageRefreshUnavailableGeneration = -1;
+        private int _httpImageRefreshUnavailableGeneration = -1;
+        private int _htspImageRefreshUnavailableGeneration = -1;
         private int _disposed;
 
         private TaskCompletionSource<bool> _initialLoad = CreateInitialLoadCompletion();
@@ -51,6 +54,7 @@ namespace TVHeadEnd
         private volatile Boolean _configured = false;
 
         private HTSConnectionAsync _htsConnection;
+        private HTSConnectionAsync _htspArtworkDeniedConnection;
         private int _priority;
         private string _profile;
         private string _httpBaseUrl;
@@ -241,6 +245,7 @@ namespace TVHeadEnd
             var activeKeys = activeChannelCacheKeys.ToHashSet(StringComparer.Ordinal);
             lock (_channelImageSources)
             {
+                Interlocked.Increment(ref _imageRefreshGeneration);
                 foreach (var cacheKey in _channelImageSources.Keys)
                 {
                     if (!activeKeys.Contains(cacheKey))
@@ -259,7 +264,6 @@ namespace TVHeadEnd
                 }
             }
 
-            Interlocked.Increment(ref _imageRefreshGeneration);
             var cacheDirectory = GetImageCacheDirectory();
             var activePrefixes = activeKeys
                 .Select(GetImageFilePrefix)
@@ -334,11 +338,22 @@ namespace TVHeadEnd
             }
 
             imageUrl = imageUrl.Trim();
+            var baseUri = new Uri(httpBaseUrl);
+            if (imageUrl.StartsWith("//", StringComparison.Ordinal))
+            {
+                return new Uri(baseUri, imageUrl).AbsoluteUri;
+            }
             if (Uri.TryCreate(imageUrl, UriKind.Absolute, out var absoluteUri))
             {
                 return absoluteUri.Scheme == Uri.UriSchemeHttp || absoluteUri.Scheme == Uri.UriSchemeHttps
                     ? absoluteUri.AbsoluteUri
                     : null;
+            }
+
+            var webRoot = baseUri.AbsolutePath.TrimEnd('/');
+            if (imageUrl.StartsWith(webRoot + "/", StringComparison.Ordinal))
+            {
+                return baseUri.GetLeftPart(UriPartial.Authority) + imageUrl;
             }
 
             return httpBaseUrl + "/" + imageUrl.TrimStart('/');
@@ -350,6 +365,7 @@ namespace TVHeadEnd
             CancellationToken cancellationToken)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            cancellationToken.ThrowIfCancellationRequested();
             var resolvedUrl = ResolveImageUrl(imageUrl);
             if (!Uri.TryCreate(resolvedUrl, UriKind.Absolute, out var imageUri)
                 || !Uri.TryCreate(_httpBaseUrl, UriKind.Absolute, out var baseUri)
@@ -387,33 +403,29 @@ namespace TVHeadEnd
             var operationKey = cacheKey + "\0" + (hasStableCacheKey ? sourceFingerprint : string.Empty);
             var download = _imageDownloads.GetOrAdd(
                 operationKey,
-                _ => new Lazy<Task<string>>(
-                    () => RefreshImageAsync(
-                        imageUri,
-                        cacheDirectory,
-                        cacheKey,
-                        hasStableCacheKey ? sourceFingerprint : null,
-                        generation),
-                    LazyThreadSafetyMode.ExecutionAndPublication));
+                _ =>
+                {
+                    Lazy<Task<string>> operation = null;
+                    operation = new Lazy<Task<string>>(async () =>
+                    {
+                        var path = await RefreshImageAsync(imageUri, cacheDirectory, cacheKey,
+                            hasStableCacheKey ? sourceFingerprint : null, generation).ConfigureAwait(false);
+                        var matchesSource = !hasStableCacheKey;
+                        if (hasStableCacheKey && path is not null)
+                        {
+                            var sourcePath = Path.Combine(cacheDirectory, GetImageFilePrefix(cacheKey) + ".source");
+                            matchesSource = string.Equals(FindCachedChannelImage(cacheDirectory, cacheKey,
+                                sourcePath, sourceFingerprint), path, StringComparison.OrdinalIgnoreCase);
+                        }
+                        // The shared operation owns cleanup even if every API caller has cancelled its wait.
+                        if (path is not null && matchesSource)
+                            _imageDownloads.TryRemove(new KeyValuePair<string, Lazy<Task<string>>>(operationKey, operation));
+                        return path;
+                    }, LazyThreadSafetyMode.ExecutionAndPublication);
+                    return operation;
+                });
 
             var refreshedPath = await download.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
-            var resultMatchesCurrentSource = !hasStableCacheKey;
-            if (hasStableCacheKey && refreshedPath is not null)
-            {
-                var sourcePath = Path.Combine(cacheDirectory, GetImageFilePrefix(cacheKey) + ".source");
-                var currentPath = FindCachedChannelImage(
-                    cacheDirectory,
-                    cacheKey,
-                    sourcePath,
-                    sourceFingerprint);
-                resultMatchesCurrentSource = string.Equals(currentPath, refreshedPath, StringComparison.OrdinalIgnoreCase);
-            }
-
-            if (refreshedPath is not null && resultMatchesCurrentSource)
-            {
-                _imageDownloads.TryRemove(new KeyValuePair<string, Lazy<Task<string>>>(operationKey, download));
-            }
-
             return (refreshedPath ?? cachedPath, null);
         }
 
@@ -431,11 +443,6 @@ namespace TVHeadEnd
             {
                 await _imageDownloadSlots.WaitAsync(_disposeCancellation.Token).ConfigureAwait(false);
                 slotAcquired = true;
-                if (Volatile.Read(ref _imageRefreshUnavailableGeneration) == generation)
-                {
-                    return FindCachedImage(cacheDirectory, cacheKey);
-                }
-
                 if (sourceFingerprint != null)
                 {
                     channelLock = _channelImageLocks.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
@@ -459,6 +466,7 @@ namespace TVHeadEnd
                     }
                 }
 
+                var htspPath = GetHtspImagePath(new Uri(_httpBaseUrl), imageUri);
                 var path = await DownloadImageAsync(
                     _httpClient,
                     imageUri,
@@ -472,24 +480,13 @@ namespace TVHeadEnd
                             && string.Equals(latest, sourceFingerprint, StringComparison.Ordinal),
                     sourceFingerprint is null ? null : _channelImageSources,
                     sourceFingerprint,
-                    _disposeCancellation.Token).ConfigureAwait(false);
+                    _disposeCancellation.Token,
+                    token => ReadArtworkBytesAsync(imageUri, htspPath, generation, token)).ConfigureAwait(false);
 
                 return path;
             }
             catch (Exception ex)
             {
-                if (ShouldStopImageRefresh(ex))
-                {
-                    if (Volatile.Read(ref _imageRefreshGeneration) == generation)
-                    {
-                        Interlocked.Exchange(ref _imageRefreshUnavailableGeneration, generation);
-                        if (Volatile.Read(ref _imageRefreshGeneration) != generation)
-                        {
-                            Interlocked.CompareExchange(ref _imageRefreshUnavailableGeneration, -1, generation);
-                        }
-                    }
-                }
-
                 if (ex is not OperationCanceledException || Volatile.Read(ref _disposed) == 0)
                 {
                     _logger.LogWarning(ex, "[TVHclient] Could not refresh cached image {ImageUrl}", imageUri);
@@ -598,9 +595,45 @@ namespace TVHeadEnd
             }
         }
 
+        private async Task<byte[]> ReadArtworkBytesAsync(Uri imageUri, string htspPath, int generation, CancellationToken token)
+        {
+            if (htspPath is not null)
+            {
+                if (Volatile.Read(ref _htspImageRefreshUnavailableGeneration) == generation) return null;
+                try { return await ReadHtspImageAsync(htspPath, token).ConfigureAwait(false); }
+                catch (UnauthorizedAccessException)
+                {
+                    // Recorder permission is optional for artwork; reuse the authenticated HTTP path.
+                }
+                catch (Exception ex) when (ShouldStopImageRefresh(ex))
+                {
+                    MarkImageRefreshUnavailable(ref _htspImageRefreshUnavailableGeneration, generation);
+                    throw;
+                }
+            }
+
+            if (Volatile.Read(ref _httpImageRefreshUnavailableGeneration) == generation) return null;
+            try { return await ReadHttpImageAsync(_httpClient, imageUri, _headers, token).ConfigureAwait(false); }
+            catch (Exception ex) when (ShouldStopImageRefresh(ex))
+            {
+                MarkImageRefreshUnavailable(ref _httpImageRefreshUnavailableGeneration, generation);
+                throw;
+            }
+        }
+
+        private void MarkImageRefreshUnavailable(ref int unavailableGeneration, int generation)
+        {
+            // Share the refresh-generation lock so an older failure cannot overwrite a newer refresh's state.
+            lock (_channelImageSources)
+            {
+                if (Volatile.Read(ref _imageRefreshGeneration) == generation)
+                    Volatile.Write(ref unavailableGeneration, generation);
+            }
+        }
+
         private static bool ShouldStopImageRefresh(Exception exception)
         {
-            if (exception is OperationCanceledException)
+            if (exception is OperationCanceledException or UnauthorizedAccessException or TimeoutException)
             {
                 return true;
             }
@@ -651,6 +684,98 @@ namespace TVHeadEnd
             }
         }
 
+        private static string GetHtspImagePath(Uri baseUri, Uri imageUri)
+        {
+            var prefix = baseUri.AbsolutePath.TrimEnd('/') + "/imagecache/";
+            if (!SameOrigin(baseUri, imageUri) || imageUri.Query.Length != 0 || imageUri.Fragment.Length != 0
+                || !imageUri.AbsolutePath.StartsWith(prefix, StringComparison.Ordinal)) return null;
+            var value = imageUri.AbsolutePath[prefix.Length..];
+            return uint.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var id) && id > 0
+                ? "imagecache/" + id.ToString(CultureInfo.InvariantCulture) : null;
+        }
+
+        private async Task<byte[]> ReadHtspImageAsync(string path, CancellationToken cancellationToken)
+        {
+            // Match metadata loading: reconnect/authentication must not block a Jellyfin caller's cancellable wait.
+            await Task.Run(() => ensureConnection(cancellationToken), cancellationToken).ConfigureAwait(false);
+            // File handles belong to a connection; reconnecting must never send an old handle to a new socket.
+            var connection = _htsConnection;
+            if (ReferenceEquals(_htspArtworkDeniedConnection, connection))
+                throw new UnauthorizedAccessException("TVHeadend denied HTSP image access.");
+            return await ReadHtspImageFileAsync(path, async (message, token) =>
+            {
+                token.ThrowIfCancellationRequested();
+                var handler = new LoopBackResponseHandler();
+                var sequence = connection.sendMessage(message, handler);
+                try
+                {
+                    var reply = await handler.GetResponseAsync(token, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                    if (reply.getInt("noaccess", 0) != 0)
+                    {
+                        _htspArtworkDeniedConnection = connection;
+                        throw new UnauthorizedAccessException("TVHeadend denied HTSP image access.");
+                    }
+                    if (reply.containsField("error")) throw new IOException(reply.getString("error"));
+                    return reply;
+                }
+                catch (Exception ex) when (message.Method is "fileOpen" or "fileClose"
+                    && ex is OperationCanceledException or TimeoutException)
+                {
+                    // An unacknowledged open/close leaves handle ownership unknown; socket closure releases it.
+                    connection.Dispose();
+                    throw;
+                }
+                finally { connection.RemoveResponseHandler(sequence); }
+            }, cancellationToken).ConfigureAwait(false);
+        }
+
+        private static async Task<byte[]> ReadHtspImageFileAsync(
+            string path,
+            Func<HTSMessage, CancellationToken, Task<HTSMessage>> send,
+            CancellationToken cancellationToken)
+        {
+            var open = new HTSMessage { Method = "fileOpen" };
+            open.putField("file", path);
+            var reply = await send(open, cancellationToken).WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!reply.TryGetLong("id", out var id) || id < 0 || id > uint.MaxValue)
+                throw new InvalidDataException("TVHeadend returned an invalid image file handle.");
+            try
+            {
+                long size = -1;
+                if (reply.containsField("size") && (!reply.TryGetLong("size", out size) || size < 0 || size > MaximumImageBytes))
+                    throw new InvalidDataException("TVHeadend image exceeds the 20 MiB cache limit or has an invalid size.");
+                using var buffer = new MemoryStream();
+                while (size < 0 || buffer.Length < size)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var want = Math.Min(256 * 1024, (size >= 0 ? size : MaximumImageBytes + 1) - buffer.Length);
+                    var request = new HTSMessage { Method = "fileRead" };
+                    request.putField("id", id);
+                    request.putField("size", want);
+                    reply = await send(request, cancellationToken).WaitAsync(cancellationToken).ConfigureAwait(false);
+                    if (!reply.containsField("data") || reply.GetField("data") is not byte[] data
+                        || data.Length > want || buffer.Length + data.Length > MaximumImageBytes)
+                        throw new InvalidDataException("TVHeadend returned invalid or oversized image data.");
+                    if (data.Length == 0)
+                    {
+                        if (size >= 0 && buffer.Length != size) throw new InvalidDataException("TVHeadend image was truncated.");
+                        break;
+                    }
+                    // A short read is not EOF: HTSP explicitly permits fewer bytes than requested.
+                    buffer.Write(data, 0, data.Length);
+                }
+                return buffer.ToArray();
+            }
+            finally
+            {
+                using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                var close = new HTSMessage { Method = "fileClose" };
+                close.putField("id", id);
+                try { await send(close, closeTimeout.Token).WaitAsync(closeTimeout.Token).ConfigureAwait(false); }
+                catch (Exception) { /* Best effort: socket closure also releases Tvheadend file handles. */ }
+            }
+        }
+
         private static async Task<string> DownloadImageAsync(
             HttpClient httpClient,
             Uri imageUri,
@@ -661,35 +786,17 @@ namespace TVHeadEnd
             Func<bool> canCommit,
             object commitLock,
             string sourceFingerprint,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            Func<CancellationToken, Task<byte[]>> readImage = null)
         {
             Directory.CreateDirectory(cacheDirectory);
-            using var request = new HttpRequestMessage(HttpMethod.Get, imageUri);
-            foreach (var header in headers)
-            {
-                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
-            }
-
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(15));
-            using var response = await httpClient.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                timeout.Token).ConfigureAwait(false);
-            if (response.StatusCode == HttpStatusCode.NotFound)
-            {
-                return FindCachedImage(cacheDirectory, cacheKey);
-            }
-
-            response.EnsureSuccessStatusCode();
-
-            if (response.Content.Headers.ContentLength > MaximumImageBytes)
-            {
-                throw new InvalidDataException("TVHeadend image exceeds the 20 MiB cache limit.");
-            }
-
-            await response.Content.LoadIntoBufferAsync(MaximumImageBytes, timeout.Token).ConfigureAwait(false);
-            var data = await response.Content.ReadAsByteArrayAsync(timeout.Token).ConfigureAwait(false);
+            var data = readImage is null
+                ? await ReadHttpImageAsync(httpClient, imageUri, headers, timeout.Token).ConfigureAwait(false)
+                : await readImage(timeout.Token).ConfigureAwait(false);
+            if (data is null) return FindCachedImage(cacheDirectory, cacheKey);
+            if (data.LongLength > MaximumImageBytes) throw new InvalidDataException("TVHeadend image exceeds the 20 MiB cache limit.");
             var filePrefix = GetImageFilePrefix(cacheKey);
             var extension = GetImageExtension(data);
             var cachedPath = FindCachedImage(cacheDirectory, cacheKey);
@@ -745,6 +852,20 @@ namespace TVHeadEnd
             {
                 File.Delete(temporaryPath);
             }
+        }
+
+        private static async Task<byte[]> ReadHttpImageAsync(HttpClient httpClient, Uri imageUri,
+            IReadOnlyDictionary<string, string> headers, CancellationToken token)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, imageUri);
+            foreach (var header in headers) request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.NotFound) return null;
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength > MaximumImageBytes)
+                throw new InvalidDataException("TVHeadend image exceeds the 20 MiB cache limit.");
+            await response.Content.LoadIntoBufferAsync(MaximumImageBytes, token).ConfigureAwait(false);
+            return await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
         }
 
         private void ValidateImage(string path)

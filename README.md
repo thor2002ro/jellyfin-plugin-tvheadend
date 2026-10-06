@@ -27,6 +27,11 @@ Jellyfin plugin, with fork-specific changes.
 - TVHeadend channel tags imported into Jellyfin, including tag renames/deletions.
 - Audio and subtitle languages preserved from TVHeadend, with probe fallback for
   missing values and consistent ISO-639 codes in Jellyfin and MPEG-TS descriptors.
+- Channel logos and programme artwork fetched from TVHeadend's image cache over
+  the existing HTSP connection, with validated local caching and pruning. Other
+  same-server image paths retain HTTP; external artwork URLs remain external.
+  HTSP file access needs TVHeadend's HTSP recorder permission; accounts without
+  it retain the authenticated HTTP artwork path.
 - An in-plugin MPEG-TS muxer for HTSP payloads, including common video, audio,
   DVB subtitle, teletext, and private/fallback stream handling.
 - Signal monitoring and recovery for HTSP streams, including lock/SNR/UNC
@@ -40,7 +45,8 @@ Jellyfin plugin, with fork-specific changes.
 ## Requirements
 
 - Jellyfin server compatible with plugin ABI `12.0.0.0`.
-- TVHeadend with HTTP and HTSP access enabled.
+- TVHeadend with HTSP access enabled. HTTP access is needed for recordings,
+  HTTP streaming modes, and image URLs outside TVHeadend's image cache.
 - .NET 10 SDK to build from source.
 
 ## Installation

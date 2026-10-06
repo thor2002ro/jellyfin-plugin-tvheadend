@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.LiveTv;
+using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Logging;
 using TVHeadEnd.Configuration;
 using TVHeadEnd.DataHelper;
@@ -33,6 +34,8 @@ namespace TVHeadEnd
         private readonly object _lock = new Object();
         private static readonly TimeSpan InitialLoadTimeout = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromSeconds(10);
+        // Jellyfin rebuilds every provider's guide; event pushes must not cause frequent full rebuilds.
+        private static readonly TimeSpan GuideRefreshInterval = TimeSpan.FromHours(12);
         private static readonly TimeSpan ImageCacheRetention = TimeSpan.FromDays(90);
 
         private readonly ILoggerFactory _loggerFactory;
@@ -72,6 +75,12 @@ namespace TVHeadEnd
 
         // Data helpers
         private readonly ChannelDataHelper _channelDataHelper;
+        private readonly EpgDataHelper _epgDataHelper = new();
+        private readonly ITaskManager _taskManager;
+        private readonly object _guideRefreshLock = new();
+        private readonly Timer _guideRefreshTimer;
+        private DateTime _lastGuideRefreshUtc = DateTime.MinValue;
+        private bool _guideRefreshPending;
         private readonly DvrDataHelper _dvrDataHelper;
         private readonly AutorecDataHelper _autorecDataHelper;
 
@@ -80,12 +89,15 @@ namespace TVHeadEnd
         public HTSConnectionHandler(
             ILoggerFactory loggerFactory,
             IHttpClientFactory httpClientFactory,
-            IImageEncoder imageEncoder)
+            IImageEncoder imageEncoder,
+            ITaskManager taskManager = null)
         {
             _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger<HTSConnectionHandler>();
             _httpClient = httpClientFactory.CreateClient();
             _imageEncoder = imageEncoder;
+            _taskManager = taskManager;
+            _guideRefreshTimer = new Timer(_ => RefreshGuide(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
             _logger.LogDebug("[TVHclient] HTSConnectionHandler");
 
@@ -101,8 +113,14 @@ namespace TVHeadEnd
 
         private void ResetInitialLoad()
         {
-            var previous = Interlocked.Exchange(ref _initialLoad, CreateInitialLoadCompletion());
-            previous.TrySetResult(false);
+            lock (_guideRefreshLock)
+            {
+                _guideRefreshPending = false;
+                if (_disposed == 0) _guideRefreshTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                var previous = Interlocked.Exchange(ref _initialLoad, CreateInitialLoadCompletion());
+                _epgDataHelper.Clean();
+                previous.TrySetResult(false);
+            }
         }
 
         public async Task<int> WaitForInitialLoadAsync(CancellationToken cancellationToken)
@@ -1196,12 +1214,21 @@ namespace TVHeadEnd
                     case "tagAdd":
                     case "tagUpdate":
                     case "tagDelete":
-                        _channelDataHelper.UpdateTag(response);
+                        if (_channelDataHelper.UpdateTag(response)) ScheduleGuideRefresh();
                         break;
 
                     case "channelAdd":
                     case "channelUpdate":
-                        _channelDataHelper.Add(response);
+                        if (_channelDataHelper.Add(response)) ScheduleGuideRefresh();
+                        break;
+
+                    case "channelDelete":
+                        if (response.TryGetLong("channelId", out var channelId))
+                        {
+                            var changed = _channelDataHelper.Remove(channelId);
+                            changed |= _epgDataHelper.RemoveChannel(channelId);
+                            if (changed) ScheduleGuideRefresh();
+                        }
                         break;
 
                     case "dvrEntryAdd":
@@ -1227,7 +1254,10 @@ namespace TVHeadEnd
                     case "eventAdd":
                     case "eventUpdate":
                     case "eventDelete":
-                        // should not happen as we don't subscribe for this events.
+                        if (_epgDataHelper.Update(response))
+                        {
+                            ScheduleGuideRefresh();
+                        }
                         break;
 
                     case "initialSyncCompleted":
@@ -1236,6 +1266,60 @@ namespace TVHeadEnd
 
                     default:
                         break;
+                }
+            }
+        }
+
+        public HTSMessage[] GetCachedEvents(long channelId, long startUnix = long.MinValue, long endUnix = long.MaxValue)
+            => _epgDataHelper.GetEvents(channelId, startUnix, endUnix);
+
+        private void ScheduleGuideRefresh()
+        {
+            lock (_guideRefreshLock)
+            {
+                var initialLoad = Volatile.Read(ref _initialLoad).Task;
+                if (!initialLoad.IsCompletedSuccessfully || !initialLoad.Result) return;
+                if (_disposed != 0 || _taskManager == null || _guideRefreshPending) return;
+                _guideRefreshPending = true;
+                var remaining = _lastGuideRefreshUtc.Add(GuideRefreshInterval) - DateTime.UtcNow;
+                _guideRefreshTimer.Change(remaining > TimeSpan.FromSeconds(30) ? remaining : TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan);
+            }
+        }
+
+        private void RefreshGuide()
+        {
+            lock (_guideRefreshLock)
+            {
+                if (_disposed != 0 || !_guideRefreshPending) return;
+                try
+                {
+                    var worker = _taskManager.ScheduledTasks.FirstOrDefault(task => task.ScheduledTask.Key == "RefreshGuide");
+                    if (worker == null)
+                    {
+                        _guideRefreshPending = false;
+                        return;
+                    }
+                    var lastRefresh = worker.LastExecutionResult?.EndTimeUtc ?? DateTime.MinValue;
+                    if (lastRefresh < _lastGuideRefreshUtc) lastRefresh = _lastGuideRefreshUtc;
+                    var remaining = lastRefresh.Add(GuideRefreshInterval) - DateTime.UtcNow;
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        _guideRefreshTimer.Change(remaining, Timeout.InfiniteTimeSpan);
+                        return;
+                    }
+                    if (worker.State != TaskState.Idle)
+                    {
+                        _guideRefreshTimer.Change(TimeSpan.FromMinutes(1), Timeout.InfiniteTimeSpan);
+                        return;
+                    }
+                    _taskManager.QueueScheduledTask(worker.ScheduledTask, new TaskOptions());
+                    _lastGuideRefreshUtc = DateTime.UtcNow;
+                    _guideRefreshPending = false;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Could not queue Jellyfin guide refresh");
+                    _guideRefreshTimer.Change(TimeSpan.FromMinutes(1), Timeout.InfiniteTimeSpan);
                 }
             }
         }
@@ -1256,6 +1340,7 @@ namespace TVHeadEnd
             }
 
             _disposeCancellation.Cancel();
+            _guideRefreshTimer.Dispose();
             try
             {
                 Task.WhenAll(_imageDownloads.Values

@@ -40,65 +40,94 @@ namespace TVHeadEnd.DataHelper
             }
         }
 
-        public void UpdateTag(HTSMessage message)
+        public bool UpdateTag(HTSMessage message)
         {
             if (!message.TryGetLong("tagId", out var id))
             {
-                return;
+                return false;
             }
 
             lock (_data)
             {
                 if (message.Method == "tagDelete")
                 {
-                    _tags.Remove(id);
+                    return _tags.Remove(id);
                 }
                 else if (message.containsField("tagName") && message.GetField("tagName") is string name)
                 {
-                    _tags[id] = name.Trim();
+                    name = name.Trim();
+                    if (_tags.TryGetValue(id, out var previous) && previous == name) return false;
+                    _tags[id] = name;
+                    return true;
                 }
+                return false;
             }
         }
 
-        public void Add(HTSMessage message)
+        public bool Add(HTSMessage message)
         {
             lock (_data)
             {
                 try
                 {
-                    long channelID = message.getLong("channelId");
-                    if (_data.ContainsKey(channelID))
+                    if (!message.TryGetLong("channelId", out var channelID)) return false;
+                    if (!_data.TryGetValue(channelID, out var storedMessage))
                     {
-                        HTSMessage storedMessage = _data[channelID];
-                        if (storedMessage != null)
-                        {
-                            foreach (KeyValuePair<string, object> entry in message)
-                            {
-                                if (storedMessage.containsField(entry.Key))
-                                {
-                                    storedMessage.removeField(entry.Key);
-                                }
-                                storedMessage.putField(entry.Key, entry.Value);
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogError("[TVHclient] ChannelDataHelper: updated data for channelID '{id}' but no initial data found", channelID);
-                        }
+                        if (!message.TryGetInt("channelNumber", out var number) || number <= 0) return false;
+                        storedMessage = new HTSMessage();
+                        foreach (var entry in message) storedMessage.putField(entry.Key, entry.Value);
+                        _data.Add(channelID, storedMessage);
+                        return true;
                     }
-                    else
+
+                    var changed = false;
+                    foreach (var entry in message)
                     {
-                        if (message.containsField("channelNumber") && message.getInt("channelNumber") > 0) // use only channels with number > 0
+                        if (entry.Key is "channelIdStr" or "channelName" or "channelNumber" or "channelNumberMinor"
+                            or "channelIcon" or "services" or "tags")
                         {
-                            _data.Add(channelID, message);
+                            changed |= !storedMessage.containsField(entry.Key)
+                                || !FieldsEqual(storedMessage.GetField(entry.Key), entry.Value, entry.Key == "tags");
                         }
+                        storedMessage.putField(entry.Key, entry.Value);
                     }
+                    return changed;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "[TVHclient] ChannelDataHelper.Add: exception caught. HTSMessage: {m} ", message);
+                    return false;
                 }
             }
+        }
+
+        public bool Remove(long channelId)
+        {
+            lock (_data) return _data.Remove(channelId);
+        }
+
+        private static bool FieldsEqual(object left, object right, bool unordered = false)
+        {
+            if (left is IList leftList && right is IList rightList)
+            {
+                if (unordered) return new HashSet<object>(leftList.Cast<object>()).SetEquals(rightList.Cast<object>());
+                return leftList.Count == rightList.Count && leftList.Cast<object>().Zip(rightList.Cast<object>())
+                    .All(pair => FieldsEqual(pair.First, pair.Second));
+            }
+            if (left is HTSMessage leftMessage && right is HTSMessage rightMessage)
+            {
+                var leftCount = 0;
+                foreach (var field in leftMessage)
+                {
+                    leftCount++;
+                    if (!rightMessage.containsField(field.Key)
+                        || !FieldsEqual(field.Value, rightMessage.GetField(field.Key))) return false;
+                }
+                var rightCount = 0;
+                foreach (var field in rightMessage) rightCount++;
+                return leftCount == rightCount;
+            }
+            return Equals(left, right);
         }
 
         public long ResolveChannelId(string channelId)

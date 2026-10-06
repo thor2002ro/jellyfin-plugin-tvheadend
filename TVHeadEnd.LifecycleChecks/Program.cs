@@ -111,6 +111,7 @@ public sealed class PluginTests
         var hellos = 0;
         var closes = 0;
         var denials = 0;
+        var getEventsRequests = 0;
         var authenticationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseAuthentication = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var server = Task.Run(async () =>
@@ -129,6 +130,7 @@ public sealed class PluginTests
                     header.CopyTo(frame, 0);
                     await network.ReadExactlyAsync(frame.AsMemory(4), stop.Token);
                     var request = HTSMessage.parse(frame, NullLogger<HTSMessage>.Instance);
+                    if (request.Method == "getEvents") getEventsRequests++;
                     var reply = new HTSMessage();
                     reply.putField("seq", request.GetField("seq"));
                     if (request.Method == "authenticate" && cancelAuthentication)
@@ -162,6 +164,22 @@ public sealed class PluginTests
                     if (request.Method == "fileRead") reply.putField("data", png);
                     if (request.Method == "fileClose") closes++;
                     await network.WriteAsync(reply.BuildBytes(), stop.Token);
+                    if (request.Method == "enableAsyncMetadata")
+                    {
+                        Xunit.Assert.Equal(1, request.getInt("epg"));
+                        var channel = new HTSMessage { Method = "channelAdd" };
+                        channel.putField("channelId", 42);
+                        channel.putField("channelNumber", 1);
+                        var epg = new HTSMessage { Method = "eventAdd" };
+                        epg.putField("eventId", 123);
+                        epg.putField("channelId", 42);
+                        epg.putField("start", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                        epg.putField("stop", DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds());
+                        epg.putField("title", "Pushed programme");
+                        await network.WriteAsync(channel.BuildBytes(), stop.Token);
+                        await network.WriteAsync(epg.BuildBytes(), stop.Token);
+                        await network.WriteAsync(new HTSMessage { Method = "initialSyncCompleted" }.BuildBytes(), stop.Token);
+                    }
                 }
             }
             catch (Exception ex) when (ex is OperationCanceledException || ex is IOException) { }
@@ -214,6 +232,11 @@ public sealed class PluginTests
                 return;
             }
             Xunit.Assert.NotNull(channel.ImagePath);
+            var guideService = new LiveTvService(NullLoggerFactory.Instance, null, handler, null, null, null);
+            var guides = await Task.WhenAll(Enumerable.Range(0, 50).Select(_ =>
+                guideService.GetProgramsAsync("42", DateTime.UtcNow.AddHours(-1), DateTime.UtcNow.AddHours(2), stop.Token)));
+            foreach (var guide in guides) Xunit.Assert.Equal("Pushed programme", Xunit.Assert.Single(guide).Name);
+            Xunit.Assert.Equal(0, getEventsRequests);
             Xunit.Assert.Equal(png, await File.ReadAllBytesAsync(channel.ImagePath, stop.Token));
             var programmes = await Task.WhenAll(Enumerable.Range(0, 50)
                 .Select(_ => handler.CacheImageAsync("imagecache/42", null, stop.Token)));
@@ -426,8 +449,6 @@ public sealed class PluginTests
     public async Task ChannelTagsFollowUpdatesDeletionAndReconnect()
     {
         var helper = new TVHeadEnd.DataHelper.ChannelDataHelper(NullLogger<TVHeadEnd.DataHelper.ChannelDataHelper>.Instance);
-        var update = helper.GetType().GetMethod("UpdateTag");
-        Xunit.Assert.NotNull(update);
         HTSMessage Tag(string method, int id, string name = null)
         {
             var message = new HTSMessage { Method = method };
@@ -435,8 +456,9 @@ public sealed class PluginTests
             message.putField("tagName", name);
             return message;
         }
-        update.Invoke(helper, new object[] { Tag("tagAdd", 1, "Sports") });
-        update.Invoke(helper, new object[] { Tag("tagAdd", 2, "sports") });
+        Xunit.Assert.True(helper.UpdateTag(Tag("tagAdd", 1, " Sports ")));
+        Xunit.Assert.False(helper.UpdateTag(Tag("tagUpdate", 1, "Sports")));
+        helper.UpdateTag(Tag("tagAdd", 2, "sports"));
         var service = new HTSMessage();
         service.putField("type", "hdtv");
         var channel = new HTSMessage();
@@ -448,8 +470,9 @@ public sealed class PluginTests
         helper.Add(channel);
         var info = (await helper.BuildChannelInfos(CancellationToken.None)).Single();
         Xunit.Assert.Equal(new[] { "Sports" }, info.Tags);
-        update.Invoke(helper, new object[] { Tag("tagUpdate", 1, "News") });
-        update.Invoke(helper, new object[] { Tag("tagDelete", 2) });
+        Xunit.Assert.True(helper.UpdateTag(Tag("tagUpdate", 1, "News")));
+        Xunit.Assert.True(helper.UpdateTag(Tag("tagDelete", 2)));
+        Xunit.Assert.False(helper.UpdateTag(Tag("tagDelete", 2)));
         info = (await helper.BuildChannelInfos(CancellationToken.None)).Single();
         Xunit.Assert.Equal(new[] { "News" }, info.Tags);
         helper.Clean();
@@ -1205,7 +1228,7 @@ public sealed class PluginTests
         }
     }
 
-    static T CreateProxy<T>(Func<MethodInfo, object[], object> invoke)
+    internal static T CreateProxy<T>(Func<MethodInfo, object[], object> invoke)
         where T : class
     {
         var proxy = DispatchProxy.Create<T, InterfaceProxy>();

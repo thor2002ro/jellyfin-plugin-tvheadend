@@ -396,6 +396,7 @@ namespace TVHeadEnd.HTSP
                         {
                             HTSMessage enableAsyncMetadataMessage = new HTSMessage();
                             enableAsyncMetadataMessage.Method = "enableAsyncMetadata";
+                            enableAsyncMetadataMessage.putField("epg", 1);
                             sendMessage(enableAsyncMetadataMessage, null);
                         }
                     }

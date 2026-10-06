@@ -728,28 +728,13 @@ namespace TVHeadEnd
 
             GetEventsResponseHandler currGetEventsResponseHandler = new GetEventsResponseHandler(startDateUtc, endDateUtc, _logger);
 
-            HTSMessage queryEvents = new HTSMessage();
-            queryEvents.Method = "getEvents";
-            queryEvents.putField("channelId", _htsConnectionHandler.ResolveChannelId(channelId));
-            queryEvents.putField("maxTime", ((DateTimeOffset)endDateUtc).ToUnixTimeSeconds());
-            int sequence = _htsConnectionHandler.SendMessage(queryEvents, currGetEventsResponseHandler);
-
-            _logger.LogDebug("LiveTvService.GetProgramsAsync: ask TVH for events of channel '{chanid}'", channelId);
-
-            IEnumerable<ProgramInfo> programs;
-            try
-            {
-                programs = await currGetEventsResponseHandler.GetEvents(cancellationToken).WaitAsync(_timeout, cancellationToken);
-            }
-            catch (TimeoutException)
-            {
-                _logger.LogDebug("LiveTvService.GetProgramsAsync: timeout reached while calling for events of channel '{chanid}'", channelId);
-                return [];
-            }
-            finally
-            {
-                _htsConnectionHandler.RemoveResponseHandler(sequence);
-            }
+            var cachedEvents = new HTSMessage();
+            cachedEvents.putField("events", _htsConnectionHandler.GetCachedEvents(
+                _htsConnectionHandler.ResolveChannelId(channelId),
+                ((DateTimeOffset)startDateUtc).ToUnixTimeSeconds(),
+                ((DateTimeOffset)endDateUtc).ToUnixTimeSeconds()));
+            currGetEventsResponseHandler.handleResponse(cachedEvents);
+            var programs = await currGetEventsResponseHandler.GetEvents(cancellationToken).ConfigureAwait(false);
 
             var programList = programs.ToList();
             await Task.WhenAll(programList.Select(async program =>

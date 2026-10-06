@@ -25,6 +25,14 @@ Jellyfin plugin, with fork-specific changes.
   and caches results for 30 minutes with format-change detection. Probe failures
   leave playback available; the Force deinterlace setting still takes precedence.
 - TVHeadend channel tags imported into Jellyfin, including tag renames/deletions.
+  Channel deletion removes the cached channel and its guide immediately. Channel
+  and tag changes use the existing throttled guide refresh; duplicate metadata
+  and current/next-programme pointers do not trigger refreshes.
+- EPG cached from HTSP event pushes on the existing metadata connection, with
+  partial updates, deletions and a fresh snapshot after reconnect. Guide reads
+  reuse that cache instead of requesting each channel separately. Changes are
+  coalesced for 30 seconds and use Jellyfin's guide refresh task at most once per
+  12 hours; an initial dump does not trigger another refresh.
 - Audio and subtitle languages preserved from TVHeadend, with probe fallback for
   missing values and consistent ISO-639 codes in Jellyfin and MPEG-TS descriptors.
 - Channel logos and programme artwork fetched from TVHeadend's image cache over

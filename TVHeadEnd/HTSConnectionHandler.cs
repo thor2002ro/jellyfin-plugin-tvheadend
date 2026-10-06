@@ -1075,6 +1075,7 @@ namespace TVHeadEnd
                     case "tagAdd":
                     case "tagUpdate":
                     case "tagDelete":
+                        _channelDataHelper.UpdateTag(response);
                         break;
 
                     case "channelAdd":

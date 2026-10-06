@@ -24,6 +24,7 @@ Jellyfin plugin, with fork-specific changes.
   probe keeps the complete track list, opens no additional tuner subscription,
   and caches results for 30 minutes with format-change detection. Probe failures
   leave playback available; the Force deinterlace setting still takes precedence.
+- TVHeadend channel tags imported into Jellyfin, including tag renames/deletions.
 - An in-plugin MPEG-TS muxer for HTSP payloads, including common video, audio,
   DVB subtitle, teletext, and private/fallback stream handling.
 - Signal monitoring and recovery for HTSP streams, including lock/SNR/UNC

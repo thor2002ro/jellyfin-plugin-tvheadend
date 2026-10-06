@@ -74,6 +74,42 @@ public sealed class PluginTests
     }
 
     [Fact]
+    public async Task ChannelTagsFollowUpdatesDeletionAndReconnect()
+    {
+        var helper = new TVHeadEnd.DataHelper.ChannelDataHelper(NullLogger<TVHeadEnd.DataHelper.ChannelDataHelper>.Instance);
+        var update = helper.GetType().GetMethod("UpdateTag");
+        Xunit.Assert.NotNull(update);
+        HTSMessage Tag(string method, int id, string name = null)
+        {
+            var message = new HTSMessage { Method = method };
+            message.putField("tagId", new System.Numerics.BigInteger(id));
+            message.putField("tagName", name);
+            return message;
+        }
+        update.Invoke(helper, new object[] { Tag("tagAdd", 1, "Sports") });
+        update.Invoke(helper, new object[] { Tag("tagAdd", 2, "sports") });
+        var service = new HTSMessage();
+        service.putField("type", "hdtv");
+        var channel = new HTSMessage();
+        channel.putField("channelId", new System.Numerics.BigInteger(99));
+        channel.putField("channelNumber", new System.Numerics.BigInteger(1));
+        channel.putField("services", new System.Collections.ArrayList { service });
+        channel.putField("tags", new System.Collections.ArrayList {
+            new System.Numerics.BigInteger(1), new System.Numerics.BigInteger(2), new System.Numerics.BigInteger(500) });
+        helper.Add(channel);
+        var info = (await helper.BuildChannelInfos(CancellationToken.None)).Single();
+        Xunit.Assert.Equal(new[] { "Sports" }, info.Tags);
+        update.Invoke(helper, new object[] { Tag("tagUpdate", 1, "News") });
+        update.Invoke(helper, new object[] { Tag("tagDelete", 2) });
+        info = (await helper.BuildChannelInfos(CancellationToken.None)).Single();
+        Xunit.Assert.Equal(new[] { "News" }, info.Tags);
+        helper.Clean();
+        helper.Add(channel);
+        info = (await helper.BuildChannelInfos(CancellationToken.None)).Single();
+        Xunit.Assert.Empty(info.Tags);
+    }
+
+    [Fact]
     public async Task HtspProbeReadsBufferedOutputAndDeletesItsTemporaryFile()
     {
         using var stream = CreateStream(Guid.NewGuid().ToString("N"));

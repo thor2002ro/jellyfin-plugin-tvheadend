@@ -1,6 +1,8 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Controller.LiveTv;
@@ -14,6 +16,7 @@ namespace TVHeadEnd.DataHelper
     {
         private readonly ILogger<ChannelDataHelper> _logger;
         private readonly Dictionary<long, HTSMessage> _data;
+        private readonly Dictionary<long, string> _tags = new Dictionary<long, string>();
         private string _channelType4Other = "Ignore";
 
         public ChannelDataHelper(ILogger<ChannelDataHelper> logger)
@@ -33,6 +36,27 @@ namespace TVHeadEnd.DataHelper
             lock (_data)
             {
                 _data.Clear();
+                _tags.Clear();
+            }
+        }
+
+        public void UpdateTag(HTSMessage message)
+        {
+            if (!message.TryGetLong("tagId", out var id))
+            {
+                return;
+            }
+
+            lock (_data)
+            {
+                if (message.Method == "tagDelete")
+                {
+                    _tags.Remove(id);
+                }
+                else if (message.containsField("tagName") && message.GetField("tagName") is string name)
+                {
+                    _tags[id] = name.Trim();
+                }
             }
         }
 
@@ -132,6 +156,15 @@ namespace TVHeadEnd.DataHelper
                             ci.Id = m.containsField("channelIdStr") ? m.getString("channelIdStr") : "" + entry.Key;
 
                             ci.ImagePath = "";
+
+                            ci.Tags = m.containsField("tags") && m.GetField("tags") is IList tags
+                                ? tags.Cast<object>().OfType<BigInteger>()
+                                    .Where(id => id >= long.MinValue && id <= long.MaxValue)
+                                    .Select(id => _tags.GetValueOrDefault((long)id))
+                                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray()
+                                : Array.Empty<string>();
 
                             if (m.containsField("channelIcon"))
                             {

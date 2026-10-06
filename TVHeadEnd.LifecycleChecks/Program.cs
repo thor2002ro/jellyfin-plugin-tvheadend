@@ -1086,7 +1086,7 @@ public sealed class PluginTests
         return (int)collection.GetType().GetProperty("Count")!.GetValue(collection)!;
     }
 
-    static (Plugin Plugin, IImageEncoder ImageEncoder) ConfigureImageCache(string root)
+    internal static (Plugin Plugin, IImageEncoder ImageEncoder) ConfigureImageCache(string root)
     {
         var applicationPaths = CreateProxy<IApplicationPaths>((method, _) =>
             method.ReturnType == typeof(string) ? root : GetDefault(method.ReturnType));

@@ -43,6 +43,12 @@ Jellyfin plugin, with fork-specific changes.
   same-server image paths retain HTTP; external artwork URLs remain external.
   HTSP file access needs TVHeadend's HTSP recorder permission; accounts without
   it retain the authenticated HTTP artwork path.
+- Optional programme thumbnails from already-watched HTSP channels. Enable
+  **Generate missing programme artwork from watched channels** in plugin settings
+  and save. Disabled by default; checks every 30 seconds, uses Jellyfin's encoder
+  on existing buffered video and keeps broadcaster or existing artwork preferred.
+  Captures run one at a time without opening another tuner; generated images use
+  the existing image cache and its 90-day cleanup.
 - An in-plugin MPEG-TS muxer for HTSP payloads, including common video, audio,
   DVB subtitle, teletext, and private/fallback stream handling.
 - Signal monitoring and recovery for HTSP streams, including lock/SNR/UNC

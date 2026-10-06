@@ -270,6 +270,7 @@
                 <details class="tvhSection" open>
                     <summary>HTSP streaming and sharing</summary>
                     <div class="tvhSectionBody">
+                        <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkGenerateMissingProgrammeImages" /><span>Generate missing programme artwork from watched channels</span></label><div class="fieldDescription checkboxFieldDescription">Uses buffered HTSP video only, without tuning another channel. Broadcaster artwork is preferred. Saves one image per programme; disabled by default.</div></div>
                         <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPEnableStreamSharing" /><span>Share one upstream subscription between viewers of the same channel</span></label><div class="fieldDescription checkboxFieldDescription">Reduces tuner use and TVHeadend bandwidth. Each Jellyfin reader still receives an independent buffered stream.</div></div>
                         <div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="chkHTSPKeyframeStartupEnabled" /><span>Start new readers at a verified video keyframe</span></label><div class="fieldDescription checkboxFieldDescription">Recommended. Prevents late readers from starting on P/B frames without SPS/PPS/VPS.</div></div>
                         <div class="tvhGrid">

@@ -27,6 +27,7 @@ namespace TVHeadEnd.Configuration
         public bool HideRecordingsChannel { get; set; }
         public string StreamingMethod { get; set; }
         public bool ForceDeinterlace { get; set; }
+        public bool GenerateMissingProgrammeImages { get; set; }
         public int HTSPQueueDepth { get; set; }
         public int HTSPStallTimeoutSeconds { get; set; }
         public bool HTSPFilterControlStreams { get; set; }
@@ -73,6 +74,7 @@ namespace TVHeadEnd.Configuration
             HideRecordingsChannel = false;
             StreamingMethod = StreamingMethods.Htsp;
             ForceDeinterlace = false;
+            GenerateMissingProgrammeImages = false;
             HTSPQueueDepth = DefaultHTSPQueueDepth;
             HTSPStallTimeoutSeconds = 15;
             HTSPFilterControlStreams = false;

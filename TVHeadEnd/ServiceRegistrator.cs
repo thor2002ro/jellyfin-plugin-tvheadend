@@ -19,6 +19,7 @@ public class ServiceRegistrator : IPluginServiceRegistrator
             .RemoveAllLoggers()
             .ConfigurePrimaryHttpMessageHandler(() => new System.Net.Http.HttpClientHandler { AllowAutoRedirect = false, UseCookies = false });
         serviceCollection.AddSingleton<LiveTvService>();
+        serviceCollection.AddHostedService<ProgrammeImageService>();
         serviceCollection.AddSingleton<ILiveTvService>(provider => provider.GetRequiredService<LiveTvService>());
         serviceCollection.AddSingleton<IChannel, RecordingsChannel>();
     }

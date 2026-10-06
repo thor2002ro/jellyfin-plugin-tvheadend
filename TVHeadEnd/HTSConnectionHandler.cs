@@ -63,6 +63,8 @@ namespace TVHeadEnd
         private string _httpBaseUrl;
         private string _channelType;
         private string _tvhServerName;
+        internal string GetProgrammeConnectionIdentity() => _configured
+            ? ProgrammeImageService.GetConnectionIdentity(_tvhServerName, _htspPort, _userName) : null;
         private int _httpPort;
         private int _htspPort;
         private string _webRoot;
@@ -886,7 +888,7 @@ namespace TVHeadEnd
             return await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
         }
 
-        private void ValidateImage(string path)
+        internal void ValidateImage(string path)
         {
             var dimensions = _imageEncoder.GetImageSize(path);
             if (dimensions.Width <= 0 || dimensions.Height <= 0)
@@ -1272,6 +1274,8 @@ namespace TVHeadEnd
 
         public HTSMessage[] GetCachedEvents(long channelId, long startUnix = long.MinValue, long endUnix = long.MaxValue)
             => _epgDataHelper.GetEvents(channelId, startUnix, endUnix);
+
+        internal string GetExternalChannelId(long channelId) => _channelDataHelper.GetExternalChannelId(channelId);
 
         private void ScheduleGuideRefresh()
         {

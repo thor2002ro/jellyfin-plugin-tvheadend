@@ -102,6 +102,8 @@ namespace TVHeadEnd
         private Task _stallWatchdogTask;
         private HTSConnectionAsync _connection;
         private int? _subscriptionWeight;
+        private byte[] _lastKeyframeChunk;
+        private long _lastKeyframeUtcTicks;
         private TaskCompletionSource<bool> _connectionFirstPacket = CreateFirstPacketSource();
         private TaskCompletionSource<Exception> _connectionError = CreateConnectionErrorSource();
         private int _subscriptionId;
@@ -506,6 +508,8 @@ namespace TVHeadEnd
             MediaSource.SupportsTranscoding = true;
         }
 
+        private string _serverIdentity;
+
         private async Task ConnectAndSubscribeAsync(
             string hostname,
             int port,
@@ -530,6 +534,8 @@ namespace TVHeadEnd
                 ResetStallWatchdogClock();
                 ResetQueueDiagnostics();
                 ResetStartupCacheForNewSubscription(clearParameterSets: false);
+                lock (_broadcastLock)
+                    _serverIdentity = ProgrammeImageService.GetConnectionIdentity(hostname, port, username);
 
                 _subscriptionId = Interlocked.Increment(ref _nextSubscriptionId);
                 var connection = new HTSConnectionAsync(this, "TVHclient4Jellyfin-HTSP", "" + HTSMessage.HTSP_VERSION, _loggerFactory);
@@ -1088,6 +1094,12 @@ namespace TVHeadEnd
                 return _startupCacheKeyframeAligned;
             }
 
+            if (randomAccess)
+            {
+                _lastKeyframeChunk = chunk;
+                _lastKeyframeUtcTicks = DateTime.UtcNow.Ticks;
+            }
+
             if (!GetConfiguredKeyframeStartupEnabled())
             {
                 AddStartupCacheChunkAndTrimLocked(chunk);
@@ -1141,6 +1153,11 @@ namespace TVHeadEnd
             while (_startupCacheBytes > StartupCacheMaxBytes && _startupCache.Count > 1)
             {
                 var removed = _startupCache.Dequeue();
+                if (ReferenceEquals(removed, _lastKeyframeChunk))
+                {
+                    _lastKeyframeChunk = null;
+                    _lastKeyframeUtcTicks = 0;
+                }
                 _startupCacheBytes -= removed.Length;
             }
         }
@@ -1163,6 +1180,8 @@ namespace TVHeadEnd
             lock (_broadcastLock)
             {
                 _startupCache.Clear();
+                _lastKeyframeChunk = null;
+                _lastKeyframeUtcTicks = 0;
                 _startupCacheBytes = 0;
                 _startupCacheStartedUtcTicks = 0;
                 _startupCacheKeyframeAligned = false;
@@ -3011,6 +3030,50 @@ namespace TVHeadEnd
             return stream.Index + ":" + codec + language + title;
         }
 
+        internal static long[] GetWatchedChannelIds()
+        {
+            return RunningChannelsByUniqueId.Values
+                .Where(stream => !stream._closing && Volatile.Read(ref stream._activeStreamReaders) > 0)
+                .Select(stream => long.TryParse(stream._channelId, out var id) ? id : -1)
+                .Where(id => id >= 0).Distinct().ToArray();
+        }
+
+        internal static bool TryGetWatchedSample(long channelId, DateTime programmeStart, string identity, out byte[][] chunks, out MediaStream video)
+        {
+            chunks = null;
+            video = null;
+            foreach (var stream in RunningChannelsByUniqueId.Values)
+            {
+                if (stream._closing || Volatile.Read(ref stream._activeStreamReaders) <= 0
+                    || !long.TryParse(stream._channelId, out var id) || id != channelId) continue;
+                lock (stream._broadcastLock)
+                {
+                    if (stream._serverIdentity != identity || stream._lastKeyframeUtcTicks < programmeStart.Ticks || stream._lastKeyframeChunk == null) continue;
+                    var snapshot = stream._startupCache.ToArray();
+                    var start = Array.FindIndex(snapshot, chunk => ReferenceEquals(chunk, stream._lastKeyframeChunk));
+                    var track = stream.MediaSource.MediaStreams?.FirstOrDefault(track => track.Type == MediaStreamType.Video);
+                    if (start < 0 || track == null) continue;
+                    chunks = snapshot[start..];
+                    video = track;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        internal static async Task WriteBufferedSampleAsync(string path, byte[][] chunks, CancellationToken token)
+        {
+            await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 65536, true);
+            var remaining = 188 * 8000;
+            foreach (var chunk in chunks)
+            {
+                var count = Math.Min(chunk.Length, remaining);
+                await file.WriteAsync(chunk.AsMemory(0, count), token).ConfigureAwait(false);
+                remaining -= count;
+                if (remaining == 0) break;
+            }
+        }
+
         private async Task ProbeStreamMetadataAsync(CancellationToken cancellationToken)
         {
             var streams = MediaSource.MediaStreams;
@@ -3054,17 +3117,7 @@ namespace TVHeadEnd
                     await Task.Delay(100, timeout.Token).ConfigureAwait(false);
                 }
 
-                await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 65536, true))
-                {
-                    var remaining = sampleBytes;
-                    foreach (var chunk in chunks)
-                    {
-                        var count = Math.Min(chunk.Length, remaining);
-                        await file.WriteAsync(chunk.AsMemory(0, count), timeout.Token).ConfigureAwait(false);
-                        remaining -= count;
-                        if (remaining == 0) break;
-                    }
-                }
+                await WriteBufferedSampleAsync(path, chunks, timeout.Token).ConfigureAwait(false);
 
                 var info = await _mediaEncoder.GetMediaInfo(new MediaInfoRequest {
                     MediaType = streams.Any(s => s.Type == MediaStreamType.Video) ? DlnaProfileType.Video : DlnaProfileType.Audio,

@@ -740,6 +740,7 @@ namespace TVHeadEnd
             await Task.WhenAll(programList.Select(async program =>
             {
                 program.ChannelId = channelId;
+                var broadcasterHasImage = !string.IsNullOrWhiteSpace(program.ImageUrl);
                 var image = await _htsConnectionHandler.CacheImageAsync(
                     program.ImageUrl,
                     null,
@@ -748,6 +749,16 @@ namespace TVHeadEnd
                 program.ImageUrl = image.ImageUrl;
                 program.HasImage = !string.IsNullOrEmpty(program.ImagePath)
                     || !string.IsNullOrEmpty(program.ImageUrl);
+                if (!broadcasterHasImage && program.HasImage != true && Plugin.Instance?.Configuration.GenerateMissingProgrammeImages == true
+                    && ProgrammeImageService.CurrentConnectionIdentity == _htsConnectionHandler.GetProgrammeConnectionIdentity())
+                {
+                    var generated = ProgrammeImageService.GetImagePath(_htsConnectionHandler.ResolveChannelId(channelId), program.Id, program.StartDate);
+                    if (File.Exists(generated))
+                    {
+                        program.ImagePath = generated;
+                        program.HasImage = true;
+                    }
+                }
             })).ConfigureAwait(false);
 
             return programList;

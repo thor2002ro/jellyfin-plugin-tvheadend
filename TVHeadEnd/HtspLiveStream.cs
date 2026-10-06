@@ -4,10 +4,14 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Entities;
@@ -54,6 +58,7 @@ namespace TVHeadEnd
 
         private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
         private static readonly ConcurrentDictionary<string, HtspLiveStream> RunningChannelsByUniqueId = new ConcurrentDictionary<string, HtspLiveStream>();
+        private static readonly ConcurrentDictionary<string, (string Format, DateTime ExpiresUtc, IReadOnlyList<MediaStream> Streams)> MetadataCache = new();
 
         private static readonly TimeSpan SubscribeResponseTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan FirstPacketTimeout = TimeSpan.FromSeconds(10);
@@ -68,6 +73,9 @@ namespace TVHeadEnd
         private readonly IServerApplicationHost _appHost;
         private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly ILogger<HtspLiveStream> _logger;
+        private readonly IMediaEncoder _mediaEncoder;
+        private string _metadataCacheKey;
+        private string _metadataFormat;
         private readonly BlockingByteStream _stream;
         private readonly HtspTransportStreamMuxer _muxer = new HtspTransportStreamMuxer();
         private readonly TaskCompletionSource<bool> _firstPacket = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -207,7 +215,7 @@ namespace TVHeadEnd
             return SharedHubsByChannelId.TryRemove(new KeyValuePair<string, HtspLiveStream>(channelId, hub));
         }
 
-        public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor)
+        public HtspLiveStream(MediaSourceInfo mediaSource, string channelId, ILoggerFactory loggerFactory, IServerApplicationHost appHost, IHttpContextAccessor httpContextAccessor, IMediaEncoder mediaEncoder = null)
         {
             MediaSource = mediaSource;
             _channelId = channelId;
@@ -215,6 +223,7 @@ namespace TVHeadEnd
             _appHost = appHost;
             _httpContextAccessor = httpContextAccessor;
             _logger = loggerFactory.CreateLogger<HtspLiveStream>();
+            _mediaEncoder = mediaEncoder;
             _stream = new BlockingByteStream(null);
             UniqueId = Guid.NewGuid().ToString("N");
             OriginalStreamId = mediaSource?.Id;
@@ -581,6 +590,8 @@ namespace TVHeadEnd
             {
                 _connectionSemaphore.Release();
             }
+
+            await ProbeStreamMetadataAsync(cancellationToken).ConfigureAwait(false);
         }
 
         private HTSMessage BuildSubscribeMessage(string profile)
@@ -2537,6 +2548,9 @@ namespace TVHeadEnd
                     Meta = stream.containsField("meta") ? stream.getByteArray("meta") : null,
                     Width = GetInt(stream, "width", 0),
                     Height = GetInt(stream, "height", 0),
+                    Duration = GetInt(stream, "duration", 0),
+                    AspectNum = GetInt(stream, "aspect_num", 0),
+                    AspectDen = GetInt(stream, "aspect_den", 0),
                     Channels = GetInt(stream, "channels", 0),
                     Rate = GetInt(stream, "rate", 0),
                     AudioType = GetInt(stream, "audio_type", 0),
@@ -2831,6 +2845,20 @@ namespace TVHeadEnd
             // with only the tracks that happened to emit packets during the probe window.
             MediaSource.SupportsProbing = false;
 
+            var config = Plugin.Instance?.Configuration;
+            _metadataCacheKey = JsonSerializer.Serialize(new {
+                config?.TVH_ServerName, config?.HTSP_Port, config?.Username, config?.Profile, Channel = _channelId });
+            // Include codec headers: a channel can change format without changing its ID or resolution.
+            _metadataFormat = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(
+                streams.Select(s => new { s.Index, s.Codec, s.Width, s.Height, s.Duration, s.AspectNum,
+                    s.AspectDen, s.Channels, s.Rate, s.Language, s.Meta })))));
+            if (MetadataCache.TryGetValue(_metadataCacheKey, out var cached)
+                && cached.Format == _metadataFormat && cached.ExpiresUtc > DateTime.UtcNow)
+            {
+                MergeProbeMetadata(mediaStreams, cached.Streams);
+            }
+            ApplyVideoMetadataOverrides();
+
             _logger.LogInformation(
                 "HTSP exposed {Count} playable stream(s) to Jellyfin metadata: {Streams}; all muxable audio/subtitle streams are carried, CA/private control streams are ignored",
                 mediaStreams.Count,
@@ -2953,6 +2981,142 @@ namespace TVHeadEnd
             return stream.Index + ":" + codec + language + title;
         }
 
+        private async Task ProbeStreamMetadataAsync(CancellationToken cancellationToken)
+        {
+            var streams = MediaSource.MediaStreams;
+            if (_mediaEncoder == null || streams == null || streams.Count == 0)
+            {
+                return;
+            }
+
+            var cacheKey = _metadataCacheKey;
+            var format = _metadataFormat;
+            if (cacheKey != null && MetadataCache.TryGetValue(cacheKey, out var cached)
+                && cached.Format == format && cached.ExpiresUtc > DateTime.UtcNow)
+            {
+                MergeProbeMetadata(streams, cached.Streams);
+                ApplyVideoMetadataOverrides();
+                return;
+            }
+
+            var path = Path.Combine(Path.GetTempPath(), "tvheadend-probe-" + Guid.NewGuid().ToString("N") + ".ts");
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                // Bound first-tune latency; failure leaves the complete HTSP track list usable.
+                timeout.CancelAfter(TimeSpan.FromSeconds(6));
+                var captureStarted = DateTime.UtcNow;
+                const int sampleBytes = 188 * 8000;
+                byte[][] chunks;
+                while (true)
+                {
+                    timeout.Token.ThrowIfCancellationRequested();
+                    lock (_broadcastLock)
+                    {
+                        // Reuse the keyframe-aligned cache without adding a subscription or playback reader.
+                        if (_startupCacheBytes > 0 && (!_primaryVideoStreamIndex.HasValue || _startupCacheKeyframeAligned)
+                            && (_startupCacheBytes >= sampleBytes || DateTime.UtcNow - captureStarted >= TimeSpan.FromSeconds(2)))
+                        {
+                            chunks = _startupCache.ToArray();
+                            break;
+                        }
+                    }
+                    await Task.Delay(100, timeout.Token).ConfigureAwait(false);
+                }
+
+                await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 65536, true))
+                {
+                    var remaining = sampleBytes;
+                    foreach (var chunk in chunks)
+                    {
+                        var count = Math.Min(chunk.Length, remaining);
+                        await file.WriteAsync(chunk.AsMemory(0, count), timeout.Token).ConfigureAwait(false);
+                        remaining -= count;
+                        if (remaining == 0) break;
+                    }
+                }
+
+                var info = await _mediaEncoder.GetMediaInfo(new MediaInfoRequest {
+                    MediaType = streams.Any(s => s.Type == MediaStreamType.Video) ? DlnaProfileType.Video : DlnaProfileType.Audio,
+                    MediaSource = new MediaSourceInfo { Path = path, Protocol = MediaProtocol.File, Container = "ts" },
+                    ExtractChapters = false
+                }, timeout.Token).WaitAsync(timeout.Token).ConfigureAwait(false);
+
+                if (info?.MediaStreams?.Count > 0 && ReferenceEquals(streams, MediaSource.MediaStreams))
+                {
+                    MergeProbeMetadata(streams, info.MediaStreams);
+                    ApplyVideoMetadataOverrides();
+                    if (cacheKey != null)
+                    {
+                        MetadataCache[cacheKey] = (format, DateTime.UtcNow.AddMinutes(30), info.MediaStreams);
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "HTSP metadata probe failed for channel {ChannelId}; using broadcast metadata", _channelId);
+            }
+            finally
+            {
+                try { File.Delete(path); }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Unable to remove HTSP metadata sample {Path}", path);
+                }
+            }
+        }
+
+        private static void MergeProbeMetadata(IReadOnlyList<MediaStream> streams, IReadOnlyList<MediaStream> probed)
+        {
+            foreach (var stream in streams)
+            {
+                // Match emitted TS indexes, not list positions: a short sample can miss a silent track.
+                var probe = probed.FirstOrDefault(p => p.Index == stream.Index && p.Type == stream.Type);
+                if (probe == null) continue;
+                if (probe.BitRate > 0) stream.BitRate = probe.BitRate;
+                stream.Profile = probe.Profile ?? stream.Profile;
+                stream.ChannelLayout = probe.ChannelLayout ?? stream.ChannelLayout;
+                if (stream.Type != MediaStreamType.Video) continue;
+                stream.IsInterlaced = probe.IsInterlaced;
+                stream.BitDepth = probe.BitDepth ?? stream.BitDepth;
+                stream.PixelFormat = probe.PixelFormat ?? stream.PixelFormat;
+                stream.Level = probe.Level ?? stream.Level;
+                stream.RefFrames = probe.RefFrames ?? stream.RefFrames;
+                stream.ColorSpace = probe.ColorSpace ?? stream.ColorSpace;
+                stream.ColorPrimaries = probe.ColorPrimaries ?? stream.ColorPrimaries;
+                stream.ColorTransfer = probe.ColorTransfer ?? stream.ColorTransfer;
+                stream.ColorRange = probe.ColorRange ?? stream.ColorRange;
+                if (probe.RealFrameRate > 0) stream.RealFrameRate = probe.RealFrameRate;
+                if (probe.AverageFrameRate > 0) stream.AverageFrameRate = probe.AverageFrameRate;
+            }
+        }
+
+        private void ApplyVideoMetadataOverrides()
+        {
+            long bitrate = 0;
+            foreach (var stream in MediaSource.MediaStreams)
+            {
+                if (stream.Type == MediaStreamType.Video)
+                {
+                    if (Plugin.Instance?.Configuration?.ForceDeinterlace == true) stream.IsInterlaced = true;
+                    if (!(stream.BitRate > 0) && stream.Width > 0 && stream.Height > 0)
+                    {
+                        // Estimate only when the probe has no rate; avoid Jellyfin's oversized live-TV fallback.
+                        var bitsPerPixel = stream.Codec == "hevc" ? 0.06 : stream.Codec == "mpeg2video" ? 0.16 : 0.10;
+                        stream.BitRate = (int)Math.Clamp(stream.Width.Value * (double)stream.Height.Value
+                            * (stream.RealFrameRate > 0 ? stream.RealFrameRate.Value : 25) * bitsPerPixel, 1000000, 25000000);
+                    }
+                }
+                if (stream.Type == MediaStreamType.Video || stream.Type == MediaStreamType.Audio)
+                    bitrate += stream.BitRate ?? (stream.Type == MediaStreamType.Audio ? 256000 : 0);
+            }
+            MediaSource.Bitrate = bitrate > 0 ? (int)Math.Min(bitrate, int.MaxValue) : null;
+        }
+
         private static MediaStream CreateMediaStream(HtspTransportStreamMuxer.StreamInfo stream, int ffmpegStreamIndex)
         {
             if (stream == null || !TryGetMediaStreamType(stream.Codec, out var mediaStreamType))
@@ -2989,8 +3153,15 @@ namespace TVHeadEnd
                     mediaStream.Height = stream.Height;
                 }
 
-                mediaStream.IsInterlaced = true;
-                mediaStream.RealFrameRate = 50.0F;
+                if (stream.Duration > 0)
+                {
+                    mediaStream.RealFrameRate = 90000f / stream.Duration;
+                    mediaStream.AverageFrameRate = mediaStream.RealFrameRate;
+                }
+                if (stream.AspectNum > 0 && stream.AspectDen > 0)
+                {
+                    mediaStream.AspectRatio = $"{stream.AspectNum}:{stream.AspectDen}";
+                }
             }
             else if (mediaStreamType == MediaStreamType.Audio)
             {

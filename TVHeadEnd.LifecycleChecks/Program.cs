@@ -30,6 +30,131 @@ public sealed class PluginTests
     private const BindingFlags PrivateStatic = BindingFlags.Static | BindingFlags.NonPublic;
 
     [Fact]
+    public void HtspVideoUsesBroadcastTimingInsteadOfFixedInterlacing()
+    {
+        var (_, source) = CreateH264Muxer();
+        var duration = source.GetType().GetProperty("Duration");
+        Xunit.Assert.NotNull(duration);
+        duration.SetValue(source, 3000);
+        source.GetType().GetProperty("AspectNum")!.SetValue(source, 16);
+        source.GetType().GetProperty("AspectDen")!.SetValue(source, 9);
+        var build = typeof(HtspLiveStream).GetMethod("CreateMediaStream", PrivateStatic)!;
+        var video = (MediaStream)build.Invoke(null, new[] { source, (object)0 })!;
+        Xunit.Assert.False(video.IsInterlaced);
+        Xunit.Assert.Equal(30f, video.RealFrameRate);
+        Xunit.Assert.Equal("16:9", video.AspectRatio);
+    }
+
+    [Fact]
+    public void HtspProbeEnrichesMetadataWithoutReplacingOrRenumberingTracks()
+    {
+        var merge = typeof(HtspLiveStream).GetMethod("MergeProbeMetadata", PrivateStatic);
+        Xunit.Assert.NotNull(merge);
+        var video = new MediaStream { Index = 0, Type = MediaStreamType.Video, Codec = "hevc" };
+        var audio = new MediaStream { Index = 2, Type = MediaStreamType.Audio, Language = "eng", Title = "Audio description" };
+        var silentAudio = new MediaStream { Index = 3, Type = MediaStreamType.Audio, Language = "fra" };
+        var subtitle = new MediaStream { Index = 4, Type = MediaStreamType.Subtitle, Codec = "dvbsub" };
+        var streams = new List<MediaStream> { video, audio, silentAudio, subtitle };
+        var probe = new List<MediaStream>
+        {
+            new() { Index = 0, Type = MediaStreamType.Video, IsInterlaced = false, BitDepth = 10,
+                ColorTransfer = "smpte2084", Profile = "Main 10", RealFrameRate = 25, BitRate = 8000000 },
+            new() { Index = 3, Type = MediaStreamType.Audio, ChannelLayout = "stereo", BitRate = 128000 }
+        };
+        merge.Invoke(null, new object[] { streams, probe });
+        Xunit.Assert.Equal(4, streams.Count);
+        Xunit.Assert.Equal(10, video.BitDepth);
+        Xunit.Assert.Equal("smpte2084", video.ColorTransfer);
+        Xunit.Assert.Equal(25f, video.RealFrameRate);
+        Xunit.Assert.Equal("eng", audio.Language);
+        Xunit.Assert.Equal("Audio description", audio.Title);
+        Xunit.Assert.Null(audio.BitRate);
+        Xunit.Assert.Equal(128000, silentAudio.BitRate);
+        Xunit.Assert.Equal(4, subtitle.Index);
+    }
+
+    [Fact]
+    public async Task HtspProbeReadsBufferedOutputAndDeletesItsTemporaryFile()
+    {
+        using var stream = CreateStream(Guid.NewGuid().ToString("N"));
+        stream.MediaSource.MediaStreams = new List<MediaStream> {
+            new() { Index = 0, Type = MediaStreamType.Video, Codec = "hevc" } };
+        var queue = (Queue<byte[]>)GetField(stream, "_startupCache");
+        queue.Enqueue(new byte[188 * 8000]);
+        SetField(stream, "_startupCacheBytes", 188L * 8000);
+        SetField(stream, "_startupCacheKeyframeAligned", true);
+        var cacheKey = Guid.NewGuid().ToString("N");
+        SetField(stream, "_metadataCacheKey", cacheKey);
+        SetField(stream, "_metadataFormat", "format-1");
+        var probe = typeof(HtspLiveStream).GetMethod("ProbeStreamMetadataAsync", PrivateInstance);
+        Xunit.Assert.NotNull(probe);
+        string sampledPath = null;
+        var calls = 0;
+        var encoder = CreateProxy<MediaBrowser.Controller.MediaEncoding.IMediaEncoder>((method, args) =>
+        {
+            if (method.Name != "GetMediaInfo") return GetDefault(method.ReturnType);
+            calls++;
+            var request = (MediaBrowser.Controller.MediaEncoding.MediaInfoRequest)args[0];
+            sampledPath = request.MediaSource.Path;
+            Xunit.Assert.True(File.Exists(sampledPath));
+            Xunit.Assert.Equal(MediaBrowser.Model.MediaInfo.MediaProtocol.File, request.MediaSource.Protocol);
+            Xunit.Assert.Equal(0, GetInt(stream, "_activeStreamReaders"));
+            return Task.FromResult(new MediaBrowser.Model.MediaInfo.MediaInfo {
+                MediaStreams = new List<MediaStream> { new() {
+                    Index = 0, Type = MediaStreamType.Video, BitDepth = 10, ColorTransfer = "smpte2084" } } });
+        });
+        SetField(stream, "_mediaEncoder", encoder);
+        await (Task)probe.Invoke(stream, new object[] { CancellationToken.None });
+        Xunit.Assert.NotNull(sampledPath);
+        Xunit.Assert.False(File.Exists(sampledPath));
+        Xunit.Assert.Equal(10, stream.MediaSource.MediaStreams[0].BitDepth);
+        Xunit.Assert.Single(queue);
+        await (Task)probe.Invoke(stream, new object[] { CancellationToken.None });
+        Xunit.Assert.Equal(1, calls);
+        SetField(stream, "_metadataFormat", "format-2");
+        await (Task)probe.Invoke(stream, new object[] { CancellationToken.None });
+        Xunit.Assert.Equal(2, calls);
+        var cache = (System.Collections.IDictionary)typeof(HtspLiveStream).GetField("MetadataCache", PrivateStatic)!.GetValue(null)!;
+        var value = ((string Format, DateTime ExpiresUtc, IReadOnlyList<MediaStream> Streams))cache[cacheKey];
+        cache[cacheKey] = (value.Format, DateTime.UtcNow.AddMinutes(-1), value.Streams);
+        await (Task)probe.Invoke(stream, new object[] { CancellationToken.None });
+        Xunit.Assert.Equal(3, calls);
+        cache.Remove(cacheKey);
+    }
+
+    [Fact]
+    public async Task HtspProbeFailurePreservesTracksAndCancellationStopsTheProbe()
+    {
+        using var stream = CreateStream(Guid.NewGuid().ToString("N"));
+        var tracks = new List<MediaStream> { new() { Index = 0, Type = MediaStreamType.Video, Codec = "h264" } };
+        stream.MediaSource.MediaStreams = tracks;
+        ((Queue<byte[]>)GetField(stream, "_startupCache")).Enqueue(new byte[188 * 8000]);
+        SetField(stream, "_startupCacheBytes", 188L * 8000);
+        SetField(stream, "_startupCacheKeyframeAligned", true);
+        var probe = typeof(HtspLiveStream).GetMethod("ProbeStreamMetadataAsync", PrivateInstance)!;
+        string path = null;
+        var waitForCancellation = false;
+        var encoder = CreateProxy<MediaBrowser.Controller.MediaEncoding.IMediaEncoder>((method, args) =>
+        {
+            if (method.Name != "GetMediaInfo") return GetDefault(method.ReturnType);
+            path = ((MediaBrowser.Controller.MediaEncoding.MediaInfoRequest)args[0]).MediaSource.Path;
+            return waitForCancellation
+                ? new TaskCompletionSource<MediaBrowser.Model.MediaInfo.MediaInfo>().Task
+                : Task.FromException<MediaBrowser.Model.MediaInfo.MediaInfo>(new IOException("probe unavailable"));
+        });
+        SetField(stream, "_mediaEncoder", encoder);
+        await (Task)probe.Invoke(stream, new object[] { CancellationToken.None });
+        Xunit.Assert.Same(tracks, stream.MediaSource.MediaStreams);
+        Xunit.Assert.False(File.Exists(path));
+        waitForCancellation = true;
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        await Xunit.Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => (Task)probe.Invoke(stream, new object[] { cancellation.Token }));
+        Xunit.Assert.False(File.Exists(path));
+        Xunit.Assert.Equal(0, GetInt(stream, "_activeStreamReaders"));
+    }
+
+    [Fact]
     public void StaleSharedHubCannotRemoveReplacement()
     {
         var sharedHubsField = typeof(HtspLiveStream).GetField("SharedHubsByChannelId", PrivateStatic)!;

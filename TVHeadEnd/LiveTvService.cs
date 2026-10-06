@@ -441,7 +441,7 @@ namespace TVHeadEnd
             {
                 try
                 {
-                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), _htsConnectionHandler.ResolveChannelId(channelId).ToString(), _loggerFactory, _appHost, _httpContextAccessor);
+                    var stream = new HtspLiveStream(CreateHtspMediaSource(channelId), _htsConnectionHandler.ResolveChannelId(channelId).ToString(), _loggerFactory, _appHost, _httpContextAccessor, _mediaEncoder);
                     await stream.Open(cancellationToken).ConfigureAwait(false);
                     return stream;
                 }
@@ -552,9 +552,7 @@ namespace TVHeadEnd
                     new MediaStream
                     {
                         Type = MediaStreamType.Video,
-                        Index = -1,
-                        IsInterlaced = true,
-                        RealFrameRate = 50.0F
+                        Index = -1
                     },
                     new MediaStream
                     {

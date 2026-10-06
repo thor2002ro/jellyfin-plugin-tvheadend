@@ -1196,6 +1196,12 @@ namespace TVHeadEnd
 
             public int Height { get; set; }
 
+            public int Duration { get; set; }
+
+            public int AspectNum { get; set; }
+
+            public int AspectDen { get; set; }
+
             public int Channels { get; set; }
 
             public int Rate { get; set; }

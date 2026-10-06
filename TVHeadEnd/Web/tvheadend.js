@@ -78,6 +78,7 @@ export default function (view, params) {
         page.querySelector('#selStreamingMethod').value = getStreamingMethod(values);
         page.querySelector('#chkForceDeinterlace').checked = values.ForceDeinterlace === true;
         page.querySelector('#chkGenerateMissingProgrammeImages').checked = values.GenerateMissingProgrammeImages === true;
+        page.querySelector('#chkCaptureUnwatchedProgrammeImages').checked = values.CaptureUnwatchedProgrammeImages === true;
         loadQueueDepth(page.querySelector('#txtHTSPQueueDepth'), values.HTSPQueueDepth);
         page.querySelector('#txtHTSPInitialTuneBufferMs').value = Number.isFinite(values.HTSPInitialTuneBufferMs) ? values.HTSPInitialTuneBufferMs : 0;
         page.querySelector('#txtHTSPStallTimeoutSeconds').value = Number.isFinite(values.HTSPStallTimeoutSeconds) ? values.HTSPStallTimeoutSeconds : 15;
@@ -444,6 +445,7 @@ export default function (view, params) {
             config.HideRecordingsChannel = form.querySelector('#chkHideRecordingsChannel').checked;
             config.ForceDeinterlace = form.querySelector('#chkForceDeinterlace').checked;
             config.GenerateMissingProgrammeImages = form.querySelector('#chkGenerateMissingProgrammeImages').checked;
+            config.CaptureUnwatchedProgrammeImages = form.querySelector('#chkCaptureUnwatchedProgrammeImages').checked;
             config.HTSPQueueDepth = saveQueueDepth(form.querySelector('#txtHTSPQueueDepth'));
             config.HTSPInitialTuneBufferMs = intValue(form.querySelector('#txtHTSPInitialTuneBufferMs'), 0, 0, 3000);
             config.HTSPStallTimeoutSeconds = intValue(form.querySelector('#txtHTSPStallTimeoutSeconds'), 15, 0, 120);

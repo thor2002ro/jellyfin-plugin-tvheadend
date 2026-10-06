@@ -118,12 +118,19 @@ public class ProgrammeImageTests
     [InlineData("changed-server", 0)]
     [InlineData("changed-server-during-capture", 1)]
     [InlineData("late-cancellation", 1)]
+    [InlineData("refresh", 1)]
+    [InlineData("fresh-generated", 0)]
+    [InlineData("refresh-broadcaster", 1)]
+    [InlineData("refresh-ended", 1)]
+    [InlineData("refresh-publish-failure", 2)]
+    [InlineData("background-deferred", 0)]
     public async Task CaptureUsesOnlyWatchedBuffersAndKeepsExistingArtwork(string scenario, int expectedExtractions)
     {
         var root = Path.Combine(Path.GetTempPath(), "tvheadend-frames-" + Guid.NewGuid().ToString("N"));
         var (plugin, normalValidator) = PluginTests.ConfigureImageCache(root);
         plugin.Configuration.GenerateMissingProgrammeImages = scenario != "off";
         plugin.Configuration.HTSPKeyframeStartupEnabled = false;
+        plugin.Configuration.CaptureUnwatchedProgrammeImages = scenario == "background-deferred";
         var validator = scenario == "invalid-output"
             ? PluginTests.CreateProxy<IImageEncoder>((_, _) => new ImageDimensions(0, 0)) : normalValidator;
         using var handler = new HTSConnectionHandler(NullLoggerFactory.Instance, new HttpFactory(), validator);
@@ -142,6 +149,17 @@ public class ProgrammeImageTests
         if (scenario == "foreign-channel") channel.ServiceName = "Other service";
         if (scenario == "foreign-programme") programme.StartDate = start.AddHours(1);
         if (scenario == "existing-image") programme.SetImagePath(ImageType.Primary, "https://existing/artwork.jpg");
+        var originalImage = new byte[] { 0xff, 0xd8, 0xff, 0xd9, 0x42 };
+        var originalImageTime = DateTime.MinValue;
+        if (scenario.StartsWith("refresh", StringComparison.Ordinal) || scenario == "fresh-generated")
+        {
+            var path = ImagePath(42, "123", start);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllBytesAsync(path, originalImage);
+            if (scenario.StartsWith("refresh", StringComparison.Ordinal)) File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(-6));
+            originalImageTime = File.GetLastWriteTimeUtc(path);
+            programme.SetImage(new ItemImageInfo { Path = path, Type = ImageType.Primary, DateModified = File.GetLastWriteTimeUtc(path) }, 0);
+        }
         var updates = 0;
         var library = PluginTests.CreateProxy<ILibraryManager>((method, arguments) =>
         {
@@ -161,7 +179,7 @@ public class ProgrammeImageTests
             {
                 updates++;
                 Assert.Same(programme, arguments[0]);
-                if (scenario == "publish-failure") return Task.FromException(new IOException("Database unavailable"));
+                if (scenario is "publish-failure" or "refresh-publish-failure") return Task.FromException(new IOException("Database unavailable"));
                 return Task.CompletedTask;
             }
             return null;
@@ -189,13 +207,13 @@ public class ProgrammeImageTests
             File.WriteAllBytes(extractedPath, new byte[] { 0xff, 0xd8, 0xff, 0xd9 });
             if (scenario == "disabled-during-capture") plugin.Configuration.GenerateMissingProgrammeImages = false;
             if (scenario == "changed-server-during-capture") plugin.Configuration.TVH_ServerName = "other-server";
-            if (scenario == "ended-during-capture")
+            if (scenario is "ended-during-capture" or "refresh-ended")
             {
                 var delete = new HTSMessage { Method = "eventDelete" };
                 delete.putField("eventId", new BigInteger(123));
                 handler.onMessage(delete);
             }
-            if (scenario == "broadcaster-during-capture")
+            if (scenario is "broadcaster-during-capture" or "refresh-broadcaster")
             {
                 var update = new HTSMessage { Method = "eventUpdate" };
                 update.putField("eventId", new BigInteger(123));
@@ -218,7 +236,7 @@ public class ProgrammeImageTests
         addChunk.Invoke(stream, new object[] { Chunk(1), false, false, false });
         addChunk.Invoke(stream, new object[] { Chunk(2), true, false, false });
         if (scenario == "unwatched") typeof(HtspLiveStream).GetField("_activeStreamReaders", Private)!.SetValue(stream, 0);
-        if (scenario == "old-keyframe") typeof(HtspLiveStream).GetField("_lastKeyframeUtcTicks", Private)!.SetValue(stream, start.AddSeconds(-1).Ticks);
+        if (scenario is "old-keyframe" or "background-deferred") typeof(HtspLiveStream).GetField("_lastKeyframeUtcTicks", Private)!.SetValue(stream, start.AddSeconds(-1).Ticks);
         var liveTv = new LiveTvService(NullLoggerFactory.Instance, null, handler, null, null, library);
         using var worker = new ProgrammeImageService(handler, liveTv, encoder, library, NullLogger<ProgrammeImageService>.Instance);
         try
@@ -244,10 +262,16 @@ public class ProgrammeImageTests
                 await operation;
                 await (Task)capture.Invoke(worker, new object[] { callerCancellation.Token })!;
             }
-            var success = scenario == "capture";
+            var success = scenario is "capture" or "refresh";
             Assert.Equal(scenario == "invalid-output" ? 2 : expectedExtractions, extracts);
-            Assert.Equal(success ? 1 : scenario == "publish-failure" ? 2 : 0, updates);
-            Assert.Equal(success || scenario == "existing-image", programme.HasImage(ImageType.Primary));
+            Assert.Equal(success ? 1 : scenario is "publish-failure" or "refresh-publish-failure" ? 2 : 0, updates);
+            Assert.Equal(success || scenario is "existing-image" or "fresh-generated" || scenario.StartsWith("refresh", StringComparison.Ordinal), programme.HasImage(ImageType.Primary));
+            if (scenario is "refresh-broadcaster" or "refresh-ended" or "refresh-publish-failure")
+            {
+                var path = programme.GetImageInfo(ImageType.Primary, 0).Path;
+                Assert.Equal(originalImage, await File.ReadAllBytesAsync(path));
+                Assert.Equal(originalImageTime, File.GetLastWriteTimeUtc(path));
+            }
             if (success) Assert.True(File.Exists(programme.GetImageInfo(ImageType.Primary, 0).Path));
             Assert.False(File.Exists(samplePath));
             Assert.False(File.Exists(extractedPath));

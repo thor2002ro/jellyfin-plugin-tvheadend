@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -59,6 +60,10 @@ namespace TVHeadEnd
         private const int SignalRecoveryAttemptWindowSeconds = 60;
 
         private static readonly ConcurrentDictionary<string, HtspLiveStream> SharedHubsByChannelId = new ConcurrentDictionary<string, HtspLiveStream>();
+        private static readonly ConcurrentDictionary<(string Server, long Channel), string> KnownChannelMuxes = new();
+        private static readonly Regex SharedTransponder = new(@"(?<![0-9A-Za-z])(\d{3,6})\s*([HVhv])(?![0-9A-Za-z])", RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(50));
+        private string _sourceMuxIdentity;
+        internal string MuxIdentity => _sourceMuxIdentity;
         private static readonly ConcurrentDictionary<string, HtspLiveStream> RunningChannelsByUniqueId = new ConcurrentDictionary<string, HtspLiveStream>();
         private static readonly ConcurrentDictionary<string, (string Format, DateTime ExpiresUtc, IReadOnlyList<MediaStream> Streams)> MetadataCache = new();
 
@@ -247,6 +252,19 @@ namespace TVHeadEnd
         public MediaSourceInfo MediaSource { get; set; }
 
         public string UniqueId { get; }
+
+        private bool _captureOnly;
+        internal bool IsCaptureClosed => _closing;
+
+        internal async Task OpenCaptureAsync(CancellationToken token)
+        {
+            _captureOnly = true;
+            var config = Plugin.Instance.Configuration;
+            await ConnectAndSubscribeAsync(config.TVH_ServerName.Trim(), config.HTSP_Port, config.Username.Trim(),
+                config.Password.Trim(), config.Profile?.Trim(), token, waitForMuxPacket: false).ConfigureAwait(false);
+        }
+
+        internal Task CloseCaptureAsync() => CloseProducerNow("programme frame capture finished");
 
         public async Task Open(CancellationToken openCancellationToken)
         {
@@ -1639,6 +1657,7 @@ namespace TVHeadEnd
         public void onError(Exception ex)
         {
             NotifyConnectionError(ex);
+            if (_captureOnly) { CompleteWithError(ex); return; }
 
             if (_closing || _lifetimeCancellationTokenSource.IsCancellationRequested || _stream.IsCompleted)
             {
@@ -3046,19 +3065,26 @@ namespace TVHeadEnd
             {
                 if (stream._closing || Volatile.Read(ref stream._activeStreamReaders) <= 0
                     || !long.TryParse(stream._channelId, out var id) || id != channelId) continue;
-                lock (stream._broadcastLock)
-                {
-                    if (stream._serverIdentity != identity || stream._lastKeyframeUtcTicks < programmeStart.Ticks || stream._lastKeyframeChunk == null) continue;
-                    var snapshot = stream._startupCache.ToArray();
-                    var start = Array.FindIndex(snapshot, chunk => ReferenceEquals(chunk, stream._lastKeyframeChunk));
-                    var track = stream.MediaSource.MediaStreams?.FirstOrDefault(track => track.Type == MediaStreamType.Video);
-                    if (start < 0 || track == null) continue;
-                    chunks = snapshot[start..];
-                    video = track;
-                    return true;
-                }
+                if (stream.TryGetBufferedSample(programmeStart, identity, out chunks, out video)) return true;
             }
             return false;
+        }
+
+        internal bool TryGetBufferedSample(DateTime programmeStart, string identity, out byte[][] chunks, out MediaStream video)
+        {
+            chunks = null;
+            video = null;
+            lock (_broadcastLock)
+            {
+                if (_closing || _serverIdentity != identity || _lastKeyframeUtcTicks < programmeStart.Ticks || _lastKeyframeChunk == null) return false;
+                var snapshot = _startupCache.ToArray();
+                var start = Array.FindIndex(snapshot, chunk => ReferenceEquals(chunk, _lastKeyframeChunk));
+                var track = MediaSource.MediaStreams?.FirstOrDefault(track => track.Type == MediaStreamType.Video);
+                if (start < 0 || track == null) return false;
+                chunks = snapshot[start..];
+                video = track;
+                return true;
+            }
         }
 
         internal static async Task WriteBufferedSampleAsync(string path, byte[][] chunks, CancellationToken token)
@@ -3872,6 +3898,13 @@ namespace TVHeadEnd
                 _sourceNetwork = source.getString("network", string.Empty);
                 _sourceMux = source.getString("mux", string.Empty);
                 _sourceProvider = source.getString("provider", string.Empty);
+                _sourceMuxIdentity = GetMuxIdentity(source);
+                if (_serverIdentity == ProgrammeImageService.CurrentConnectionIdentity && long.TryParse(_channelId, out var channelId))
+                {
+                    var key = (_serverIdentity, channelId);
+                    if (_sourceMuxIdentity == null) KnownChannelMuxes.TryRemove(key, out _);
+                    else KnownChannelMuxes[key] = _sourceMuxIdentity;
+                }
                 _logger.LogInformation(
                     "HTSP source: adapter={Adapter}, network={Network}, mux={Mux}, provider={Provider}, service={Service}, satpos={SatPos}",
                     _sourceAdapter,
@@ -3885,6 +3918,33 @@ namespace TVHeadEnd
             {
                 _logger.LogTrace(ex, "Could not parse HTSP sourceinfo");
             }
+        }
+
+        internal static string GetMuxIdentity(HTSMessage source)
+        {
+            if (source == null) return null;
+            var network = source.getString("network", string.Empty).Trim();
+            var mux = source.getString("mux", string.Empty).Trim();
+            var satellite = source.getString("satpos", string.Empty).Trim();
+            if (network.Length > 0 && (network + " " + mux).Contains("abertpy", StringComparison.OrdinalIgnoreCase))
+            {
+                var transponder = SharedTransponder.Match(mux);
+                if (transponder.Success)
+                    return "transponder:" + JsonSerializer.Serialize(new[] { network, satellite,
+                        transponder.Groups[1].Value + transponder.Groups[2].Value.ToUpperInvariant() });
+            }
+            var uuid = source.getString("mux_uuid", string.Empty).Trim();
+            if (uuid.Length > 0) return "uuid:" + uuid.ToLowerInvariant();
+            return network.Length > 0 && mux.Length > 0 ? "name:" + JsonSerializer.Serialize(new[] { network, satellite, mux }) : null;
+        }
+
+        internal static string GetKnownMux(string identity, long channelId) =>
+            KnownChannelMuxes.TryGetValue((identity, channelId), out var mux) ? mux : null;
+
+        internal static void PruneKnownMuxes(string identity, HashSet<long> channels)
+        {
+            foreach (var entry in KnownChannelMuxes)
+                if (entry.Key.Server != identity || !channels.Contains(entry.Key.Channel)) KnownChannelMuxes.TryRemove(entry.Key, out _);
         }
 
         private void WriteOutput(byte[] chunk, bool randomAccess = false, bool forceBootstrapReady = false)

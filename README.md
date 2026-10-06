@@ -56,12 +56,23 @@ Jellyfin plugin, with fork-specific changes.
   same-server image paths retain HTTP; external artwork URLs remain external.
   HTSP file access needs TVHeadend's HTSP recorder permission; accounts without
   it retain the authenticated HTTP artwork path.
-- Optional programme thumbnails from already-watched HTSP channels. Enable
-  **Generate missing programme artwork from watched channels** in plugin settings
+- Optional programme thumbnails from HTSP channels. Enable
+  **Generate missing programme artwork** in plugin settings
   and save. Disabled by default; checks every 30 seconds, uses Jellyfin's encoder
   on existing buffered video and keeps broadcaster or existing artwork preferred.
-  Captures run one at a time without opening another tuner; generated images use
-  the existing image cache and its 90-day cleanup.
+  Generated pictures refresh after five minutes and include a cached local
+  channel logo when available. Logo failures keep the plain frame usable.
+  Captures run one at a time; watched channels use existing buffers. The optional
+  **Also capture artwork from unwatched channels** checkbox permits at most one
+  brief low-priority tune per minute, rotating through TV channels while no HTSP
+  playback readers are active. Both checkboxes default off. Capture subscriptions
+  use weight 1, create no playback readers, and close immediately after sampling;
+  viewers use weight 100. Generated images use the existing 90-day image cache.
+  Background capture passes group channels by learned HTSP mux identity, starting
+  with the last captured mux when known. Each candidate is visited once per pass
+  so other muxes and unknown channels still get a turn. Hints are scoped to the
+  server/account and pruned for removed channels; TVHeadend retains physical tuner
+  selection and mux sharing. This adds no playback connection pool or tuning.
 - An in-plugin MPEG-TS muxer for HTSP payloads, including common video, audio,
   DVB subtitle, teletext, and private/fallback stream handling.
 - Signal monitoring and recovery for HTSP streams, including lock/SNR/UNC

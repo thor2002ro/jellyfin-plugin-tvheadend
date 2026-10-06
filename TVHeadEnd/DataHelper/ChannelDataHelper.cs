@@ -152,6 +152,23 @@ namespace TVHeadEnd.DataHelper
             throw new ArgumentException("Unknown TVHeadend channel identifier.", nameof(channelId));
         }
 
+        internal long[] ResolveChannelIds(IEnumerable<string> channelIds)
+        {
+            lock (_data)
+            {
+                var external = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (var entry in _data)
+                    if (entry.Value.TryGetString("channelIdStr", out var id) && !string.IsNullOrWhiteSpace(id)) external.TryAdd(id, entry.Key);
+                var result = new List<long>();
+                foreach (var id in channelIds)
+                {
+                    if (uint.TryParse(id, out var numeric)) result.Add(numeric);
+                    else if (id != null && external.TryGetValue(id, out var known)) result.Add(known);
+                }
+                return result.ToArray();
+            }
+        }
+
         public string GetExternalChannelId(long channelId)
         {
             lock (_data)

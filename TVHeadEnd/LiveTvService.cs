@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
@@ -77,6 +78,9 @@ namespace TVHeadEnd
         public string HomePageUrl { get { return "http://tvheadend.org/"; } }
 
         public string Name { get { return "TVHclient LiveTvService"; } }
+
+        internal HtspLiveStream CreateCaptureStream(long channelId) => new(new MediaSourceInfo(),
+            channelId.ToString(CultureInfo.InvariantCulture), _loggerFactory, null, null);
 
         public async Task CancelSeriesTimerAsync(string timerId, CancellationToken cancellationToken)
         {

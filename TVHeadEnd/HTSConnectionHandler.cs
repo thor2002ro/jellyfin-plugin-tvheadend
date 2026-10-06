@@ -893,11 +893,17 @@ namespace TVHeadEnd
 
         internal void ValidateImage(string path)
         {
+            _ = GetValidatedImageSize(path);
+        }
+
+        internal MediaBrowser.Model.Drawing.ImageDimensions GetValidatedImageSize(string path)
+        {
             var dimensions = _imageEncoder.GetImageSize(path);
             if (dimensions.Width <= 0 || dimensions.Height <= 0)
             {
                 throw new InvalidDataException("TVHeadend response is not a valid image.");
             }
+            return dimensions;
         }
 
         private static string GetImageExtension(ReadOnlySpan<byte> header)
@@ -1380,6 +1386,7 @@ namespace TVHeadEnd
         internal long RecordingRevision => _dvrDataHelper.Revision;
 
         internal string GetExternalChannelId(long channelId) => _channelDataHelper.GetExternalChannelId(channelId);
+        internal long[] ResolveChannelIds(IEnumerable<string> channelIds) => _channelDataHelper.ResolveChannelIds(channelIds);
 
         private void ScheduleGuideRefresh()
         {

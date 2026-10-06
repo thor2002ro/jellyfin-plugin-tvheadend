@@ -1,6 +1,8 @@
 using System;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -99,7 +101,7 @@ public class ChannelSwitchingTests
         public void onError(Exception ex) { }
     }
 
-    private sealed class Server : IAsyncDisposable
+    internal sealed class Server : IAsyncDisposable
     {
         private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
         private readonly CancellationTokenSource _stop = new(TimeSpan.FromSeconds(15));
@@ -110,7 +112,7 @@ public class ChannelSwitchingTests
         public TaskCompletionSource ReleaseSubscribe { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
-        public Server(bool pauseSubscribe = false)
+        public Server(bool pauseSubscribe = false, bool emitFrame = false)
         {
             _listener.Start();
             _server = Task.Run(async () =>
@@ -144,6 +146,23 @@ public class ChannelSwitchingTests
                                     reply.putField("challenge", new byte[32]);
                                 }
                                 await network.WriteAsync(reply.BuildBytes(), Token);
+                                if (emitFrame && request.Method == "subscribe")
+                                {
+                                    var video = new Dictionary<string, object> { ["index"] = 0, ["type"] = "H264", ["width"] = 400, ["height"] = 200 };
+                                    var start = new HTSMessage { Method = "subscriptionStart" };
+                                    start.putField("subscriptionId", request.GetField("subscriptionId"));
+                                    start.putField("streams", new ArrayList { video });
+                                    start.putField("sourceinfo", new Dictionary<string, object> { ["network"] = "Loopback", ["mux"] = "Loopback mux", ["mux_uuid"] = "loopback-mux" });
+                                    await network.WriteAsync(start.BuildBytes(), Token);
+                                    var packet = new HTSMessage { Method = "muxpkt" };
+                                    packet.putField("subscriptionId", request.GetField("subscriptionId"));
+                                    packet.putField("stream", 0);
+                                    packet.putField("frametype", (int)'I');
+                                    packet.putField("pts", 0);
+                                    packet.putField("payload", new byte[] { 0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0xab,
+                                        0, 0, 0, 1, 0x68, 0xce, 0xdc, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21 });
+                                    await network.WriteAsync(packet.BuildBytes(), Token);
+                                }
                             }
                         }
                         catch (IOException) { }

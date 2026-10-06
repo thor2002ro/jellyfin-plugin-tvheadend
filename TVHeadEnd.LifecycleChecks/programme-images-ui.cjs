@@ -24,16 +24,21 @@ async function main() {
         .replace('installControlTooltips(view);', 'view.loadConfig = config => loadConfig(view, config);');
     vm.runInNewContext(source + '\ninitialize(view, {});', context);
     const checkbox = control('#chkGenerateMissingProgrammeImages');
+    const background = control('#chkCaptureUnwatchedProgrammeImages');
     view.loadConfig({});
     assert.equal(checkbox.checked, false, 'Missing saved setting must default off');
-    view.loadConfig({ GenerateMissingProgrammeImages: true });
+    assert.equal(background.checked, false);
+    view.loadConfig({ GenerateMissingProgrammeImages: true, CaptureUnwatchedProgrammeImages: true });
     assert.equal(checkbox.checked, true);
+    assert.equal(background.checked, true);
     const form = control('.TVHclientConfigurationForm');
     for (const enabled of [true, false]) {
         checkbox.checked = enabled;
+        background.checked = enabled;
         form.listeners.submit.call(form, { preventDefault() {} });
         await new Promise(resolve => setImmediate(resolve));
         assert.equal(saved.GenerateMissingProgrammeImages, enabled);
+        assert.equal(saved.CaptureUnwatchedProgrammeImages, enabled);
     }
     console.log('Programme artwork checkbox loads defaults and saves both enabled and disabled states.');
 }

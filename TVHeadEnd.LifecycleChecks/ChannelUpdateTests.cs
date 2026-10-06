@@ -13,6 +13,23 @@ using Xunit;
 
 public class ChannelUpdateTests
 {
+    [Fact]
+    public void BatchResolutionMatchesScalarIdsAndSkipsStaleExternalChannels()
+    {
+        var helper = new ChannelDataHelper(NullLogger<ChannelDataHelper>.Instance);
+        helper.Add(Channel(42));
+        helper.Add(Channel(43));
+        var resolve = typeof(ChannelDataHelper).GetMethod("ResolveChannelIds", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        long[] Batch(params string[] ids) => (long[])resolve.Invoke(helper, new object[] { ids })!;
+        Assert.Equal(new long[] { 42, 43, 43 }, Batch("UUID-42", "43", "missing", "uuid-43", null));
+        helper.Remove(42);
+        Assert.Equal(new long[] { 43 }, Batch("uuid-42", "UUID-43"));
+        var update = Message("channelUpdate", "channelId", 43);
+        update.putField("channelIdStr", "replacement");
+        helper.Add(update);
+        Assert.Equal(new long[] { 43 }, Batch("uuid-43", "replacement"));
+    }
+
     private static HTSMessage Channel(long id, string name = "Channel")
     {
         var message = Message("channelAdd", "channelId", id);
